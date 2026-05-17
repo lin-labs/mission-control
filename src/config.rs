@@ -27,6 +27,10 @@ pub struct Config {
     /// cmux binary path
     #[arg(long, default_value = "cmux")]
     pub cmux_bin: String,
+
+    /// cmux socket path (auto-detected from CMUX_SOCKET_PATH or default location)
+    #[arg(long, env = "CMUX_SOCKET_PATH", default_value_os_t = default_socket_path())]
+    pub cmux_socket: PathBuf,
 }
 
 fn default_histories_dir() -> PathBuf {
@@ -39,6 +43,12 @@ fn default_device_file() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_default()
         .join("agents/.device")
+}
+
+fn default_socket_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join("Library/Application Support/cmux/cmux.sock")
 }
 
 pub const SUMMARIZE_PROMPT: &str = r#"You are summarizing an AI coding agent's session for a mission-control dashboard.

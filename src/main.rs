@@ -32,7 +32,7 @@ use tokio::time::{Duration, interval};
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::parse();
-    let cmux_client = CmuxClient::new(config.cmux_bin.clone());
+    let cmux_client = CmuxClient::new(config.cmux_bin.clone(), config.cmux_socket.clone());
 
     let summarizer: Option<Arc<dyn Summarizer>> = config.openai_api_key.as_ref().map(|key| {
         Arc::new(OpenAISummarizer::new(
@@ -70,8 +70,9 @@ async fn run_app(
     // Spawn cmux event stream subscriber
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let cmux_bin = config.cmux_bin.clone();
+    let cmux_socket = config.cmux_socket.clone();
     tokio::spawn(async move {
-        let _ = events::subscribe(&cmux_bin, event_tx).await;
+        let _ = events::subscribe(&cmux_bin, &cmux_socket, event_tx).await;
     });
 
     // Create session file watcher

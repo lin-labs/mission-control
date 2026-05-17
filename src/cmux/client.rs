@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::path::PathBuf;
 use tokio::process::Command;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -12,21 +13,33 @@ pub struct Workspace {
 
 pub struct CmuxClient {
     bin: String,
+    socket_path: PathBuf,
 }
 
 impl CmuxClient {
-    pub fn new(bin: String) -> Self {
-        Self { bin }
+    pub fn new(bin: String, socket_path: PathBuf) -> Self {
+        Self { bin, socket_path }
+    }
+
+    fn cmd(&self) -> Command {
+        let mut cmd = Command::new(&self.bin);
+        cmd.env("CMUX_SOCKET_PATH", &self.socket_path);
+        cmd
     }
 
     /// Parse `cmux list-workspaces --id-format both` output.
     /// Each line: `[*] workspace:N UUID  name [selected]`
     pub async fn list_workspaces(&self) -> Result<Vec<Workspace>> {
-        let output = Command::new(&self.bin)
+        let output = self.cmd()
             .args(["list-workspaces", "--id-format", "both"])
             .output()
             .await
             .context("failed to run cmux list-workspaces")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("cmux list-workspaces failed: {}", stderr);
+        }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut workspaces = Vec::new();
@@ -45,14 +58,8 @@ impl CmuxClient {
                 continue;
             }
             let ref_id = parts[0].to_string();
-            let rest = parts[2..].join(" ").trim().to_string();
-
-            // UUID is next token
-            let mut rest_parts = rest.splitn(2, char::is_whitespace);
-            let uuid = rest_parts.next().unwrap_or("").trim().to_string();
-            let name = rest_parts
-                .next()
-                .unwrap_or("")
+            let uuid = parts[1].to_string();
+            let name = parts[2]
                 .trim()
                 .trim_end_matches("[selected]")
                 .trim()
@@ -75,7 +82,7 @@ impl CmuxClient {
         workspace_ref: &str,
         lines: u32,
     ) -> Result<String> {
-        let output = Command::new(&self.bin)
+        let output = self.cmd()
             .args([
                 "read-screen",
                 "--workspace",
@@ -92,7 +99,7 @@ impl CmuxClient {
 
     /// Select a workspace (focus it).
     pub async fn select_workspace(&self, workspace_ref: &str) -> Result<()> {
-        Command::new(&self.bin)
+        self.cmd()
             .args(["select-workspace", "--workspace", workspace_ref])
             .output()
             .await

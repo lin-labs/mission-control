@@ -39,6 +39,7 @@ struct RawPayload {
 /// Spawn `cmux events --reconnect --category agent --no-heartbeat` and stream parsed events.
 pub async fn subscribe(
     cmux_bin: &str,
+    socket_path: &std::path::Path,
     tx: mpsc::UnboundedSender<AgentEvent>,
 ) -> Result<()> {
     let mut child = Command::new(cmux_bin)
@@ -49,6 +50,7 @@ pub async fn subscribe(
             "agent",
             "--no-heartbeat",
         ])
+        .env("CMUX_SOCKET_PATH", socket_path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()?;
