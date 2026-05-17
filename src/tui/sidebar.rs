@@ -12,6 +12,7 @@ pub fn render_sidebar(
     area: Rect,
     workspaces: &[WorkspaceState],
     selected: usize,
+    focused: bool,
 ) {
     let items: Vec<ListItem> = workspaces
         .iter()
@@ -37,12 +38,13 @@ pub fn render_sidebar(
         })
         .collect();
 
+    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
     let list = List::new(items)
         .block(
             Block::default()
                 .title(" Workspaces ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(border_color)),
         )
         .highlight_style(
             Style::default()
@@ -57,11 +59,20 @@ pub fn render_sidebar(
 }
 
 fn status_indicator(ws: &WorkspaceState) -> (&str, Color) {
-    match ws.session.as_ref().and_then(|s| s.frontmatter.status.as_deref()) {
-        Some("active") => ("\u{25cf}", Color::Green),    // filled circle
-        Some("idle") => ("\u{25d0}", Color::Yellow),     // half circle
-        Some("waiting") => ("\u{26a0}", Color::Red),     // warning
-        Some("done") => ("\u{25cb}", Color::DarkGray),   // empty circle
-        _ => ("\u{25cb}", Color::DarkGray),              // empty circle, no agent
+    // Check session status first
+    if let Some(status) = ws.session.as_ref().and_then(|s| s.frontmatter.status.as_deref()) {
+        return match status {
+            "active" => ("\u{25cf}", Color::Green),    // ● filled circle
+            "idle" => ("\u{25d0}", Color::Yellow),     // ◐ half circle
+            "waiting" => ("\u{26a0}", Color::Red),     // ⚠ warning
+            "done" => ("\u{25cb}", Color::DarkGray),   // ○ empty circle
+            _ => ("\u{25cb}", Color::DarkGray),
+        };
+    }
+    // Fallback: check if surfaces indicate an agent is running
+    if ws.has_agent_surface() {
+        ("\u{25cf}", Color::Green) // ● agent surface present
+    } else {
+        ("\u{25cb}", Color::DarkGray) // ○ no agent
     }
 }

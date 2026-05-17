@@ -66,6 +66,7 @@ async fn run_app(
     let mut app = App::new();
     app.refresh_workspaces(cmux_client, &config.histories_dir)
         .await?;
+    app.load_screen_preview(cmux_client).await;
 
     // Spawn cmux event stream subscriber
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -89,8 +90,9 @@ async fn run_app(
             let chunks = Layout::horizontal([Constraint::Length(32), Constraint::Min(40)])
                 .split(f.area());
 
-            tui::sidebar::render_sidebar(f, chunks[0], &app.workspaces, app.selected);
-            tui::detail::render_detail(f, chunks[1], app.selected_workspace());
+            let sidebar_focused = app.focus == crate::tui::app::Focus::Sidebar;
+            tui::sidebar::render_sidebar(f, chunks[0], &app.workspaces, app.selected, sidebar_focused);
+            tui::detail::render_detail(f, chunks[1], app.selected_workspace(), app.detail_scroll, !sidebar_focused);
         })?;
 
         tokio::select! {
@@ -107,26 +109,43 @@ async fn run_app(
                             | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                                 app.should_quit = true;
                             }
-                            (KeyCode::Char('j') | KeyCode::Down, _) => app.next(),
-                            (KeyCode::Char('k') | KeyCode::Up, _) => app.previous(),
-                            (KeyCode::Enter, _) => {
-                                if let Some(ws) = app.selected_workspace() {
-                                    let _ = cmux_client
-                                        .select_workspace(&ws.workspace.ref_id)
-                                        .await;
+                            (KeyCode::Char('j') | KeyCode::Down, _) => {
+                                if app.focus == crate::tui::app::Focus::Detail {
+                                    app.scroll_down();
+                                } else {
+                                    app.next();
+                                    app.load_screen_preview(cmux_client).await;
+                                }
+                            }
+                            (KeyCode::Char('k') | KeyCode::Up, _) => {
+                                if app.focus == crate::tui::app::Focus::Detail {
+                                    app.scroll_up();
+                                } else {
+                                    app.previous();
+                                    app.load_screen_preview(cmux_client).await;
+                                }
+                            }
+                            (KeyCode::Char('l') | KeyCode::Right, _) | (KeyCode::Enter, KeyModifiers::NONE) => {
+                                if app.focus == crate::tui::app::Focus::Sidebar {
+                                    app.focus = crate::tui::app::Focus::Detail;
+                                } else {
+                                    // In detail focus, Enter switches to the workspace in cmux
+                                    if let Some(ws) = app.selected_workspace() {
+                                        let _ = cmux_client
+                                            .select_workspace(&ws.workspace.ref_id)
+                                            .await;
+                                    }
+                                }
+                            }
+                            (KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc, _) => {
+                                if app.focus == crate::tui::app::Focus::Detail {
+                                    app.focus = crate::tui::app::Focus::Sidebar;
+                                    app.detail_scroll = 0;
                                 }
                             }
                             (KeyCode::Char('s'), _) => {
-                                let idx = app.selected;
-                                if let Some(ws) = app.workspaces.get_mut(idx) {
-                                    ws.show_screen = !ws.show_screen;
-                                    if ws.show_screen && ws.screen_preview.is_none() {
-                                        ws.screen_preview = cmux_client
-                                            .read_screen(&ws.workspace.ref_id, 10)
-                                            .await
-                                            .ok();
-                                    }
-                                }
+                                // Refresh screen preview
+                                app.load_screen_preview(cmux_client).await;
                             }
                             (KeyCode::Char('r'), _) => {
                                 if let Some(ws) = app.workspaces.get(app.selected) {

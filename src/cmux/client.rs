@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::process::Command;
 
@@ -9,6 +10,11 @@ pub struct Workspace {
     pub uuid: String,        // e.g. "32E47B1E-..."
     pub name: String,        // e.g. "gmail-labs"
     pub selected: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SurfaceInfo {
+    pub title: String,
 }
 
 pub struct CmuxClient {
@@ -106,4 +112,48 @@ impl CmuxClient {
             .context("failed to run cmux select-workspace")?;
         Ok(())
     }
+
+    /// Parse `cmux tree --all` to get surface titles per workspace ref.
+    pub async fn get_surfaces(&self) -> Result<HashMap<String, Vec<SurfaceInfo>>> {
+        let output = self.cmd()
+            .args(["tree", "--all"])
+            .output()
+            .await
+            .context("failed to run cmux tree --all")?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut result: HashMap<String, Vec<SurfaceInfo>> = HashMap::new();
+        let mut current_ws_ref: Option<String> = None;
+
+        for line in stdout.lines() {
+            if let Some(pos) = line.find("workspace workspace:") {
+                let after = &line[pos + "workspace ".len()..];
+                // after = "workspace:5 \"mission-control\""
+                let ref_id = after.split_whitespace().next().unwrap_or("");
+                if !ref_id.is_empty() {
+                    current_ws_ref = Some(ref_id.to_string());
+                }
+            } else if let Some(pos) = line.find("surface surface:") {
+                if let Some(ref ws_ref) = current_ws_ref {
+                    let after = &line[pos..];
+                    if let Some(title) = extract_quoted_title(after) {
+                        result
+                            .entry(ws_ref.clone())
+                            .or_default()
+                            .push(SurfaceInfo { title });
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+/// Extract the first quoted string from a line.
+fn extract_quoted_title(line: &str) -> Option<String> {
+    let first_quote = line.find('"')?;
+    let rest = &line[first_quote + 1..];
+    let end_quote = rest.find('"')?;
+    Some(rest[..end_quote].to_string())
 }

@@ -7,11 +7,12 @@ use ratatui::{
     Frame,
 };
 
-pub fn render_detail(f: &mut Frame, area: Rect, ws: Option<&WorkspaceState>) {
+pub fn render_detail(f: &mut Frame, area: Rect, ws: Option<&WorkspaceState>, scroll: u16, focused: bool) {
+    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
     let block = Block::default()
         .title(" Detail ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(border_color));
 
     let ws = match ws {
         Some(ws) => ws,
@@ -28,26 +29,29 @@ pub fn render_detail(f: &mut Frame, area: Rect, ws: Option<&WorkspaceState>) {
     f.render_widget(block, area);
 
     let has_session = ws.session.is_some();
-    let has_screen = ws.show_screen && ws.screen_preview.is_some();
+    let has_surfaces = !ws.surfaces.is_empty();
+    let has_screen = ws.screen_preview.is_some();
 
-    let constraints = if has_session && has_screen {
-        vec![
-            Constraint::Length(3),
-            Constraint::Length(2),
-            Constraint::Min(4),
-            Constraint::Length(12),
-        ]
-    } else if has_session {
-        vec![
-            Constraint::Length(3),
-            Constraint::Length(2),
-            Constraint::Min(4),
-        ]
-    } else if has_screen {
-        vec![Constraint::Length(3), Constraint::Min(4)]
+    let mut constraints = vec![Constraint::Length(3)]; // header always
+
+    if has_session {
+        constraints.push(Constraint::Length(2)); // trajectory
+    }
+
+    if has_surfaces {
+        let surface_lines = ws.surfaces.len() as u16 + 2; // title + items + blank
+        constraints.push(Constraint::Length(surface_lines));
+    }
+
+    if has_session {
+        constraints.push(Constraint::Min(4)); // progress/next steps
+    }
+
+    if has_screen {
+        constraints.push(Constraint::Min(6)); // screen fills remaining space
     } else {
-        vec![Constraint::Length(3), Constraint::Min(1)]
-    };
+        constraints.push(Constraint::Min(1)); // filler
+    }
 
     let chunks = Layout::vertical(constraints).split(inner);
     let mut chunk_idx = 0;
@@ -66,7 +70,14 @@ pub fn render_detail(f: &mut Frame, area: Rect, ws: Option<&WorkspaceState>) {
         ]));
         f.render_widget(traj, chunks[chunk_idx]);
         chunk_idx += 1;
+    }
 
+    if has_surfaces {
+        render_surfaces(f, chunks[chunk_idx], &ws.surfaces);
+        chunk_idx += 1;
+    }
+
+    if let Some(ref session) = ws.session {
         let mut lines: Vec<Line> = Vec::new();
 
         if !session.bullets.is_empty() {
@@ -77,7 +88,10 @@ pub fn render_detail(f: &mut Frame, area: Rect, ws: Option<&WorkspaceState>) {
                     .add_modifier(Modifier::BOLD),
             )));
             for bullet in &session.bullets {
-                lines.push(Line::from(format!("  - {}", bullet)));
+                lines.push(Line::from(Span::styled(
+                    format!("  - {}", bullet),
+                    Style::default().fg(Color::Gray),
+                )));
             }
         }
 
@@ -116,13 +130,27 @@ pub fn render_detail(f: &mut Frame, area: Rect, ws: Option<&WorkspaceState>) {
                         .borders(Borders::TOP)
                         .border_style(Style::default().fg(Color::DarkGray)),
                 )
-                .style(Style::default().fg(Color::DarkGray));
+                .style(Style::default().fg(Color::DarkGray))
+                .scroll((scroll, 0));
             f.render_widget(screen, chunks[chunk_idx]);
         }
-    } else if !has_session {
-        let hint = Paragraph::new("No agent session. Press 's' for screen preview.");
-        f.render_widget(hint, chunks[chunk_idx]);
     }
+}
+
+fn render_surfaces(f: &mut Frame, area: Rect, surfaces: &[crate::cmux::client::SurfaceInfo]) {
+    let mut lines = vec![Line::from(Span::styled(
+        "Surfaces:",
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    for s in surfaces {
+        lines.push(Line::from(vec![
+            Span::styled("  ▸ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&s.title, Style::default().fg(Color::Cyan)),
+        ]));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 fn render_header(f: &mut Frame, area: Rect, ws: &WorkspaceState) {
@@ -130,13 +158,22 @@ fn render_header(f: &mut Frame, area: Rect, ws: &WorkspaceState) {
         .session
         .as_ref()
         .and_then(|s| s.frontmatter.status.as_deref())
-        .unwrap_or("--");
+        .unwrap_or_else(|| if ws.has_agent_surface() { "active" } else { "--" });
 
     let agent = ws
         .session
         .as_ref()
         .and_then(|s| s.frontmatter.agent.as_deref())
-        .unwrap_or("");
+        .unwrap_or_else(|| {
+            // Derive agent from surface titles
+            ws.surfaces.iter().find_map(|s| {
+                let t = s.title.to_lowercase();
+                if t.contains("claude") { Some("claude") }
+                else if t.contains("codex") { Some("codex") }
+                else if t.contains("opencode") { Some("opencode") }
+                else { None }
+            }).unwrap_or("")
+        });
 
     let host = ws
         .session
