@@ -17,6 +17,7 @@ pub struct SurfaceInfo {
     pub title: String,
 }
 
+#[derive(Clone)]
 pub struct CmuxClient {
     bin: String,
     socket_path: PathBuf,

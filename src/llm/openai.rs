@@ -1,3 +1,4 @@
+use super::log::{log_call, CallTimer};
 use super::{Summarizer, Summary};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -54,35 +55,45 @@ impl OpenAISummarizer {
 impl Summarizer for OpenAISummarizer {
     async fn summarize(&self, context: &str) -> Result<Summary> {
         let prompt = self.build_prompt(context);
+        let timer = CallTimer::start();
 
         let request = ChatRequest {
             model: self.model.clone(),
             messages: vec![Message {
                 role: "user".to_string(),
-                content: prompt,
+                content: prompt.clone(),
             }],
             max_tokens: 512,
             temperature: 0.3,
         };
 
-        let response = self
-            .client
-            .post("https://api.openai.com/v1/chat/completions")
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&request)
-            .send()
-            .await
-            .context("OpenAI API request failed")?
-            .json::<ChatResponse>()
-            .await
-            .context("failed to parse OpenAI response")?;
+        let result: Result<String> = async {
+            let response = self
+                .client
+                .post("https://api.openai.com/v1/chat/completions")
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .json(&request)
+                .send()
+                .await
+                .context("OpenAI API request failed")?
+                .json::<ChatResponse>()
+                .await
+                .context("failed to parse OpenAI response")?;
 
-        let text = response
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or_default();
+            Ok(response
+                .choices
+                .first()
+                .map(|c| c.message.content.clone())
+                .unwrap_or_default())
+        }
+        .await;
 
+        match &result {
+            Ok(text) => log_call("openai", &prompt, Ok(text.as_str()), timer.ms()),
+            Err(e) => log_call("openai", &prompt, Err(&format!("{:#}", e)), timer.ms()),
+        }
+
+        let text = result?;
         parse_summary(&text)
     }
 }

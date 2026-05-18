@@ -1,4 +1,7 @@
+pub mod codex;
+pub mod log;
 pub mod openai;
+pub mod typesafe;
 
 use anyhow::Result;
 use async_trait::async_trait;

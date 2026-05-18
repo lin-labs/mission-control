@@ -7,7 +7,9 @@ mod tui;
 use crate::cmux::client::CmuxClient;
 use crate::cmux::events;
 use crate::config::Config;
+use crate::llm::codex::CodexSummarizer;
 use crate::llm::openai::OpenAISummarizer;
+use crate::llm::typesafe::TypeSafeClassifier;
 use crate::llm::Summarizer;
 use crate::session::watcher::SessionWatcher;
 use crate::tui::app::App;
@@ -34,13 +36,23 @@ async fn main() -> Result<()> {
     let config = Config::parse();
     let cmux_client = CmuxClient::new(config.cmux_bin.clone(), config.cmux_socket.clone());
 
-    let summarizer: Option<Arc<dyn Summarizer>> = config.openai_api_key.as_ref().map(|key| {
-        Arc::new(OpenAISummarizer::new(
-            key.clone(),
-            config.model.clone(),
+    // Prefer Codex (local auth, no API key) when use_codex is set,
+    // fall back to OpenAI if explicitly requested or as a backup.
+    let summarizer: Option<Arc<dyn Summarizer>> = if config.use_codex {
+        Some(Arc::new(CodexSummarizer::new(
+            config.codex_bin.clone(),
             config::SUMMARIZE_PROMPT.to_string(),
-        )) as Arc<dyn Summarizer>
-    });
+            None, // use codex's default model
+        )) as Arc<dyn Summarizer>)
+    } else {
+        config.openai_api_key.as_ref().map(|key| {
+            Arc::new(OpenAISummarizer::new(
+                key.clone(),
+                config.model.clone(),
+                config::SUMMARIZE_PROMPT.to_string(),
+            )) as Arc<dyn Summarizer>
+        })
+    };
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -48,7 +60,12 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, &config, &cmux_client, summarizer).await;
+    let classifier = config
+        .typesafe_api_key
+        .as_ref()
+        .map(|key| TypeSafeClassifier::new(key.clone()));
+
+    let result = run_app(&mut terminal, &config, &cmux_client, summarizer, classifier.as_ref()).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -62,11 +79,22 @@ async fn run_app(
     config: &Config,
     cmux_client: &CmuxClient,
     summarizer: Option<Arc<dyn Summarizer>>,
+    classifier: Option<&TypeSafeClassifier>,
 ) -> Result<()> {
     let mut app = App::new();
     app.refresh_workspaces(cmux_client, &config.histories_dir)
         .await?;
-    app.load_screen_preview(cmux_client).await;
+
+    // Channel for async screen-capture results (per-workspace, parallel)
+    let (screen_tx, mut screen_rx) =
+        mpsc::unbounded_channel::<crate::tui::app::ScreenUpdate>();
+
+    // Kick off initial screen capture for the selected workspace
+    app.spawn_load_screen_preview(
+        cmux_client.clone(),
+        classifier.cloned(),
+        screen_tx.clone(),
+    );
 
     // Spawn cmux event stream subscriber
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -84,15 +112,21 @@ async fn run_app(
     let (summary_tx, mut summary_rx) = mpsc::unbounded_channel::<(String, crate::llm::Summary)>();
 
     let mut refresh_interval = interval(Duration::from_secs(30));
+    let mut screen_interval = interval(Duration::from_secs(15));
 
     loop {
         terminal.draw(|f| {
-            let chunks = Layout::horizontal([Constraint::Length(32), Constraint::Min(40)])
+            // Split vertically: main area on top, single-line shortcut footer on the bottom.
+            let vchunks = Layout::vertical([Constraint::Min(5), Constraint::Length(1)])
                 .split(f.area());
+
+            let chunks = Layout::horizontal([Constraint::Length(32), Constraint::Min(40)])
+                .split(vchunks[0]);
 
             let sidebar_focused = app.focus == crate::tui::app::Focus::Sidebar;
             tui::sidebar::render_sidebar(f, chunks[0], &app.workspaces, app.selected, sidebar_focused);
             tui::detail::render_detail(f, chunks[1], app.selected_workspace(), app.detail_scroll, !sidebar_focused);
+            tui::footer::render_footer(f, vchunks[1], app.focus);
         })?;
 
         tokio::select! {
@@ -114,7 +148,11 @@ async fn run_app(
                                     app.scroll_down();
                                 } else {
                                     app.next();
-                                    app.load_screen_preview(cmux_client).await;
+                                    app.spawn_load_screen_preview(
+                                        cmux_client.clone(),
+                                        classifier.cloned(),
+                                        screen_tx.clone(),
+                                    );
                                 }
                             }
                             (KeyCode::Char('k') | KeyCode::Up, _) => {
@@ -122,18 +160,24 @@ async fn run_app(
                                     app.scroll_up();
                                 } else {
                                     app.previous();
-                                    app.load_screen_preview(cmux_client).await;
+                                    app.spawn_load_screen_preview(
+                                        cmux_client.clone(),
+                                        classifier.cloned(),
+                                        screen_tx.clone(),
+                                    );
                                 }
                             }
                             (KeyCode::Char('l') | KeyCode::Right, _) | (KeyCode::Enter, KeyModifiers::NONE) => {
                                 if app.focus == crate::tui::app::Focus::Sidebar {
                                     app.focus = crate::tui::app::Focus::Detail;
                                 } else {
-                                    // In detail focus, Enter switches to the workspace in cmux
+                                    // In detail focus, Enter switches to the workspace in cmux (fire-and-forget)
                                     if let Some(ws) = app.selected_workspace() {
-                                        let _ = cmux_client
-                                            .select_workspace(&ws.workspace.ref_id)
-                                            .await;
+                                        let client = cmux_client.clone();
+                                        let ref_id = ws.workspace.ref_id.clone();
+                                        tokio::spawn(async move {
+                                            let _ = client.select_workspace(&ref_id).await;
+                                        });
                                     }
                                 }
                             }
@@ -144,25 +188,96 @@ async fn run_app(
                                 }
                             }
                             (KeyCode::Char('s'), _) => {
-                                // Refresh screen preview
-                                app.load_screen_preview(cmux_client).await;
+                                // Refresh screen preview (async)
+                                app.spawn_load_screen_preview(
+                                    cmux_client.clone(),
+                                    classifier.cloned(),
+                                    screen_tx.clone(),
+                                );
+                            }
+                            (KeyCode::Char('n'), _) => {
+                                // Open notes for current workspace in $EDITOR
+                                if let Some(ws) = app.selected_workspace() {
+                                    let notes_path = app.notes_path_for(ws);
+                                    if let Some(parent) = notes_path.parent() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
+                                    // Suspend TUI
+                                    disable_raw_mode()?;
+                                    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                                    terminal.show_cursor()?;
+
+                                    let editor = std::env::var("EDITOR")
+                                        .unwrap_or_else(|_| "vim".to_string());
+                                    let _ = std::process::Command::new(&editor)
+                                        .arg(&notes_path)
+                                        .status();
+
+                                    // Resume TUI
+                                    enable_raw_mode()?;
+                                    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                                    terminal.clear()?;
+                                    app.load_notes();
+                                }
                             }
                             (KeyCode::Char('r'), _) => {
+                                // Summarize the selected workspace.
+                                // We do a DEEP capture (500 lines of scrollback) so codex
+                                // sees the actual conversation trajectory, not just the
+                                // last 15 lines of trailing terminal output.
                                 if let Some(ws) = app.workspaces.get(app.selected) {
-                                    if let Some(ref session) = ws.session {
-                                        let uuid = ws.workspace.uuid.clone();
-                                        let context = session.bullets.join("\n");
-                                        if let Some(ref summarizer) = summarizer {
-                                            let summarizer = Arc::clone(summarizer);
-                                            let tx = summary_tx.clone();
-                                            tokio::spawn(async move {
-                                                if let Ok(summary) =
-                                                    summarizer.summarize(&context).await
-                                                {
-                                                    let _ = tx.send((uuid, summary));
+                                    let uuid = ws.workspace.uuid.clone();
+                                    let ref_id = ws.workspace.ref_id.clone();
+                                    let ws_name = ws.workspace.name.clone();
+                                    let notes = ws.notes.clone().unwrap_or_default();
+                                    let session_bullets = ws
+                                        .session
+                                        .as_ref()
+                                        .map(|s| s.bullets.join("\n"))
+                                        .unwrap_or_default();
+                                    if let Some(ref summarizer) = summarizer {
+                                        app.set_summarizing(&uuid);
+                                        let summarizer = Arc::clone(summarizer);
+                                        let tx = summary_tx.clone();
+                                        let client = cmux_client.clone();
+                                        let uuid_for_task = uuid.clone();
+                                        tokio::spawn(async move {
+                                            // Deep scrollback capture for real context
+                                            let scrollback = tokio::time::timeout(
+                                                std::time::Duration::from_secs(5),
+                                                client.read_screen(&ref_id, 500),
+                                            )
+                                            .await
+                                            .ok()
+                                            .and_then(|r| r.ok())
+                                            .unwrap_or_default();
+
+                                            let context = build_summary_context(
+                                                &ws_name,
+                                                &scrollback,
+                                                &session_bullets,
+                                                &notes,
+                                            );
+
+                                            match summarizer.summarize(&context).await {
+                                                Ok(summary) => {
+                                                    let _ = tx.send((uuid_for_task, summary));
                                                 }
-                                            });
-                                        }
+                                                Err(e) => {
+                                                    let msg: String = format!("{:#}", e)
+                                                        .chars()
+                                                        .take(220)
+                                                        .collect();
+                                                    let _ = tx.send((
+                                                        uuid_for_task,
+                                                        crate::llm::Summary {
+                                                            trajectory: format!("Summary failed: {}", msg),
+                                                            next_steps: vec![],
+                                                        },
+                                                    ));
+                                                }
+                                            }
+                                        });
                                     }
                                 }
                             }
@@ -235,10 +350,65 @@ async fn run_app(
             _ = refresh_interval.tick() => {
                 let _ = app.refresh_workspaces(cmux_client, &config.histories_dir).await;
             }
+
+            _ = screen_interval.tick() => {
+                // Fire off parallel background captures for every workspace.
+                // The main loop never blocks — results flow back via screen_rx.
+                app.spawn_refresh_all_screens(
+                    cmux_client.clone(),
+                    classifier.cloned(),
+                    screen_tx.clone(),
+                );
+            }
+
+            Some(update) = screen_rx.recv() => {
+                app.apply_screen_update(update);
+            }
         }
 
         if app.should_quit {
             return Ok(());
         }
     }
+}
+
+/// Assemble the summarization context from all available signals.
+/// Order matters — most relevant signal first so even a small context window
+/// gets the right material.
+fn build_summary_context(
+    workspace_name: &str,
+    scrollback: &str,
+    session_bullets: &str,
+    notes: &str,
+) -> String {
+    let mut parts = Vec::new();
+
+    parts.push(format!("# Workspace: {}", workspace_name));
+
+    if !notes.trim().is_empty() {
+        parts.push(format!("\n## My Notes\n{}", notes.trim()));
+    }
+
+    if !session_bullets.trim().is_empty() {
+        parts.push(format!(
+            "\n## Recent activity log (session bullets, newest last)\n{}",
+            session_bullets.trim()
+        ));
+    }
+
+    if !scrollback.trim().is_empty() {
+        // Strip empty lines and the most aggressive whitespace to compress
+        let cleaned: String = scrollback
+            .lines()
+            .map(|l| l.trim_end())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        parts.push(format!(
+            "\n## Terminal scrollback (most recent conversation, oldest first)\n{}",
+            cleaned
+        ));
+    }
+
+    parts.join("\n")
 }

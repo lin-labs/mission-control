@@ -17,7 +17,13 @@ pub fn render_sidebar(
     let items: Vec<ListItem> = workspaces
         .iter()
         .map(|ws| {
-            let (dot, dot_color) = status_indicator(ws);
+            // Spinner when an async refresh is in flight, otherwise status dot
+            let (leader, leader_color) = if ws.loading {
+                (spinner_frame().to_string(), Color::Cyan)
+            } else {
+                let (dot, c) = status_indicator(ws);
+                (dot.to_string(), c)
+            };
             let host_badge = ws
                 .session
                 .as_ref()
@@ -27,7 +33,7 @@ pub fn render_sidebar(
                 .unwrap_or_default();
 
             let line = Line::from(vec![
-                Span::styled(format!("{} ", dot), Style::default().fg(dot_color)),
+                Span::styled(format!("{} ", leader), Style::default().fg(leader_color)),
                 Span::styled(
                     ws.workspace.name.clone(),
                     Style::default().fg(Color::White),
@@ -59,20 +65,20 @@ pub fn render_sidebar(
 }
 
 fn status_indicator(ws: &WorkspaceState) -> (&str, Color) {
-    // Check session status first
-    if let Some(status) = ws.session.as_ref().and_then(|s| s.frontmatter.status.as_deref()) {
-        return match status {
-            "active" => ("\u{25cf}", Color::Green),    // ● filled circle
-            "idle" => ("\u{25d0}", Color::Yellow),     // ◐ half circle
-            "waiting" => ("\u{26a0}", Color::Red),     // ⚠ warning
-            "done" => ("\u{25cb}", Color::DarkGray),   // ○ empty circle
-            _ => ("\u{25cb}", Color::DarkGray),
-        };
+    use crate::tui::app::AgentState;
+    match ws.agent_state() {
+        AgentState::Working => ("\u{25cf}", Color::Green),     // ● baking
+        AgentState::NeedsMe => ("\u{26a0}", Color::Yellow),    // ⚠ needs you
+        AgentState::Idle    => ("\u{25cb}", Color::DarkGray),   // ○ nothing happening
     }
-    // Fallback: check if surfaces indicate an agent is running
-    if ws.has_agent_surface() {
-        ("\u{25cf}", Color::Green) // ● agent surface present
-    } else {
-        ("\u{25cb}", Color::DarkGray) // ○ no agent
-    }
+}
+
+/// Time-based braille spinner frame. Rotates every ~80ms as long as the UI redraws.
+pub fn spinner_frame() -> char {
+    const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    FRAMES[((ms / 80) as usize) % FRAMES.len()]
 }
