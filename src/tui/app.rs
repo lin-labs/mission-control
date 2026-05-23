@@ -615,13 +615,13 @@ impl App {
                 ) {
                     eprintln!("ensure_workspace({}): {e:?}", &ws.uuid);
                 }
-                // Load the trajectory doc for this workspace. We use load_from_file
-                // which returns a default (empty) doc when the file is NotFound, so
-                // we wrap in .ok() and then filter out empty-section docs, keeping
-                // None for the "no trajectory yet" fallback path in detail.rs.
+                // Load the trajectory doc only when the file actually exists.
+                // load_from_file synthesises a default doc on NotFound, which
+                // would wrongly show an empty trajectory panel; the .exists()
+                // guard keeps None as the "no trajectory yet" signal that
+                // detail.rs uses to fall back to the legacy rendering.
                 let trajectory = {
                     let traj_path = crate::mc_data::paths::trajectory_path(&ws.uuid);
-                    // Only expose a doc when the file actually exists on disk.
                     if traj_path.exists() {
                         crate::mc_data::trajectory::TrajectoryDoc::load_from_file(&traj_path).ok()
                     } else {
