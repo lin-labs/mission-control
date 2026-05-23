@@ -23,3 +23,17 @@ fn mc_help_shows_subcommands() {
     assert!(combined.contains("resolve"), "help should mention `resolve` subcommand. stdout={stdout} stderr={stderr}");
     assert!(combined.contains("setup"), "help should mention `setup` subcommand. stdout={stdout} stderr={stderr}");
 }
+
+#[test]
+fn mc_resolve_prints_workspace_dir() {
+    let bin = mc_bin();
+    let output = Command::new(&bin)
+        .args(["resolve", "abc-123"])
+        .output()
+        .expect("run resolve");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim().ends_with("data/mission-control/.data/abc-123"),
+        "expected resolve to end with .data/abc-123, got stdout={stdout:?}"
+    );
+}
