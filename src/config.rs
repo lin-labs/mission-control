@@ -16,7 +16,10 @@ pub struct Cli {
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
     /// Resolve a workspace UUID to its local data dir path.
-    Resolve { workspace_id: String },
+    Resolve {
+        /// The cmux workspace UUID.
+        workspace_id: String,
+    },
     /// One-time setup: create ~/data/mission-control/, print install summary.
     Setup,
 }

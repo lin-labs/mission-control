@@ -76,11 +76,13 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_tui(tui_config: Config) -> Result<()> {
+async fn run_tui(_tui_config: Config) -> Result<()> {
     let binary_stamp = BinaryStamp::capture();
 
     loop {
-        let config = tui_config.clone();
+        // Re-parse argv each iteration so a soft reload picks up any env-var
+        // changes (e.g. OPENAI_API_KEY) — matches pre-subcommand behavior.
+        let config = config::Cli::parse().tui;
         let cmux_client = CmuxClient::new(config.cmux_bin.clone(), config.cmux_socket.clone());
 
         // Prefer Codex (local auth, no API key) when use_codex is set,
