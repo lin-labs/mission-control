@@ -8,10 +8,15 @@ use std::fs;
 
 fn with_tmp_home<F: FnOnce(&std::path::Path)>(f: F) {
     let tmp = tempfile::tempdir().expect("tempdir");
+    let prior = std::env::var_os("HOME");
     // SAFETY: tests run single-threaded via --test-threads=1; HOME mutation
     // is process-global, so parallelism would cause data races.
-    unsafe { std::env::set_var("HOME", tmp.path()); }
+    unsafe { std::env::set_var("HOME", tmp.path()) };
     f(tmp.path());
+    match prior {
+        Some(v) => unsafe { std::env::set_var("HOME", v) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
 }
 
 #[test]
@@ -61,11 +66,11 @@ fn read_display_name_reads_name_file() {
 }
 
 #[test]
-fn read_project_reads_project_file_falling_back_to_name() {
+fn read_project_reads_project_file() {
     with_tmp_home(|_| {
         workspace::ensure_workspace("uuid-4", "ws-name", "ws-name").unwrap();
         assert_eq!(workspace::read_project("uuid-4").unwrap(), "ws-name");
-        // Manually write a different project file
+        // Overwriting the project file is reflected on subsequent reads.
         fs::write(paths::project_path("uuid-4"), "different-project").unwrap();
         assert_eq!(workspace::read_project("uuid-4").unwrap(), "different-project");
     });

@@ -26,8 +26,6 @@ pub fn ensure_workspace(uuid: &str, unique_name: &str, project: &str) -> Result<
 
     // Display symlink at the data root. Relative target so the symlink
     // resolves correctly inside the data dir regardless of cwd.
-    // The data root must exist before we can create the symlink there.
-    fs::create_dir_all(paths::data_root())?;
     let link = paths::display_symlink(unique_name);
     let target: PathBuf = PathBuf::from(".data").join(uuid);
     if let Ok(existing) = fs::read_link(&link) {
@@ -43,7 +41,7 @@ pub fn ensure_workspace(uuid: &str, unique_name: &str, project: &str) -> Result<
         );
     }
     symlink(&target, &link)
-        .with_context(|| format!("symlink {target:?} -> {link:?}"))?;
+        .with_context(|| format!("symlink {link:?} -> {target:?}"))?;
     Ok(())
 }
 
