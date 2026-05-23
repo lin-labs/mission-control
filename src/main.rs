@@ -145,6 +145,8 @@ async fn main() -> Result<()> {
         Some(config::Command::PromoteRules { proposals_file }) => cli::promote_rules::run(&proposals_file),
         Some(config::Command::RecordHit { project, rule_id }) => cli::record_hit::run(&project, &rule_id),
         Some(config::Command::Gc) => cli::gc::run(),
+        Some(config::Command::Bind { surface_id, session_file }) =>
+            cli::bind::run(&surface_id, session_file.as_deref()),
     }
 }
 
