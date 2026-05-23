@@ -1,11 +1,9 @@
 use mission_control::mc_data::paths;
-use std::path::PathBuf;
 
 #[test]
 fn data_root_under_home_data_mission_control() {
     let home = dirs::home_dir().unwrap();
     assert_eq!(paths::data_root(), home.join("data/mission-control"));
-    let _ = PathBuf::new(); // silence unused-import if needed
 }
 
 #[test]
