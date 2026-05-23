@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 pub const SECTION_GOAL: &str = "Goal";
 pub const SECTION_CURRENT_SURFACES: &str = "Current surfaces";
@@ -100,6 +101,65 @@ impl TrajectoryDoc {
         }
         // Drop any non-canonical sections silently in Phase 1a.
         self.sections = ordered;
+    }
+
+    pub fn to_markdown(&self) -> String {
+        let mut out = String::new();
+        // Frontmatter
+        out.push_str("---\n");
+        out.push_str(&serde_yaml::to_string(&self.frontmatter).unwrap_or_default());
+        out.push_str("---\n\n");
+
+        for (i, section) in self.sections.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str("## ");
+            out.push_str(&section.name);
+            out.push('\n');
+            for item in &section.items {
+                out.push_str("- ");
+                if item.is_checkbox {
+                    out.push_str(if item.checked.unwrap_or(false) {
+                        "[x] "
+                    } else {
+                        "[ ] "
+                    });
+                }
+                out.push_str(&item.text);
+                if let Some(sid) = &item.surface_id {
+                    out.push_str(&format!("              <!-- mc:surface:{sid} -->"));
+                }
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    pub fn save_to_file(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("md.tmp");
+        std::fs::write(&tmp, self.to_markdown())?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    pub fn load_from_file(path: &Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let mut d = Self::parse(&text)?;
+                d.ensure_sections();
+                Ok(d)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut d = Self::default();
+                d.ensure_sections();
+                Ok(d)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 }
 

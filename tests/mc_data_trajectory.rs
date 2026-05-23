@@ -113,3 +113,49 @@ fn malformed_surface_comment_yields_none_surface_id() {
     let item = &doc.sections[0].items[0];
     assert!(item.surface_id.is_none(), "missing --> must not produce a garbage surface id");
 }
+
+#[test]
+fn write_then_parse_round_trips() {
+    let mut doc = TrajectoryDoc::parse(SAMPLE).unwrap();
+    let serialized = doc.to_markdown();
+    let reparsed = TrajectoryDoc::parse(&serialized).unwrap();
+
+    assert_eq!(
+        doc.section("Goal").unwrap().items.len(),
+        reparsed.section("Goal").unwrap().items.len()
+    );
+    assert_eq!(
+        doc.section("Current surfaces").unwrap().items[0].surface_id,
+        reparsed.section("Current surfaces").unwrap().items[0].surface_id
+    );
+    let original_task = &doc.section("Tasks & Progress").unwrap().items[0];
+    let rep_task = &reparsed.section("Tasks & Progress").unwrap().items[0];
+    assert_eq!(original_task.text, rep_task.text);
+    assert_eq!(original_task.checked, rep_task.checked);
+
+    let _ = &mut doc; // mut used by ensure_sections in earlier test
+}
+
+#[test]
+fn save_and_load_roundtrip_via_filesystem() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("trajectory.md");
+    let doc = TrajectoryDoc::parse(SAMPLE).unwrap();
+    doc.save_to_file(&path).unwrap();
+    let loaded = TrajectoryDoc::load_from_file(&path).unwrap();
+    assert_eq!(loaded.sections.len(), 3);
+    assert_eq!(loaded.frontmatter.snapshot, Some(7));
+}
+
+#[test]
+fn load_from_missing_file_returns_default_doc() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("does-not-exist.md");
+    let loaded = TrajectoryDoc::load_from_file(&path).unwrap();
+    // Default = empty frontmatter, canonical empty sections after ensure_sections.
+    assert!(loaded.frontmatter.workspace.is_none());
+    assert_eq!(loaded.sections.len(), 3); // canonical sections backfilled
+    for s in &loaded.sections {
+        assert!(s.items.is_empty());
+    }
+}
