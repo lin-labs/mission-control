@@ -1,3 +1,4 @@
+mod cli;
 mod cmux;
 mod config;
 mod llm;
@@ -7,7 +8,7 @@ mod tui;
 
 use crate::cmux::client::CmuxClient;
 use crate::cmux::events;
-use crate::config::Config;
+use crate::config::{Cli, Config};
 use crate::llm::Summarizer;
 use crate::llm::codex::CodexSummarizer;
 use crate::llm::openai::OpenAISummarizer;
@@ -67,10 +68,19 @@ impl BinaryStamp {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        None => run_tui(cli.tui).await,
+        Some(config::Command::Resolve { workspace_id }) => cli::resolve::run(&workspace_id),
+        Some(config::Command::Setup) => cli::setup::run(),
+    }
+}
+
+async fn run_tui(tui_config: Config) -> Result<()> {
     let binary_stamp = BinaryStamp::capture();
 
     loop {
-        let config = Config::parse();
+        let config = tui_config.clone();
         let cmux_client = CmuxClient::new(config.cmux_bin.clone(), config.cmux_socket.clone());
 
         // Prefer Codex (local auth, no API key) when use_codex is set,
