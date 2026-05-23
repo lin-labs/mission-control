@@ -28,6 +28,13 @@ pub fn render_detail(
         }
     };
 
+    // If a trajectory doc is available, delegate entirely to the trajectory view.
+    // Fall through to the legacy rendering for workspaces without one.
+    if let Some(doc) = ws.trajectory.as_ref() {
+        crate::tui::trajectory_view::render(f, area, Some(doc), scroll, focused);
+        return;
+    }
+
     let inner = block.inner(area);
     f.render_widget(block, area);
 
