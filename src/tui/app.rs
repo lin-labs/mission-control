@@ -1,12 +1,14 @@
 use crate::cmux::client::{CmuxClient, SurfaceInfo, Workspace};
 use crate::cmux::events::AgentEvent;
 use crate::llm::Summary;
+use crate::llm::trajectory_regen::RegenInputs;
 use crate::llm::typesafe::{ScreenClassification, TypeSafeClassifier};
 use crate::session::file::{self, SessionFile};
 use crate::session::watcher::FileChanged;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 /// Directory for persistent per-workspace notes.
 pub fn notes_dir() -> PathBuf {
@@ -29,6 +31,55 @@ fn workspace_slug(name: &str) -> String {
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect();
     slug.trim_matches('-').to_string()
+}
+
+/// Per-workspace state for the trajectory regeneration scheduler.
+#[derive(Debug, Clone)]
+pub struct RegenSchedulerState {
+    /// When the last successful regen completed (or None if never).
+    pub last_regen_at: Option<Instant>,
+    /// Number of tool-call events accumulated since the last regen.
+    pub events_since_last_regen: u32,
+    /// True while a regen task is in-flight to prevent duplicate spawns.
+    pub regen_in_flight: bool,
+}
+
+impl Default for RegenSchedulerState {
+    fn default() -> Self {
+        Self {
+            last_regen_at: None,
+            events_since_last_regen: 0,
+            regen_in_flight: false,
+        }
+    }
+}
+
+/// Per-workspace state for shell surface summarization.
+#[derive(Debug, Clone, Default)]
+pub struct SurfaceSummaryState {
+    /// Number of new log lines accumulated since the last summary call.
+    pub lines_since_last_summary: u32,
+}
+
+/// Per-workspace dismissal tracking state.
+#[derive(Debug, Clone)]
+pub struct DismissalState {
+    /// Current count of open cmux surfaces for this workspace.
+    pub open_surfaces: u32,
+    /// When the surface count first dropped to zero (grace timer start).
+    pub grace_started_at: Option<Instant>,
+    /// True once the dismissal task has been spawned (prevents duplicate spawns).
+    pub dismissing: bool,
+}
+
+impl Default for DismissalState {
+    fn default() -> Self {
+        Self {
+            open_surfaces: 0,
+            grace_started_at: None,
+            dismissing: false,
+        }
+    }
 }
 
 /// Key insights extracted from raw screen text.
@@ -343,6 +394,21 @@ pub struct WorkspaceState {
     /// Parsed trajectory doc for this workspace (loaded from `.data/<uuid>/trajectory.md`).
     /// `None` if the file does not exist or could not be read.
     pub trajectory: Option<crate::mc_data::trajectory::TrajectoryDoc>,
+    /// Per-workspace trajectory editing state. `None` means no editing has
+    /// started yet for this workspace; `Some(...)` persists across workspace
+    /// switches so the cursor position is remembered.
+    pub edit_state: Option<crate::tui::trajectory_edit::TrajectoryEditState>,
+    /// Active peek-mode state for this workspace.
+    /// `Some(...)` while the user is viewing a surface's screen in peek mode.
+    /// `None` when not in peek mode.
+    pub peek_state: Option<crate::tui::peek_view::PeekState>,
+    /// Set to `true` when Enter is pressed in peek mode to trigger a cmux
+    /// select-workspace call from the event loop.
+    pub peek_yield_pending: bool,
+    /// Regen scheduler state for trajectory regeneration.
+    pub regen: RegenSchedulerState,
+    /// Dismissal tracking: surface count, grace timer, dismissing flag.
+    pub dismissal: DismissalState,
 }
 
 /// Result of an async screen capture + classification for a single workspace.
@@ -593,6 +659,30 @@ impl App {
             .iter()
             .map(|ws| (ws.workspace.uuid.clone(), ws.summary.clone()))
             .collect();
+        // Preserve editing state across refreshes so cursor position is remembered.
+        let old_edit_states: HashMap<String, Option<crate::tui::trajectory_edit::TrajectoryEditState>> = self
+            .workspaces
+            .iter()
+            .map(|ws| (ws.workspace.uuid.clone(), ws.edit_state.clone()))
+            .collect();
+        // Preserve peek state across refreshes so an active peek session survives.
+        let old_peek_states: HashMap<String, Option<crate::tui::peek_view::PeekState>> = self
+            .workspaces
+            .iter()
+            .map(|ws| (ws.workspace.uuid.clone(), ws.peek_state.clone()))
+            .collect();
+        // Preserve regen scheduler state across refreshes.
+        let old_regen_states: HashMap<String, RegenSchedulerState> = self
+            .workspaces
+            .iter()
+            .map(|ws| (ws.workspace.uuid.clone(), ws.regen.clone()))
+            .collect();
+        // Preserve dismissal state across refreshes.
+        let old_dismissal_states: HashMap<String, DismissalState> = self
+            .workspaces
+            .iter()
+            .map(|ws| (ws.workspace.uuid.clone(), ws.dismissal.clone()))
+            .collect();
 
         self.workspaces = workspaces
             .into_iter()
@@ -631,6 +721,16 @@ impl App {
                 let notes = load_workspace_notes(&ws.name);
                 let hook_status = load_hook_status(&ws.uuid);
                 let summary = old_summaries.get(&ws.uuid).cloned().flatten();
+                let edit_state = old_edit_states.get(&ws.uuid).cloned().flatten();
+                let peek_state = old_peek_states.get(&ws.uuid).cloned().flatten();
+                let regen = old_regen_states
+                    .get(&ws.uuid)
+                    .cloned()
+                    .unwrap_or_default();
+                let dismissal = old_dismissal_states
+                    .get(&ws.uuid)
+                    .cloned()
+                    .unwrap_or_default();
                 WorkspaceState {
                     workspace: ws,
                     session,
@@ -645,6 +745,11 @@ impl App {
                     summary,
                     summarizing: false,
                     trajectory,
+                    edit_state,
+                    peek_state,
+                    peek_yield_pending: false,
+                    regen,
+                    dismissal,
                 }
             })
             .collect();
@@ -850,6 +955,646 @@ impl App {
             ws.notes = load_workspace_notes(&ws.workspace.name);
         }
     }
+
+    /// Called when the file watcher detects a write to `<.data>/<uuid>/trajectory.md`.
+    /// Re-reads the trajectory doc from disk and updates the in-memory workspace state.
+    ///
+    /// If the workspace is currently being edited, the update is silently skipped —
+    /// the next 30 s refresh tick or a future watcher event will pick it up once
+    /// editing is done.
+    pub fn apply_trajectory_update(&mut self, uuid: &str) {
+        let Some(&idx) = self.workspace_index.get(uuid) else {
+            return;
+        };
+        // Skip if we're in an active insert-mode edit to avoid clobbering
+        // in-flight changes.
+        let is_editing = self.workspaces[idx]
+            .edit_state
+            .as_ref()
+            .map(|s| matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. }))
+            .unwrap_or(false);
+        if is_editing {
+            return;
+        }
+        let traj_path = crate::mc_data::paths::trajectory_path(uuid);
+        if traj_path.exists() {
+            if let Ok(doc) =
+                crate::mc_data::trajectory::TrajectoryDoc::load_from_file(&traj_path)
+            {
+                self.workspaces[idx].trajectory = Some(doc);
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Regen scheduler methods
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Increment the event counter for a workspace (called on agent events).
+    pub fn increment_regen_event_count(&mut self, uuid: &str) {
+        if let Some(&idx) = self.workspace_index.get(uuid) {
+            self.workspaces[idx].regen.events_since_last_regen += 1;
+        }
+    }
+
+    /// Return UUIDs of workspaces that are due for a trajectory regen.
+    ///
+    /// Thresholds (compile-time defaults, configurable in the future):
+    /// - ≥ 10 events since last regen, OR
+    /// - ≥ 300 seconds since last regen (with any events pending)
+    ///
+    /// Excluded if:
+    /// - trajectory is None (no trajectory file yet)
+    /// - workspace is in Insert mode editing
+    /// - a regen is already in flight
+    pub fn workspaces_due_for_regen(&self) -> Vec<String> {
+        const EVENT_THRESHOLD: u32 = 10;
+        const TIME_THRESHOLD_SECS: u64 = 300;
+
+        self.workspaces
+            .iter()
+            .filter(|ws| {
+                // Must have a trajectory to regenerate
+                if ws.trajectory.is_none() {
+                    return false;
+                }
+                // Don't regen while in insert mode
+                let is_editing = ws
+                    .edit_state
+                    .as_ref()
+                    .map(|s| matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. }))
+                    .unwrap_or(false);
+                if is_editing {
+                    return false;
+                }
+                // Don't spawn another if one is already running
+                if ws.regen.regen_in_flight {
+                    return false;
+                }
+                // Must have at least 1 event pending (time threshold requires some change)
+                if ws.regen.events_since_last_regen == 0 {
+                    return false;
+                }
+                // Check event threshold
+                if ws.regen.events_since_last_regen >= EVENT_THRESHOLD {
+                    return true;
+                }
+                // Check time threshold
+                if let Some(last_at) = ws.regen.last_regen_at {
+                    if last_at.elapsed().as_secs() >= TIME_THRESHOLD_SECS {
+                        return true;
+                    }
+                } else {
+                    // Never regenerated but has events — use time threshold from
+                    // startup (treat as 300s+ elapsed so first regen fires promptly)
+                    if ws.regen.events_since_last_regen > 0 {
+                        return true;
+                    }
+                }
+                false
+            })
+            .map(|ws| ws.workspace.uuid.clone())
+            .collect()
+    }
+
+    /// Mark a workspace's regen as in-flight.
+    pub fn mark_regen_in_flight(&mut self, uuid: &str) {
+        if let Some(&idx) = self.workspace_index.get(uuid) {
+            self.workspaces[idx].regen.regen_in_flight = true;
+        }
+    }
+
+    /// Build the regen inputs for a workspace to pass to the LLM task.
+    pub fn build_regen_inputs(&self, uuid: &str) -> Option<RegenInputs> {
+        let idx = *self.workspace_index.get(uuid)?;
+        let ws = &self.workspaces[idx];
+        let trajectory = ws.trajectory.as_ref()?;
+
+        // Load recent events from disk
+        let events_path = crate::mc_data::paths::events_log(uuid);
+        let recent_events = crate::mc_data::events::load(&events_path)
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+
+        // Load recent user explanations from inputs dir
+        let inputs_dir = crate::mc_data::paths::inputs_dir(uuid);
+        let recent_user_explanations = load_recent_user_explanations(&inputs_dir, 3);
+
+        // Collect session bullets
+        let session_bullets = ws
+            .session
+            .as_ref()
+            .map(|s| s.bullets.clone())
+            .unwrap_or_default();
+
+        // Collect surface summaries from .summary files
+        let surfaces_dir = crate::mc_data::paths::surfaces_dir(uuid);
+        let surface_summaries = load_surface_summaries(&surfaces_dir);
+
+        // Cmux surface order from workspace surfaces list (use titles as identifiers)
+        let cmux_surface_order = ws.surfaces.iter().map(|s| s.title.clone()).collect();
+
+        Some(RegenInputs {
+            workspace_name: ws.workspace.name.clone(),
+            current_trajectory: trajectory.to_markdown(),
+            recent_events,
+            recent_user_explanations,
+            session_bullets,
+            surface_summaries,
+            tool_call_count: ws.tool_call_count,
+            cmux_surface_order,
+        })
+    }
+
+    /// Apply a completed trajectory regen to a workspace.
+    ///
+    /// This replaces the in-memory trajectory, saves to disk, and resets the
+    /// regen scheduler state. Silently skips if the workspace is in insert mode
+    /// (the next regen tick will pick it up).
+    pub fn apply_regenerated_trajectory(
+        &mut self,
+        uuid: &str,
+        mut doc: crate::mc_data::trajectory::TrajectoryDoc,
+    ) {
+        let Some(&idx) = self.workspace_index.get(uuid) else {
+            return;
+        };
+        // Don't overwrite an active insert-mode edit session.
+        let is_editing = self.workspaces[idx]
+            .edit_state
+            .as_ref()
+            .map(|s| matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. }))
+            .unwrap_or(false);
+        if is_editing {
+            // Clear in-flight flag so the next tick can retry.
+            self.workspaces[idx].regen.regen_in_flight = false;
+            return;
+        }
+
+        // Ensure canonical sections exist.
+        doc.ensure_sections();
+
+        // Persist to disk — non-fatal on error.
+        let traj_path = crate::mc_data::paths::trajectory_path(uuid);
+        if let Err(e) = doc.save_to_file(&traj_path) {
+            eprintln!("apply_regenerated_trajectory save({uuid}): {e:?}");
+        }
+
+        // Update in-memory state.
+        self.workspaces[idx].trajectory = Some(doc);
+        self.workspaces[idx].regen.last_regen_at = Some(Instant::now());
+        self.workspaces[idx].regen.events_since_last_regen = 0;
+        self.workspaces[idx].regen.regen_in_flight = false;
+    }
+
+    /// Return (uuid, sid, log_path) tuples for shell surfaces due for summarization.
+    ///
+    /// Scans the surfaces dir for `.log` files that don't yet have a corresponding
+    /// `.summary` file (or whose summary is stale). The sid is derived from the
+    /// log filename stem.
+    pub fn surfaces_due_for_summary(&self) -> Vec<(String, String, PathBuf)> {
+        let mut result = Vec::new();
+        for ws in &self.workspaces {
+            let uuid = &ws.workspace.uuid;
+            let surfaces_dir = crate::mc_data::paths::surfaces_dir(uuid);
+            if !surfaces_dir.exists() {
+                continue;
+            }
+            let entries = match std::fs::read_dir(&surfaces_dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("log") {
+                    continue;
+                }
+                let sid = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                let log_path = path;
+                let summary_path = surfaces_dir.join(format!("{sid}.summary"));
+                // Due if no summary file exists, or log is newer than summary.
+                let due = if !summary_path.exists() {
+                    true
+                } else {
+                    // Compare mtimes — if log is newer, re-summarize.
+                    let log_mtime = std::fs::metadata(&log_path).ok()
+                        .and_then(|m| m.modified().ok());
+                    let summary_mtime = std::fs::metadata(&summary_path).ok()
+                        .and_then(|m| m.modified().ok());
+                    match (log_mtime, summary_mtime) {
+                        (Some(lm), Some(sm)) => lm > sm,
+                        _ => false,
+                    }
+                };
+                if due {
+                    result.push((uuid.clone(), sid, log_path));
+                }
+            }
+        }
+        result
+    }
+
+    /// Apply a surface summary result (called from main.rs on task completion).
+    pub fn apply_surface_summary(&mut self, uuid: &str, sid: &str, summary: String) {
+        // Write to disk immediately; the in-memory value is in the .summary file.
+        let surfaces_dir = crate::mc_data::paths::surfaces_dir(uuid);
+        if let Err(e) = crate::llm::surface_summary::write_summary_file(&surfaces_dir, sid, &summary) {
+            eprintln!("apply_surface_summary({uuid}/{sid}): {e:?}");
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Dispatch a key event to the trajectory editor for the selected workspace.
+    ///
+    /// Returns any `EditAction`s that should be persisted on the next Esc-save.
+    /// If the focused workspace has no trajectory, or the detail pane is not
+    /// focused, returns an empty Vec.
+    ///
+    /// Peek mode is handled first: when `peek_state` is Some, keys are routed
+    /// to peek navigation (j/k/g/G/Esc/Enter) and normal editing is bypassed.
+    pub fn handle_trajectory_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> Vec<crate::tui::trajectory_edit::EditAction> {
+        use crossterm::event::KeyCode;
+        let idx = self.selected;
+
+        // ── Peek mode: intercept before the editor sees anything ────────────
+        {
+            let ws = match self.workspaces.get_mut(idx) {
+                Some(w) => w,
+                None => return vec![],
+            };
+            if ws.peek_state.is_some() {
+                let peek = ws.peek_state.as_mut().unwrap();
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => { peek.scroll_down(); }
+                    KeyCode::Char('k') | KeyCode::Up   => { peek.scroll_up(); }
+                    KeyCode::Char('g')                  => { peek.go_top(); }
+                    KeyCode::Char('G')                  => { peek.go_bottom(); }
+                    KeyCode::Esc => {
+                        // Exit peek mode — back to trajectory nav.
+                        ws.peek_state = None;
+                    }
+                    KeyCode::Enter => {
+                        // Yield: select the workspace in cmux, then clear peek.
+                        // The actual cmux call is spawned asynchronously by the
+                        // caller reading `peek_yield_pending` from the workspace.
+                        // We just set a flag; the TUI event loop will act on it.
+                        ws.peek_yield_pending = true;
+                    }
+                    _ => { /* all other keys are no-ops in peek mode */ }
+                }
+                return vec![];
+            }
+        }
+
+        // ── Normal trajectory editing ────────────────────────────────────────
+        let ws = match self.workspaces.get_mut(idx) {
+            Some(w) => w,
+            None => return vec![],
+        };
+        let doc = match ws.trajectory.as_mut() {
+            Some(d) => d,
+            None => return vec![],
+        };
+        // Lazily initialise edit_state when first needed.
+        let state = ws.edit_state.get_or_insert_with(|| {
+            crate::tui::trajectory_edit::TrajectoryEditState::default()
+        });
+
+        // ── Nav mode + Enter on a Current surfaces row → enter peek ─────────
+        use crate::mc_data::trajectory::SECTION_CURRENT_SURFACES;
+        if key.code == KeyCode::Enter
+            && matches!(state.mode, crate::tui::trajectory_edit::EditMode::Nav)
+        {
+            let sec_idx = state.cursor_section;
+            let item_idx = state.cursor_item;
+            let section = doc.sections.get(sec_idx);
+            if let Some(sec) = section {
+                if sec.name == SECTION_CURRENT_SURFACES {
+                    let item = sec.items.get(item_idx);
+                    // Use surface_id if present; fall back to workspace ref_id.
+                    let surface_ref = item
+                        .and_then(|i| i.surface_id.as_deref())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| ws.workspace.ref_id.clone());
+                    let surface_label = item
+                        .map(|i| {
+                            if let Some(ref sid) = i.surface_id {
+                                format!("{} ({})", i.text.as_str(), sid)
+                            } else {
+                                i.text.clone()
+                            }
+                        })
+                        .unwrap_or_else(|| ws.workspace.ref_id.clone());
+                    ws.peek_state = Some(crate::tui::peek_view::PeekState::new(
+                        surface_ref,
+                        surface_label,
+                    ));
+                    return vec![];
+                }
+            }
+        }
+
+        crate::tui::trajectory_edit::handle_key(state, doc, key)
+    }
+
+    /// Called from the event loop to check whether a peek-yield is pending for
+    /// the selected workspace. Clears the flag and returns the workspace ref_id
+    /// to pass to `cmux select-workspace`.
+    pub fn take_peek_yield(&mut self) -> Option<String> {
+        let idx = self.selected;
+        let ws = self.workspaces.get_mut(idx)?;
+        if ws.peek_yield_pending {
+            ws.peek_yield_pending = false;
+            // After yielding, clear peek state (the user is going to work there).
+            let ref_id = ws.peek_state
+                .as_ref()
+                .map(|p| p.surface_ref.clone())
+                .unwrap_or_else(|| ws.workspace.ref_id.clone());
+            ws.peek_state = None;
+            Some(ref_id)
+        } else {
+            None
+        }
+    }
+
+    /// Apply a screen update to the active peek state for the given workspace.
+    pub fn apply_peek_screen_update(&mut self, workspace_uuid: &str, screen_text: String) {
+        if let Some(&idx) = self.workspace_index.get(workspace_uuid) {
+            if let Some(peek) = self.workspaces[idx].peek_state.as_mut() {
+                peek.ingest_screen(&screen_text);
+            }
+        }
+    }
+
+    /// Returns whether the selected workspace is currently in peek mode and
+    /// needs a screen poll.
+    pub fn peek_needs_poll(&self) -> Option<(&str, &str)> {
+        let ws = self.workspaces.get(self.selected)?;
+        let peek = ws.peek_state.as_ref()?;
+        if peek.should_poll() {
+            Some((&ws.workspace.uuid, &peek.surface_ref))
+        } else {
+            None
+        }
+    }
+
+    /// Mark the active peek as polling (prevents duplicate concurrent polls).
+    pub fn mark_peek_polling(&mut self) {
+        let idx = self.selected;
+        if let Some(ws) = self.workspaces.get_mut(idx) {
+            if let Some(peek) = ws.peek_state.as_mut() {
+                peek.polling = true;
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Dismissal methods
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Update the open_surfaces count for a workspace.
+    /// When count drops to zero, start the grace timer.
+    /// When count rises above zero, cancel the grace timer.
+    pub fn set_open_surfaces(&mut self, uuid: &str, count: u32) {
+        if let Some(&idx) = self.workspace_index.get(uuid) {
+            let ds = &mut self.workspaces[idx].dismissal;
+            let was_zero = ds.open_surfaces == 0;
+            ds.open_surfaces = count;
+            if count == 0 && !was_zero {
+                // Surfaces just dropped to zero — start grace timer.
+                ds.grace_started_at = Some(Instant::now());
+            } else if count > 0 {
+                // A surface re-attached — cancel the grace timer.
+                ds.grace_started_at = None;
+            }
+        }
+    }
+
+    /// Return UUIDs of workspaces whose grace timer has elapsed.
+    /// Excludes workspaces already marked as dismissing.
+    pub fn workspaces_ready_for_dismissal(&self, grace: std::time::Duration) -> Vec<String> {
+        self.workspaces
+            .iter()
+            .filter(|ws| {
+                if ws.dismissal.dismissing {
+                    return false;
+                }
+                if let Some(started_at) = ws.dismissal.grace_started_at {
+                    started_at.elapsed() >= grace
+                } else {
+                    false
+                }
+            })
+            .map(|ws| ws.workspace.uuid.clone())
+            .collect()
+    }
+
+    /// Gather all available data for the learning LLM call.
+    pub fn build_learning_inputs(&self, uuid: &str) -> crate::llm::learning::LearningInputs {
+        let idx = self.workspace_index.get(uuid).copied();
+        let ws = idx.and_then(|i| self.workspaces.get(i));
+
+        let workspace_name = ws
+            .map(|w| w.workspace.name.clone())
+            .unwrap_or_else(|| uuid.to_string());
+        let project = crate::mc_data::workspace::read_project(uuid)
+            .unwrap_or_else(|_| workspace_name.clone());
+
+        // Duration from screen insights if available.
+        let duration = ws
+            .and_then(|w| w.screen_insights.duration.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Surfaces summary from surface titles.
+        let surfaces_summary = ws
+            .map(|w| w.surfaces.iter().map(|s| s.title.clone()).collect())
+            .unwrap_or_default();
+
+        // Final trajectory from disk.
+        let final_trajectory = {
+            let path = crate::mc_data::paths::trajectory_path(uuid);
+            std::fs::read_to_string(&path).unwrap_or_default()
+        };
+
+        // History snapshots: histories/trajectory-N.md in chronological order.
+        let history_snapshots = {
+            let histories_dir = crate::mc_data::paths::histories_dir(uuid);
+            let mut snaps: Vec<(u32, String)> = std::fs::read_dir(&histories_dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    let stem = p.file_stem()?.to_str()?.to_string();
+                    // filename: trajectory-N.md
+                    let n: u32 = stem.strip_prefix("trajectory-")?.parse().ok()?;
+                    let content = std::fs::read_to_string(&p).ok()?;
+                    Some((n, content))
+                })
+                .collect();
+            snaps.sort_by_key(|(n, _)| *n);
+            snaps.into_iter().map(|(_, c)| c).collect()
+        };
+
+        // User inputs: inputs/N.txt in order.
+        let inputs = {
+            let inputs_dir = crate::mc_data::paths::inputs_dir(uuid);
+            let mut entries: Vec<(u32, String)> = std::fs::read_dir(&inputs_dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    if p.extension().and_then(|x| x.to_str()) != Some("txt") {
+                        return None;
+                    }
+                    let n: u32 = p.file_stem()?.to_str()?.parse().ok()?;
+                    let content = std::fs::read_to_string(&p).ok()?;
+                    Some((n, content))
+                })
+                .collect();
+            entries.sort_by_key(|(n, _)| *n);
+            entries.into_iter().map(|(_, c)| c).collect()
+        };
+
+        // Full events log.
+        let events_jsonl = {
+            let path = crate::mc_data::paths::events_log(uuid);
+            std::fs::read_to_string(&path).unwrap_or_default()
+        };
+
+        // Agent session history files: surfaces/<sid>.session-path pointer.
+        let session_history_files = {
+            let surfaces_dir = crate::mc_data::paths::surfaces_dir(uuid);
+            let mut histories = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&surfaces_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("session-path") {
+                        if let Ok(session_path) = std::fs::read_to_string(&p) {
+                            let session_path = session_path.trim();
+                            if let Ok(content) = std::fs::read_to_string(session_path) {
+                                histories.push(content);
+                            }
+                        }
+                    }
+                }
+            }
+            histories
+        };
+
+        // Shell logs: surfaces/<sid>.log.
+        let shell_logs = {
+            let surfaces_dir = crate::mc_data::paths::surfaces_dir(uuid);
+            let mut logs = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&surfaces_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("log") {
+                        if let Ok(content) = std::fs::read_to_string(&p) {
+                            logs.push(content);
+                        }
+                    }
+                }
+            }
+            logs
+        };
+
+        // Surface summary files.
+        let surface_summaries = {
+            let surfaces_dir = crate::mc_data::paths::surfaces_dir(uuid);
+            let mut summaries = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&surfaces_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("summary") {
+                        if let Ok(content) = std::fs::read_to_string(&p) {
+                            let trimmed = content.trim().to_string();
+                            if !trimmed.is_empty() {
+                                summaries.push(trimmed);
+                            }
+                        }
+                    }
+                }
+            }
+            summaries
+        };
+
+        crate::llm::learning::LearningInputs {
+            workspace_uuid: uuid.to_string(),
+            workspace_name,
+            project,
+            duration,
+            surfaces_summary,
+            final_trajectory,
+            history_snapshots,
+            inputs,
+            events_jsonl,
+            session_history_files,
+            shell_logs,
+            surface_summaries,
+        }
+    }
+
+    /// Mark a workspace as currently being dismissed (prevents re-triggering).
+    pub fn mark_dismissing(&mut self, uuid: &str) {
+        if let Some(&idx) = self.workspace_index.get(uuid) {
+            self.workspaces[idx].dismissal.dismissing = true;
+        }
+    }
+
+    /// Remove a workspace from in-memory state after successful dismissal.
+    pub fn drop_dismissed_workspace(&mut self, uuid: &str) {
+        if let Some(&idx) = self.workspace_index.get(uuid) {
+            self.workspaces.remove(idx);
+            // Rebuild the index.
+            self.workspace_index.clear();
+            for (i, ws) in self.workspaces.iter().enumerate() {
+                self.workspace_index.insert(ws.workspace.uuid.clone(), i);
+            }
+            // Clamp selected index.
+            if !self.workspaces.is_empty() && self.selected >= self.workspaces.len() {
+                self.selected = self.workspaces.len() - 1;
+            }
+        }
+    }
+
+    /// Save the current edit session for the selected workspace to disk.
+    /// Returns the snapshot number N on success.
+    pub fn save_trajectory_edits(
+        &mut self,
+        actions: &[crate::tui::trajectory_edit::EditAction],
+    ) -> anyhow::Result<Option<u32>> {
+        let idx = self.selected;
+        let ws = match self.workspaces.get_mut(idx) {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        let doc = match ws.trajectory.as_mut() {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let state = match ws.edit_state.as_ref() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let uuid = ws.workspace.uuid.clone();
+        let n = crate::tui::trajectory_edit::save(&uuid, doc, state, actions)?;
+        Ok(Some(n))
+    }
 }
 
 /// Spawn a background task that captures a workspace's screen (and optionally
@@ -923,4 +1668,508 @@ fn hash_bullets(bullets: &[String]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bullets.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Load the last `n` user explanation files from `inputs_dir/<N>.txt`.
+/// Returns them in chronological order (oldest first).
+fn load_recent_user_explanations(inputs_dir: &PathBuf, n: usize) -> Vec<String> {
+    let mut entries: Vec<(u32, PathBuf)> = match std::fs::read_dir(inputs_dir) {
+        Ok(rd) => rd
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) != Some("txt") {
+                    return None;
+                }
+                let stem = p.file_stem()?.to_str()?.parse::<u32>().ok()?;
+                Some((stem, p))
+            })
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    entries.sort_by_key(|(n, _)| *n);
+    entries
+        .into_iter()
+        .rev()
+        .take(n)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .filter_map(|(_, p)| std::fs::read_to_string(p).ok())
+        .collect()
+}
+
+/// Load `.summary` files from a surfaces directory.
+/// Returns (sid, summary_text) pairs.
+fn load_surface_summaries(surfaces_dir: &PathBuf) -> Vec<(String, String)> {
+    if !surfaces_dir.exists() {
+        return Vec::new();
+    }
+    let entries = match std::fs::read_dir(surfaces_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut result = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("summary") {
+            continue;
+        }
+        let sid = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let summary = text.trim().to_string();
+            if !summary.is_empty() {
+                result.push((sid, summary));
+            }
+        }
+    }
+    result
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmux::client::Workspace;
+    use crate::mc_data::trajectory::TrajectoryDoc;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn shift_key(c: char) -> KeyEvent {
+        KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    // Trajectory doc with a `## Current surfaces` item that has a surface_id.
+    const SAMPLE_WITH_SURFACE: &str = "---
+workspace: test-ws
+---
+
+## Goal
+- Build investment agent
+
+## Current surfaces
+- claude · mbp · working              <!-- mc:surface:sid-42 -->
+
+## Tasks & Progress
+- [ ] sprint-01
+";
+
+    // Trajectory doc with a `## Current surfaces` item with NO surface_id.
+    const SAMPLE_NO_SURFACE_ID: &str = "---
+workspace: test-ws
+---
+
+## Goal
+- Build investment agent
+
+## Current surfaces
+- claude · mbp · working
+
+## Tasks & Progress
+- [ ] sprint-01
+";
+
+    fn make_ws(doc_text: &str) -> WorkspaceState {
+        let mut doc = TrajectoryDoc::parse(doc_text).unwrap();
+        doc.ensure_sections();
+        WorkspaceState {
+            workspace: Workspace {
+                ref_id: "workspace:3".to_string(),
+                uuid: "test-uuid-1".to_string(),
+                name: "test-ws".to_string(),
+                selected: false,
+            },
+            session: None,
+            surfaces: Vec::new(),
+            screen_preview: None,
+            screen_insights: ScreenInsights::default(),
+            tool_call_count: 0,
+            notes: None,
+            hook_status: None,
+            classification: None,
+            loading: false,
+            summary: None,
+            summarizing: false,
+            trajectory: Some(doc),
+            edit_state: None,
+            peek_state: None,
+            peek_yield_pending: false,
+            regen: RegenSchedulerState::default(),
+            dismissal: DismissalState::default(),
+        }
+    }
+
+    fn make_app(doc_text: &str) -> App {
+        let ws = make_ws(doc_text);
+        let mut app = App::new();
+        app.workspaces.push(ws);
+        app.workspace_index.insert("test-uuid-1".to_string(), 0);
+        app.selected = 0;
+        app
+    }
+
+    // ── Enter on Current surfaces row → enters peek mode ─────────────────────
+
+    #[test]
+    fn enter_on_current_surfaces_row_enters_peek_mode() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        // Navigate to section 1 (Current surfaces), item 0.
+        let state = app.workspaces[0].edit_state.get_or_insert_with(Default::default);
+        state.cursor_section = 1;
+        state.cursor_item = 0;
+
+        app.handle_trajectory_key(key(KeyCode::Enter));
+
+        assert!(
+            app.workspaces[0].peek_state.is_some(),
+            "peek_state should be Some after Enter on Current surfaces row"
+        );
+    }
+
+    #[test]
+    fn enter_on_current_surfaces_row_uses_surface_id() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let state = app.workspaces[0].edit_state.get_or_insert_with(Default::default);
+        state.cursor_section = 1;
+        state.cursor_item = 0;
+
+        app.handle_trajectory_key(key(KeyCode::Enter));
+
+        let peek = app.workspaces[0].peek_state.as_ref().unwrap();
+        assert_eq!(
+            peek.surface_ref, "sid-42",
+            "surface_ref should match surface_id in comment"
+        );
+    }
+
+    #[test]
+    fn enter_on_current_surfaces_row_falls_back_to_workspace_ref() {
+        let mut app = make_app(SAMPLE_NO_SURFACE_ID);
+        let state = app.workspaces[0].edit_state.get_or_insert_with(Default::default);
+        state.cursor_section = 1;
+        state.cursor_item = 0;
+
+        app.handle_trajectory_key(key(KeyCode::Enter));
+
+        let peek = app.workspaces[0].peek_state.as_ref().unwrap();
+        assert_eq!(
+            peek.surface_ref, "workspace:3",
+            "should fall back to workspace ref_id when no surface_id"
+        );
+    }
+
+    // ── Esc in peek mode → clears peek_state ─────────────────────────────────
+
+    #[test]
+    fn esc_in_peek_mode_clears_peek_state() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        // Put app into peek mode manually.
+        app.workspaces[0].peek_state = Some(
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string())
+        );
+
+        app.handle_trajectory_key(key(KeyCode::Esc));
+
+        assert!(
+            app.workspaces[0].peek_state.is_none(),
+            "peek_state should be None after Esc"
+        );
+    }
+
+    // ── j / k in peek mode adjust scroll_offset ──────────────────────────────
+
+    #[test]
+    fn j_in_peek_mode_scrolls_down() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let mut ps =
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string());
+        // Fill buffer so scrolling has room.
+        for i in 0..50 {
+            ps.screen_buffer.push(format!("line {i}"));
+        }
+        app.workspaces[0].peek_state = Some(ps);
+
+        app.handle_trajectory_key(key(KeyCode::Char('j')));
+
+        let offset = app.workspaces[0].peek_state.as_ref().unwrap().scroll_offset;
+        assert_eq!(offset, 3, "j should increase scroll_offset by 3");
+    }
+
+    #[test]
+    fn k_in_peek_mode_scrolls_up() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let mut ps =
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string());
+        for i in 0..50 {
+            ps.screen_buffer.push(format!("line {i}"));
+        }
+        ps.scroll_offset = 10;
+        app.workspaces[0].peek_state = Some(ps);
+
+        app.handle_trajectory_key(key(KeyCode::Char('k')));
+
+        let offset = app.workspaces[0].peek_state.as_ref().unwrap().scroll_offset;
+        assert_eq!(offset, 7, "k should decrease scroll_offset by 3");
+    }
+
+    // ── g / G in peek mode ────────────────────────────────────────────────────
+
+    #[test]
+    fn g_in_peek_mode_goes_to_top() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let mut ps =
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string());
+        for i in 0..50 {
+            ps.screen_buffer.push(format!("line {i}"));
+        }
+        ps.scroll_offset = 20;
+        app.workspaces[0].peek_state = Some(ps);
+
+        app.handle_trajectory_key(key(KeyCode::Char('g')));
+
+        let offset = app.workspaces[0].peek_state.as_ref().unwrap().scroll_offset;
+        assert_eq!(offset, 0, "g should reset scroll_offset to 0");
+    }
+
+    #[test]
+    fn big_g_in_peek_mode_goes_to_bottom() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let mut ps =
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string());
+        for i in 0..30 {
+            ps.screen_buffer.push(format!("line {i}"));
+        }
+        app.workspaces[0].peek_state = Some(ps);
+
+        app.handle_trajectory_key(shift_key('G'));
+
+        let peek = app.workspaces[0].peek_state.as_ref().unwrap();
+        assert_eq!(
+            peek.scroll_offset,
+            peek.max_scroll(),
+            "G should go to max scroll offset"
+        );
+    }
+
+    // ── Enter in peek mode sets yield_pending ─────────────────────────────────
+
+    #[test]
+    fn enter_in_peek_mode_sets_yield_pending() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.workspaces[0].peek_state = Some(
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string())
+        );
+
+        app.handle_trajectory_key(key(KeyCode::Enter));
+
+        assert!(
+            app.workspaces[0].peek_yield_pending,
+            "peek_yield_pending should be true after Enter in peek mode"
+        );
+    }
+
+    // ── take_peek_yield ───────────────────────────────────────────────────────
+
+    #[test]
+    fn take_peek_yield_returns_ref_id_and_clears_peek() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.workspaces[0].peek_state = Some(
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string())
+        );
+        app.workspaces[0].peek_yield_pending = true;
+
+        let ref_id = app.take_peek_yield();
+
+        assert_eq!(ref_id, Some("workspace:3".to_string()));
+        assert!(app.workspaces[0].peek_state.is_none(), "peek_state cleared on yield");
+        assert!(!app.workspaces[0].peek_yield_pending, "flag cleared");
+    }
+
+    #[test]
+    fn take_peek_yield_returns_none_when_not_pending() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.workspaces[0].peek_state = Some(
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string())
+        );
+        // peek_yield_pending is false (default)
+
+        let ref_id = app.take_peek_yield();
+        assert!(ref_id.is_none());
+        assert!(app.workspaces[0].peek_state.is_some(), "peek_state unchanged");
+    }
+
+    // ── Regen scheduler ───────────────────────────────────────────────────────
+
+    #[test]
+    fn workspaces_due_for_regen_excludes_insert_mode() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        // Set up enough events to trigger event-threshold regen.
+        app.workspaces[0].regen.events_since_last_regen = 15;
+        // Put workspace into insert mode.
+        let state = app.workspaces[0].edit_state.get_or_insert_with(Default::default);
+        state.mode = crate::tui::trajectory_edit::EditMode::Insert {
+            focus: crate::tui::trajectory_edit::InsertFocus::Item,
+        };
+
+        let due = app.workspaces_due_for_regen();
+        assert!(
+            due.is_empty(),
+            "should not schedule regen while workspace is in Insert mode"
+        );
+    }
+
+    #[test]
+    fn workspaces_due_for_regen_excludes_in_flight() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.workspaces[0].regen.events_since_last_regen = 15;
+        app.workspaces[0].regen.regen_in_flight = true;
+
+        let due = app.workspaces_due_for_regen();
+        assert!(
+            due.is_empty(),
+            "should not schedule regen when one is already in flight"
+        );
+    }
+
+    #[test]
+    fn workspaces_due_for_regen_includes_past_time_threshold() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        // Set last_regen_at to a time far in the past (simulate by subtracting
+        // a large duration). We use Instant::now() minus 400s which is > 300s threshold.
+        // Since Instant doesn't support subtraction of arbitrary durations in a
+        // portable way, we set last_regen_at to None (never regenerated) with events > 0.
+        // Never-regenerated + has events => time threshold applies immediately.
+        app.workspaces[0].regen.events_since_last_regen = 1;
+        app.workspaces[0].regen.last_regen_at = None;
+        // No insert mode, no in-flight.
+
+        let due = app.workspaces_due_for_regen();
+        assert_eq!(
+            due,
+            vec!["test-uuid-1".to_string()],
+            "workspace never regenerated with pending events should be due"
+        );
+    }
+
+    #[test]
+    fn workspaces_due_for_regen_event_threshold() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        // Set last_regen_at to now (just happened), but accumulate enough events.
+        app.workspaces[0].regen.last_regen_at = Some(Instant::now());
+        app.workspaces[0].regen.events_since_last_regen = 10; // at threshold
+
+        let due = app.workspaces_due_for_regen();
+        assert_eq!(
+            due,
+            vec!["test-uuid-1".to_string()],
+            "workspace at event threshold should be due even if time threshold not met"
+        );
+    }
+
+    #[test]
+    fn workspaces_due_for_regen_excludes_zero_events() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.workspaces[0].regen.events_since_last_regen = 0;
+        app.workspaces[0].regen.last_regen_at = None;
+
+        let due = app.workspaces_due_for_regen();
+        assert!(
+            due.is_empty(),
+            "workspace with 0 pending events should not be due for regen"
+        );
+    }
+
+    #[test]
+    fn apply_regenerated_trajectory_replaces_and_resets() {
+        use crate::mc_data::trajectory::TrajectoryDoc;
+
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.workspaces[0].regen.events_since_last_regen = 5;
+        app.workspaces[0].regen.regen_in_flight = true;
+
+        let new_doc_text = "---\nworkspace: test-ws\n---\n\n## Goal\n- Updated goal\n\n## Current surfaces\n\n## Tasks & Progress\n- [ ] new task\n";
+        let new_doc = TrajectoryDoc::parse(new_doc_text).unwrap();
+
+        // apply_regenerated_trajectory saves to disk, so we need the path to exist.
+        // We skip the disk save assertion in unit tests — just verify in-memory state.
+        // Since the path won't exist in test, we test via direct inspection only.
+        // Note: save_to_file will mkdir-p and write, so it will succeed on real filesystem.
+        app.apply_regenerated_trajectory("test-uuid-1", new_doc);
+
+        let ws = &app.workspaces[0];
+        assert_eq!(
+            ws.regen.events_since_last_regen, 0,
+            "events counter should reset after regen"
+        );
+        assert!(
+            !ws.regen.regen_in_flight,
+            "in_flight flag should be cleared after regen"
+        );
+        assert!(
+            ws.regen.last_regen_at.is_some(),
+            "last_regen_at should be set after regen"
+        );
+        // Verify the trajectory was actually replaced.
+        let goal_items = ws.trajectory.as_ref()
+            .and_then(|d| d.section("Goal"))
+            .map(|s| s.items.iter().map(|i| i.text.clone()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(
+            goal_items.iter().any(|t| t.contains("Updated goal")),
+            "trajectory should be replaced with new content"
+        );
+    }
+
+    #[test]
+    fn apply_regenerated_trajectory_skips_insert_mode() {
+        use crate::mc_data::trajectory::TrajectoryDoc;
+
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.workspaces[0].regen.regen_in_flight = true;
+        // Enter insert mode.
+        let state = app.workspaces[0].edit_state.get_or_insert_with(Default::default);
+        state.mode = crate::tui::trajectory_edit::EditMode::Insert {
+            focus: crate::tui::trajectory_edit::InsertFocus::Item,
+        };
+
+        let new_doc_text = "---\nworkspace: test-ws\n---\n\n## Goal\n- Should not appear\n\n## Current surfaces\n\n## Tasks & Progress\n";
+        let new_doc = TrajectoryDoc::parse(new_doc_text).unwrap();
+        app.apply_regenerated_trajectory("test-uuid-1", new_doc);
+
+        // In-flight flag should be cleared so next tick can retry.
+        assert!(
+            !app.workspaces[0].regen.regen_in_flight,
+            "in_flight flag cleared even when skipping due to insert mode"
+        );
+        // Trajectory should NOT be replaced.
+        let goal_items = app.workspaces[0].trajectory.as_ref()
+            .and_then(|d| d.section("Goal"))
+            .map(|s| s.items.iter().map(|i| i.text.clone()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(
+            !goal_items.iter().any(|t| t.contains("Should not appear")),
+            "trajectory should NOT be replaced while in insert mode"
+        );
+    }
 }

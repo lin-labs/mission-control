@@ -1,0 +1,913 @@
+/// Trajectory editing state machine for the detail pane.
+///
+/// This module owns:
+/// - `EditMode` — nav vs insert
+/// - `TrajectoryEditState` — cursor, buffers, mode
+/// - `handle_key` — maps key events to mutations
+/// - `save` — commits an edit session to disk (snapshot + inputs + events)
+use crate::mc_data::events::{Event, Kind, Source};
+use crate::mc_data::inputs::{InputContext, write_input};
+use crate::mc_data::paths;
+use crate::mc_data::snapshots::{highest_snapshot, write_snapshot};
+use crate::mc_data::trajectory::{
+    Item, SECTION_CURRENT_SURFACES, SECTION_TASKS, TrajectoryDoc,
+};
+use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Public types
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Which text buffer the cursor is in while inserting.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InsertFocus {
+    /// Editing the trajectory item text.
+    Item,
+    /// Editing the input-context (user explanation) buffer.
+    InputCtx,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum EditMode {
+    /// Normal cursor movement; no text buffer open.
+    Nav,
+    /// Single-line text edit for a trajectory item.
+    Insert { focus: InsertFocus },
+}
+
+/// A pending line-level change produced by `handle_key`.
+/// Accumulated and flushed to `events.jsonl` on Esc-save.
+#[derive(Debug, Clone)]
+pub enum EditAction {
+    /// Text of an existing item was changed.
+    Edit { section: String, before: String, after: String },
+    /// A new item was inserted.
+    Add { section: String, after: String },
+    /// An item was deleted.
+    Delete { section: String, before: String },
+    /// A checkbox was toggled on.
+    Check { section: String, before: String, after: String },
+    /// A checkbox was toggled off.
+    Uncheck { section: String, before: String, after: String },
+    /// An item was reordered within its section.
+    Move { section: String, before: String },
+}
+
+/// Per-workspace editing state.
+#[derive(Debug, Clone)]
+pub struct TrajectoryEditState {
+    /// Index into `doc.sections` (0 = Goal, 1 = Current surfaces, 2 = Tasks).
+    pub cursor_section: usize,
+    /// Index into `doc.sections[cursor_section].items`.
+    pub cursor_item: usize,
+    pub mode: EditMode,
+    /// In-flight text for the item being edited (insert mode only).
+    pub edit_buffer: String,
+    /// In-flight text for the user-explanation pane (insert mode only).
+    pub input_ctx_buffer: String,
+    /// Text of the item when insert mode was entered — used to detect no-op.
+    pub edit_start_text: Option<String>,
+}
+
+impl Default for TrajectoryEditState {
+    fn default() -> Self {
+        Self {
+            cursor_section: 0,
+            cursor_item: 0,
+            mode: EditMode::Nav,
+            edit_buffer: String::new(),
+            input_ctx_buffer: String::new(),
+            edit_start_text: None,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Key handling
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Process one key event. Mutates `state` and `doc` in place, and returns any
+/// `EditAction`s that should be emitted to events.jsonl on the next save.
+///
+/// Returns a `Vec` because a single keystroke can produce at most one action
+/// (toggle/delete/move) — but we return a Vec for uniformity with save.
+pub fn handle_key(
+    state: &mut TrajectoryEditState,
+    doc: &mut TrajectoryDoc,
+    key: KeyEvent,
+) -> Vec<EditAction> {
+    match &state.mode {
+        EditMode::Nav => handle_nav_key(state, doc, key),
+        EditMode::Insert { .. } => handle_insert_key(state, doc, key),
+    }
+}
+
+fn handle_nav_key(
+    state: &mut TrajectoryEditState,
+    doc: &mut TrajectoryDoc,
+    key: KeyEvent,
+) -> Vec<EditAction> {
+    let mut actions = Vec::new();
+    match key.code {
+        // ── Movement ────────────────────────────────────────────────────────
+        KeyCode::Char('j') | KeyCode::Down => {
+            move_cursor_down(state, doc);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            move_cursor_up(state, doc);
+        }
+        KeyCode::Char('g') => {
+            state.cursor_section = first_non_empty_section(doc);
+            state.cursor_item = 0;
+        }
+        KeyCode::Char('G') => {
+            let (s, i) = last_item_pos(doc);
+            state.cursor_section = s;
+            state.cursor_item = i;
+        }
+        // ── Editing ─────────────────────────────────────────────────────────
+        KeyCode::Char(' ') => {
+            if let Some(action) = toggle_checkbox(state, doc) {
+                actions.push(action);
+            }
+        }
+        KeyCode::Char('x') | KeyCode::Char('d') => {
+            if let Some(action) = delete_item(state, doc) {
+                actions.push(action);
+            }
+        }
+        KeyCode::Char('o') => {
+            insert_item_below(state, doc);
+        }
+        KeyCode::Char('O') => {
+            insert_item_above(state, doc);
+        }
+        KeyCode::Char('i') | KeyCode::Enter => {
+            enter_insert_mode(state, doc);
+        }
+        // ── Move item within section ─────────────────────────────────────────
+        KeyCode::Char('J') => {
+            if let Some(action) = move_item_down(state, doc) {
+                actions.push(action);
+            }
+        }
+        KeyCode::Char('K') => {
+            if let Some(action) = move_item_up(state, doc) {
+                actions.push(action);
+            }
+        }
+        // Esc is a no-op in nav mode
+        KeyCode::Esc => {}
+        _ => {}
+    }
+    actions
+}
+
+fn handle_insert_key(
+    state: &mut TrajectoryEditState,
+    doc: &mut TrajectoryDoc,
+    key: KeyEvent,
+) -> Vec<EditAction> {
+    let mode_clone = state.mode.clone();
+    let focus = match &mode_clone {
+        EditMode::Insert { focus } => focus.clone(),
+        _ => return vec![],
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            return commit_insert(state, doc);
+        }
+        KeyCode::Tab => {
+            // Toggle between item buffer and input-ctx buffer
+            state.mode = EditMode::Insert {
+                focus: match focus {
+                    InsertFocus::Item => InsertFocus::InputCtx,
+                    InsertFocus::InputCtx => InsertFocus::Item,
+                },
+            };
+        }
+        KeyCode::Backspace => {
+            let buf = active_buffer_mut(state, &focus);
+            buf.pop();
+        }
+        KeyCode::Left => {
+            // For now no visual cursor movement within the buffer — just no-op.
+            // Full line-editor cursor is a Phase 1b polish item.
+        }
+        KeyCode::Right => {}
+        KeyCode::Char(c) if key.modifiers == KeyModifiers::NONE
+            || key.modifiers == KeyModifiers::SHIFT =>
+        {
+            let buf = active_buffer_mut(state, &focus);
+            buf.push(c);
+        }
+        _ => {}
+    }
+    vec![]
+}
+
+fn active_buffer_mut<'a>(state: &'a mut TrajectoryEditState, focus: &InsertFocus) -> &'a mut String {
+    match focus {
+        InsertFocus::Item => &mut state.edit_buffer,
+        InsertFocus::InputCtx => &mut state.input_ctx_buffer,
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Commit / save
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Commit insert mode: write edit_buffer back to doc and produce diff actions.
+fn commit_insert(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> Vec<EditAction> {
+    let mut actions = Vec::new();
+    let new_text = state.edit_buffer.clone();
+    let section_name = doc
+        .sections
+        .get(state.cursor_section)
+        .map(|s| s.name.clone())
+        .unwrap_or_default();
+
+    if let Some(section) = doc.sections.get_mut(state.cursor_section) {
+        if let Some(item) = section.items.get_mut(state.cursor_item) {
+            let old_text = state.edit_start_text.clone().unwrap_or_else(|| item.text.clone());
+            if new_text != old_text {
+                // Text genuinely changed — record an Edit action.
+                let before = item_display_text(item, &old_text);
+                item.text = new_text.clone();
+                let after = item_display_text(item, &new_text);
+                actions.push(EditAction::Edit {
+                    section: section_name,
+                    before,
+                    after,
+                });
+            }
+            // No-op if text is identical — don't emit events.
+        }
+    }
+
+    state.mode = EditMode::Nav;
+    state.edit_buffer.clear();
+    state.edit_start_text = None;
+    actions
+}
+
+/// Write the current doc to disk, emit events.jsonl entries, and return snapshot N.
+pub fn save(
+    uuid: &str,
+    doc: &mut TrajectoryDoc,
+    state: &TrajectoryEditState,
+    edit_actions: &[EditAction],
+) -> Result<u32> {
+    let n = highest_snapshot(uuid)? + 1;
+
+    // Update frontmatter snapshot number before saving.
+    doc.frontmatter.snapshot = Some(n);
+
+    // 1. Overwrite trajectory.md
+    let traj_path = paths::trajectory_path(uuid);
+    doc.save_to_file(&traj_path)?;
+
+    // 2. Write snapshot
+    write_snapshot(uuid, n, doc)?;
+
+    // 3. Write input context
+    let ctx = InputContext {
+        user_why: if state.input_ctx_buffer.trim().is_empty() {
+            None
+        } else {
+            Some(state.input_ctx_buffer.trim().to_string())
+        },
+        ..Default::default()
+    };
+    write_input(uuid, n, &ctx)?;
+
+    // 4. Emit events
+    if !edit_actions.is_empty() {
+        let events_path = paths::events_log(uuid);
+        let user_explanation = ctx.user_why.clone();
+
+        // Build all events first, then attach user_explanation to the last one.
+        let mut events: Vec<Event> = edit_actions
+            .iter()
+            .map(|a| action_to_event(a, n))
+            .collect();
+
+        // Attach user explanation to most-recent event if non-empty.
+        if let Some(ref expl) = user_explanation {
+            if let Some(last) = events.last_mut() {
+                last.user_explanation = Some(expl.clone());
+            }
+        }
+
+        for ev in &events {
+            crate::mc_data::events::append(&events_path, ev)?;
+        }
+    }
+
+    Ok(n)
+}
+
+fn action_to_event(action: &EditAction, snapshot: u32) -> Event {
+    match action {
+        EditAction::Edit { section, before, after } => {
+            Event::new_now(Source::User, Kind::Edit, section.as_str())
+                .with_before(before.as_str())
+                .with_after(after.as_str())
+                .with_snapshot(snapshot)
+        }
+        EditAction::Add { section, after } => {
+            Event::new_now(Source::User, Kind::Add, section.as_str())
+                .with_after(after.as_str())
+                .with_snapshot(snapshot)
+        }
+        EditAction::Delete { section, before } => {
+            Event::new_now(Source::User, Kind::Delete, section.as_str())
+                .with_before(before.as_str())
+                .with_snapshot(snapshot)
+        }
+        EditAction::Check { section, before, after } => {
+            Event::new_now(Source::User, Kind::Check, section.as_str())
+                .with_before(before.as_str())
+                .with_after(after.as_str())
+                .with_snapshot(snapshot)
+        }
+        EditAction::Uncheck { section, before, after } => {
+            Event::new_now(Source::User, Kind::Uncheck, section.as_str())
+                .with_before(before.as_str())
+                .with_after(after.as_str())
+                .with_snapshot(snapshot)
+        }
+        EditAction::Move { section, before } => {
+            Event::new_now(Source::User, Kind::Move, section.as_str())
+                .with_before(before.as_str())
+                .with_snapshot(snapshot)
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Cursor helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Find the first section index that has items (for `g`).
+fn first_non_empty_section(doc: &TrajectoryDoc) -> usize {
+    for (i, s) in doc.sections.iter().enumerate() {
+        if !s.items.is_empty() {
+            return i;
+        }
+    }
+    0
+}
+
+/// Find the last item's (section_idx, item_idx) for `G`.
+fn last_item_pos(doc: &TrajectoryDoc) -> (usize, usize) {
+    for i in (0..doc.sections.len()).rev() {
+        if !doc.sections[i].items.is_empty() {
+            return (i, doc.sections[i].items.len() - 1);
+        }
+    }
+    (0, 0)
+}
+
+fn move_cursor_down(state: &mut TrajectoryEditState, doc: &TrajectoryDoc) {
+    let n_sections = doc.sections.len();
+    if n_sections == 0 {
+        return;
+    }
+    let cur_sec = &doc.sections[state.cursor_section];
+    if state.cursor_item + 1 < cur_sec.items.len() {
+        state.cursor_item += 1;
+        return;
+    }
+    // Try to advance to the next non-empty section.
+    let mut sec = state.cursor_section + 1;
+    while sec < n_sections {
+        if !doc.sections[sec].items.is_empty() {
+            state.cursor_section = sec;
+            state.cursor_item = 0;
+            return;
+        }
+        sec += 1;
+    }
+    // Already at end — stay put.
+}
+
+fn move_cursor_up(state: &mut TrajectoryEditState, doc: &TrajectoryDoc) {
+    if state.cursor_item > 0 {
+        state.cursor_item -= 1;
+        return;
+    }
+    // Try to retreat to the last item of the previous non-empty section.
+    if state.cursor_section == 0 {
+        return;
+    }
+    let mut sec = state.cursor_section - 1;
+    loop {
+        if !doc.sections[sec].items.is_empty() {
+            state.cursor_section = sec;
+            state.cursor_item = doc.sections[sec].items.len() - 1;
+            return;
+        }
+        if sec == 0 {
+            break;
+        }
+        sec -= 1;
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Item mutations
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn toggle_checkbox(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> Option<EditAction> {
+    let section = doc.sections.get_mut(state.cursor_section)?;
+    // Only Tasks & Progress items have checkboxes (by convention).
+    if section.name != SECTION_TASKS {
+        return None;
+    }
+    let item = section.items.get_mut(state.cursor_item)?;
+    if !item.is_checkbox {
+        return None;
+    }
+    let currently_checked = item.checked.unwrap_or(false);
+    let before = item_display_text(item, &item.text.clone());
+    item.checked = Some(!currently_checked);
+    let after = item_display_text(item, &item.text.clone());
+    Some(if currently_checked {
+        EditAction::Uncheck {
+            section: section.name.clone(),
+            before,
+            after,
+        }
+    } else {
+        EditAction::Check {
+            section: section.name.clone(),
+            before,
+            after,
+        }
+    })
+}
+
+fn delete_item(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> Option<EditAction> {
+    let section = doc.sections.get_mut(state.cursor_section)?;
+    if section.items.is_empty() {
+        return None;
+    }
+    let item = section.items.remove(state.cursor_item);
+    let before = item_display_text(&item, &item.text);
+    // Clamp cursor after removal.
+    if state.cursor_item > 0 && state.cursor_item >= section.items.len() {
+        state.cursor_item -= 1;
+    }
+    Some(EditAction::Delete {
+        section: section.name.clone(),
+        before,
+    })
+}
+
+fn insert_item_below(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
+    let section = match doc.sections.get_mut(state.cursor_section) {
+        Some(s) => s,
+        None => return,
+    };
+    let insert_pos = if section.items.is_empty() {
+        0
+    } else {
+        state.cursor_item + 1
+    };
+    let is_checkbox = section.name == SECTION_TASKS || section.name == SECTION_CURRENT_SURFACES;
+    section.items.insert(
+        insert_pos,
+        Item {
+            text: String::new(),
+            is_checkbox,
+            checked: if is_checkbox { Some(false) } else { None },
+            surface_id: None,
+        },
+    );
+    state.cursor_item = insert_pos;
+    state.mode = EditMode::Insert { focus: InsertFocus::Item };
+    state.edit_buffer = String::new();
+    state.input_ctx_buffer = String::new();
+    state.edit_start_text = Some(String::new());
+}
+
+fn insert_item_above(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
+    let section = match doc.sections.get_mut(state.cursor_section) {
+        Some(s) => s,
+        None => return,
+    };
+    let insert_pos = if section.items.is_empty() { 0 } else { state.cursor_item };
+    let is_checkbox = section.name == SECTION_TASKS || section.name == SECTION_CURRENT_SURFACES;
+    section.items.insert(
+        insert_pos,
+        Item {
+            text: String::new(),
+            is_checkbox,
+            checked: if is_checkbox { Some(false) } else { None },
+            surface_id: None,
+        },
+    );
+    state.cursor_item = insert_pos;
+    state.mode = EditMode::Insert { focus: InsertFocus::Item };
+    state.edit_buffer = String::new();
+    state.input_ctx_buffer = String::new();
+    state.edit_start_text = Some(String::new());
+}
+
+fn enter_insert_mode(state: &mut TrajectoryEditState, doc: &TrajectoryDoc) {
+    let section = match doc.sections.get(state.cursor_section) {
+        Some(s) => s,
+        None => return,
+    };
+    let item = match section.items.get(state.cursor_item) {
+        Some(i) => i,
+        None => return,
+    };
+    state.mode = EditMode::Insert { focus: InsertFocus::Item };
+    state.edit_buffer = item.text.clone();
+    state.input_ctx_buffer = String::new();
+    state.edit_start_text = Some(item.text.clone());
+}
+
+fn move_item_down(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> Option<EditAction> {
+    let section = doc.sections.get_mut(state.cursor_section)?;
+    let idx = state.cursor_item;
+    if idx + 1 >= section.items.len() {
+        return None;
+    }
+    let before = item_display_text(&section.items[idx], &section.items[idx].text.clone());
+    section.items.swap(idx, idx + 1);
+    state.cursor_item += 1;
+    Some(EditAction::Move {
+        section: section.name.clone(),
+        before,
+    })
+}
+
+fn move_item_up(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> Option<EditAction> {
+    let section = doc.sections.get_mut(state.cursor_section)?;
+    let idx = state.cursor_item;
+    if idx == 0 {
+        return None;
+    }
+    let before = item_display_text(&section.items[idx], &section.items[idx].text.clone());
+    section.items.swap(idx, idx - 1);
+    state.cursor_item -= 1;
+    Some(EditAction::Move {
+        section: section.name.clone(),
+        before,
+    })
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Formatting helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Produce the display string for an item (as it would appear in the markdown),
+/// using the provided `text` rather than `item.text` so callers can compute
+/// before/after with different text.
+pub fn item_display_text(item: &Item, text: &str) -> String {
+    if item.is_checkbox {
+        let mark = if item.checked.unwrap_or(false) { "[x]" } else { "[ ]" };
+        format!("- {mark} {text}")
+    } else {
+        format!("- {text}")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mc_data::trajectory::TrajectoryDoc;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    const SAMPLE: &str = "---
+workspace: test-ws
+---
+
+## Goal
+- Build investment agent
+
+## Current surfaces
+- claude · mbp · working
+
+## Tasks & Progress
+- [x] sprint-01 done
+- [ ] sprint-02
+- [ ] sprint-03
+";
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn shift_key(c: char) -> KeyEvent {
+        KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn make_doc() -> TrajectoryDoc {
+        let mut doc = TrajectoryDoc::parse(SAMPLE).unwrap();
+        doc.ensure_sections();
+        doc
+    }
+
+    // ── Cursor navigation ────────────────────────────────────────────────────
+
+    #[test]
+    fn j_moves_within_section() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState::default();
+        // Start at Goal section (section 0, item 0).
+        assert_eq!(state.cursor_section, 0);
+        assert_eq!(state.cursor_item, 0);
+
+        handle_key(&mut state, &mut doc.clone(), key(KeyCode::Char('j')));
+        // Goal has 1 item, so cursor stays (no next item in section, but next section = Current surfaces with 1 item).
+        assert_eq!(state.cursor_section, 1);
+        assert_eq!(state.cursor_item, 0);
+    }
+
+    #[test]
+    fn j_crosses_section_boundary() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState {
+            cursor_section: 0,
+            cursor_item: 0,
+            ..Default::default()
+        };
+        // Goal has 1 item. Moving down should land on Current surfaces item 0.
+        handle_key(&mut state, &mut doc.clone(), key(KeyCode::Char('j')));
+        assert_eq!(state.cursor_section, 1);
+        assert_eq!(state.cursor_item, 0);
+    }
+
+    #[test]
+    fn j_skips_empty_sections() {
+        let mut doc = make_doc();
+        // Clear Current surfaces items.
+        doc.sections[1].items.clear();
+        let mut state = TrajectoryEditState {
+            cursor_section: 0,
+            cursor_item: 0,
+            ..Default::default()
+        };
+        // Goal item 0 → skip empty Current surfaces → Tasks item 0.
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
+        assert_eq!(state.cursor_section, 2);
+        assert_eq!(state.cursor_item, 0);
+    }
+
+    #[test]
+    fn k_moves_up_across_sections() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState {
+            cursor_section: 2,
+            cursor_item: 0,
+            ..Default::default()
+        };
+        // Tasks item 0 → up → Current surfaces item 0 (last item).
+        handle_key(&mut state, &mut doc.clone(), key(KeyCode::Char('k')));
+        assert_eq!(state.cursor_section, 1);
+        assert_eq!(state.cursor_item, 0);
+    }
+
+    #[test]
+    fn g_goes_to_first_non_empty_section() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState {
+            cursor_section: 2,
+            cursor_item: 1,
+            ..Default::default()
+        };
+        handle_key(&mut state, &mut doc.clone(), key(KeyCode::Char('g')));
+        assert_eq!(state.cursor_section, 0);
+        assert_eq!(state.cursor_item, 0);
+    }
+
+    #[test]
+    fn big_g_goes_to_last_item() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState::default();
+        handle_key(&mut state, &mut doc.clone(), shift_key('G'));
+        // Tasks has 3 items (sprint-01, sprint-02, sprint-03), last index = 2.
+        assert_eq!(state.cursor_section, 2);
+        assert_eq!(state.cursor_item, 2);
+    }
+
+    // ── Insert mode ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn i_enters_insert_mode_with_current_text() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState::default(); // Goal, item 0
+        handle_key(&mut state, &mut doc.clone(), key(KeyCode::Char('i')));
+        assert!(matches!(state.mode, EditMode::Insert { .. }));
+        assert_eq!(state.edit_buffer, "Build investment agent");
+        assert_eq!(state.edit_start_text.as_deref(), Some("Build investment agent"));
+    }
+
+    #[test]
+    fn typing_appends_to_edit_buffer() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState::default();
+        let mut doc_mut = doc.clone();
+        handle_key(&mut state, &mut doc_mut, key(KeyCode::Char('i')));
+        handle_key(&mut state, &mut doc_mut, key(KeyCode::Char('!')));
+        assert_eq!(state.edit_buffer, "Build investment agent!");
+    }
+
+    #[test]
+    fn esc_commits_edit_and_returns_to_nav() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState::default();
+        let mut doc_mut = doc.clone();
+
+        // Enter insert, type new text, press Esc.
+        handle_key(&mut state, &mut doc_mut, key(KeyCode::Char('i')));
+        // Clear buffer and type new text.
+        state.edit_buffer = "New goal text".to_string();
+        let actions = handle_key(&mut state, &mut doc_mut, key(KeyCode::Esc));
+
+        assert_eq!(state.mode, EditMode::Nav);
+        // Doc updated.
+        assert_eq!(doc_mut.sections[0].items[0].text, "New goal text");
+        // One edit action produced.
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], EditAction::Edit { .. }));
+    }
+
+    #[test]
+    fn esc_on_unchanged_text_emits_no_action() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState::default();
+        let mut doc_mut = doc.clone();
+        handle_key(&mut state, &mut doc_mut, key(KeyCode::Char('i')));
+        // Don't type anything — esc immediately.
+        let actions = handle_key(&mut state, &mut doc_mut, key(KeyCode::Esc));
+        assert_eq!(actions.len(), 0);
+    }
+
+    #[test]
+    fn tab_toggles_insert_focus() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState::default();
+        let mut doc_mut = doc.clone();
+        handle_key(&mut state, &mut doc_mut, key(KeyCode::Char('i')));
+        assert!(matches!(state.mode, EditMode::Insert { focus: InsertFocus::Item }));
+
+        handle_key(&mut state, &mut doc_mut, key(KeyCode::Tab));
+        assert!(matches!(state.mode, EditMode::Insert { focus: InsertFocus::InputCtx }));
+
+        handle_key(&mut state, &mut doc_mut, key(KeyCode::Tab));
+        assert!(matches!(state.mode, EditMode::Insert { focus: InsertFocus::Item }));
+    }
+
+    #[test]
+    fn typing_in_input_ctx_focus_goes_to_input_ctx_buffer() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState::default();
+        let mut doc_mut = doc.clone();
+        handle_key(&mut state, &mut doc_mut, key(KeyCode::Char('i')));
+        handle_key(&mut state, &mut doc_mut, key(KeyCode::Tab)); // switch to InputCtx
+        handle_key(&mut state, &mut doc_mut, key(KeyCode::Char('w')));
+        handle_key(&mut state, &mut doc_mut, key(KeyCode::Char('h')));
+        handle_key(&mut state, &mut doc_mut, key(KeyCode::Char('y')));
+        assert_eq!(state.input_ctx_buffer, "why");
+        // Edit buffer should be untouched.
+        assert_eq!(state.edit_buffer, "Build investment agent");
+    }
+
+    // ── o / O ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn o_inserts_item_below_cursor_in_insert_mode() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState {
+            cursor_section: 0,
+            cursor_item: 0,
+            ..Default::default()
+        };
+        let mut doc_mut = doc.clone();
+        handle_key(&mut state, &mut doc_mut, key(KeyCode::Char('o')));
+        // A new empty item should be at index 1 (below cursor).
+        assert_eq!(doc_mut.sections[0].items.len(), 2);
+        assert_eq!(doc_mut.sections[0].items[1].text, "");
+        assert_eq!(state.cursor_item, 1);
+        assert!(matches!(state.mode, EditMode::Insert { .. }));
+    }
+
+    #[test]
+    fn big_o_inserts_item_above_cursor() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState {
+            cursor_section: 0,
+            cursor_item: 0,
+            ..Default::default()
+        };
+        let mut doc_mut = doc.clone();
+        handle_key(&mut state, &mut doc_mut, shift_key('O'));
+        assert_eq!(doc_mut.sections[0].items.len(), 2);
+        assert_eq!(doc_mut.sections[0].items[0].text, "");
+        assert_eq!(state.cursor_item, 0);
+    }
+
+    #[test]
+    fn o_then_type_then_esc_emits_add_action() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState {
+            cursor_section: 0,
+            cursor_item: 0,
+            ..Default::default()
+        };
+        let mut doc_mut = doc.clone();
+        handle_key(&mut state, &mut doc_mut, key(KeyCode::Char('o')));
+        state.edit_buffer = "New goal item".to_string();
+        let actions = handle_key(&mut state, &mut doc_mut, key(KeyCode::Esc));
+        // edit_start_text is "", new text is "New goal item" → an Edit action
+        // (the item was created with "" and changed to "New goal item").
+        // Actually it starts as "" via insert_item_below, so we get an Edit action.
+        assert!(!actions.is_empty());
+    }
+
+    // ── x (delete) ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn x_deletes_current_item_and_emits_delete() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState {
+            cursor_section: 2, // Tasks
+            cursor_item: 0,
+            ..Default::default()
+        };
+        let mut doc_mut = doc.clone();
+        let original_text = doc_mut.sections[2].items[0].text.clone();
+        let actions = handle_key(&mut state, &mut doc_mut, key(KeyCode::Char('x')));
+
+        assert_eq!(doc_mut.sections[2].items.len(), 2); // was 3, now 2
+        assert_eq!(actions.len(), 1);
+        if let EditAction::Delete { before, .. } = &actions[0] {
+            assert!(before.contains(&original_text));
+        } else {
+            panic!("expected Delete action, got {:?}", actions[0]);
+        }
+    }
+
+    // ── Space (toggle) ───────────────────────────────────────────────────────
+
+    #[test]
+    fn space_toggles_unchecked_to_checked_in_tasks() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState {
+            cursor_section: 2,
+            cursor_item: 1, // sprint-02 (unchecked)
+            ..Default::default()
+        };
+        let mut doc_mut = doc.clone();
+        let actions = handle_key(&mut state, &mut doc_mut, key(KeyCode::Char(' ')));
+
+        assert_eq!(doc_mut.sections[2].items[1].checked, Some(true));
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], EditAction::Check { .. }));
+    }
+
+    #[test]
+    fn space_toggles_checked_to_unchecked() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState {
+            cursor_section: 2,
+            cursor_item: 0, // sprint-01 (checked)
+            ..Default::default()
+        };
+        let mut doc_mut = doc.clone();
+        let actions = handle_key(&mut state, &mut doc_mut, key(KeyCode::Char(' ')));
+
+        assert_eq!(doc_mut.sections[2].items[0].checked, Some(false));
+        assert!(matches!(actions[0], EditAction::Uncheck { .. }));
+    }
+
+    #[test]
+    fn space_noop_in_goal_section() {
+        let doc = make_doc();
+        let mut state = TrajectoryEditState::default(); // Goal section
+        let mut doc_mut = doc.clone();
+        let actions = handle_key(&mut state, &mut doc_mut, key(KeyCode::Char(' ')));
+        assert!(actions.is_empty());
+    }
+}

@@ -22,6 +22,34 @@ pub enum Command {
     },
     /// One-time setup: create ~/data/mission-control/, print install summary.
     Setup,
+    /// Promote ticked rules from a proposals file into the project's rules.md.
+    PromoteRules {
+        /// Path to the proposals .md file.
+        proposals_file: PathBuf,
+    },
+    /// Bump the hit count for a matched prompt rule.
+    RecordHit {
+        /// The project the rule belongs to.
+        project: String,
+        /// Stable short hash of the rule's PATTERN.
+        rule_id: String,
+    },
+    /// Garbage-collect stale rules across all projects' rules.md.
+    Gc,
+    /// Write a session-path pointer for the current surface.
+    ///
+    /// Typically invoked from an agent's SessionStart hook with env vars set
+    /// (MC_WORKSPACE_ID, MC_SURFACE_ID). Becomes a silent no-op when env vars
+    /// are not present, so it's safe to call unconditionally from a global hook.
+    Bind {
+        /// Surface ID; defaults to $MC_SURFACE_ID if env var is set.
+        #[arg(env = "MC_SURFACE_ID")]
+        surface_id: String,
+        /// Path to the agent's session-history file. Falls back to
+        /// $CLAUDE_SESSION_FILE, then auto-scans ~/agents/histories/.
+        #[arg(long)]
+        session_file: Option<PathBuf>,
+    },
 }
 
 /// Configuration for the TUI (all existing flags live here).
