@@ -23,17 +23,86 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Layout},
 };
+use std::collections::HashMap;
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
+
+/// A trajectory.md file was written externally — carry just the workspace uuid.
+#[derive(Debug, Clone)]
+struct TrajectoryUpdate {
+    uuid: String,
+}
+
+/// Start a recursive notify watcher on `dir` (creating it first if missing).
+/// Returns `(watcher_handle, receiver)`. The watcher_handle must be kept alive.
+///
+/// Debounce: consecutive events for the same uuid within 100 ms are collapsed.
+/// Pattern matched: `<dir>/<uuid>/trajectory.md`.
+fn start_trajectory_watcher(
+    dir: PathBuf,
+) -> anyhow::Result<(RecommendedWatcher, mpsc::UnboundedReceiver<TrajectoryUpdate>)> {
+    // Ensure the watched directory exists so the watcher never panics on
+    // first-time-user setups.
+    std::fs::create_dir_all(&dir)?;
+
+    let (tx, rx) = mpsc::unbounded_channel::<TrajectoryUpdate>();
+
+    // Debounce table: uuid -> last-sent Instant (shared via Mutex so the
+    // notify callback (non-async closure) can mutate it).
+    let debounce: std::sync::Arc<std::sync::Mutex<HashMap<String, Instant>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+    let mut watcher = notify::recommended_watcher(
+        move |res: std::result::Result<notify::Event, notify::Error>| {
+            let Ok(event) = res else { return };
+            match event.kind {
+                EventKind::Modify(_) | EventKind::Create(_) => {}
+                _ => return,
+            }
+            for path in &event.paths {
+                // Match: .../<uuid>/trajectory.md
+                let file_name = path.file_name().and_then(|n| n.to_str());
+                if file_name != Some("trajectory.md") {
+                    continue;
+                }
+                let uuid = path
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string());
+                let Some(uuid) = uuid else { continue };
+
+                // Debounce: skip if another event for this uuid was sent < 100ms ago.
+                let now = Instant::now();
+                let mut table = debounce.lock().unwrap();
+                if let Some(&last) = table.get(&uuid) {
+                    if now.duration_since(last).as_millis() < 100 {
+                        continue;
+                    }
+                }
+                table.insert(uuid.clone(), now);
+                drop(table);
+
+                let _ = tx.send(TrajectoryUpdate { uuid });
+            }
+        },
+    )?;
+
+    watcher.watch(&dir, RecursiveMode::Recursive)?;
+
+    Ok((watcher, rx))
+}
 
 enum AppControl {
     Quit,
@@ -169,6 +238,22 @@ async fn run_app(
     // Create session file watcher
     let (file_tx, mut file_rx) = mpsc::unbounded_channel();
     let _watcher = SessionWatcher::new(config.histories_dir.clone(), file_tx)?;
+
+    // Create trajectory file watcher — watches ~/data/mission-control/.data/ recursively.
+    // start_trajectory_watcher mkdir-p's the dir so it never panics for first-time users.
+    let data_subroot = crate::mc_data::paths::data_subroot();
+    let (mut traj_rx, _traj_watcher_opt) = match start_trajectory_watcher(data_subroot) {
+        Ok((_watcher, rx)) => {
+            // Keep the watcher alive for the duration of run_app.
+            (rx, Some(_watcher))
+        }
+        Err(e) => {
+            eprintln!("trajectory watcher: {e:?}");
+            // Degrade gracefully: use an idle channel. The 30 s loop still works.
+            let (_dead_tx, dead_rx) = mpsc::unbounded_channel::<TrajectoryUpdate>();
+            (dead_rx, None)
+        }
+    };
 
     // Channel for LLM summary completions
     let (summary_tx, mut summary_rx) = mpsc::unbounded_channel::<(String, crate::llm::Summary)>();
@@ -410,6 +495,10 @@ async fn run_app(
                         }
                     }
                 }
+            }
+
+            Some(update) = traj_rx.recv() => {
+                app.apply_trajectory_update(&update.uuid);
             }
 
             Some((uuid, summary)) = summary_rx.recv() => {
