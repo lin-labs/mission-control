@@ -13,10 +13,16 @@ fn with_tmp_home<F: FnOnce(&std::path::Path)>(f: F) {
     // SAFETY: tests run single-threaded via --test-threads=1; HOME mutation
     // is process-global, so parallelism would cause data races.
     unsafe { std::env::set_var("HOME", tmp.path()) };
-    f(tmp.path());
+    // Restore HOME even if the closure panics — otherwise a failing test
+    // leaves later tests pointing at the already-dropped tempdir.
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(tmp.path())));
     match prior {
         Some(v) => unsafe { std::env::set_var("HOME", v) },
         None => unsafe { std::env::remove_var("HOME") },
+    }
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
     }
 }
 
