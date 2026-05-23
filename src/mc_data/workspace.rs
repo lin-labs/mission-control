@@ -82,11 +82,17 @@ fn write_atomic(path: &std::path::Path, contents: &str) -> Result<()> {
 
 /// Write only if the file is absent or its contents differ. This avoids
 /// touching the parent directory's mtime on repeated no-op calls.
+///
+/// Stores `contents.trim()` so the on-disk form is canonical — readers
+/// (`read_display_name`, `read_project`) also `.trim()`, so we guarantee
+/// round-trip equality and never get tricked into skipping a corrective
+/// write because of asymmetric whitespace.
 fn write_if_changed(path: &std::path::Path, contents: &str) -> Result<()> {
+    let canonical = contents.trim();
     if let Ok(existing) = fs::read_to_string(path) {
-        if existing.trim() == contents.trim() {
+        if existing.trim() == canonical {
             return Ok(());
         }
     }
-    write_atomic(path, contents)
+    write_atomic(path, canonical)
 }
