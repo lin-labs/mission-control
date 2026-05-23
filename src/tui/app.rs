@@ -640,6 +640,35 @@ impl App {
 
         if let Some(&idx) = self.workspace_index.get(&event.workspace_id) {
             self.workspaces[idx].tool_call_count += 1;
+
+            // Derive a status from the hook event name. cmux already publishes
+            // hook events with phase=completed for every agent that has a
+            // cmux hook bridge installed (Claude, Codex, OpenCode, …) — for
+            // local *and* remote workspaces. This is the "first-class status
+            // event" path: agent_state() picks up hook_status at priority 1.
+            //
+            // event_name shape: "agent.hook.PreToolUse", "agent.hook.Stop", …
+            let hook = event
+                .event_name
+                .rsplit_once('.')
+                .map(|(_, h)| h)
+                .unwrap_or(event.event_name.as_str());
+            let derived = match hook {
+                // Agent is actively doing work.
+                "PreToolUse" | "PostToolUse" | "UserPromptSubmit" => Some("working"),
+                // Agent has yielded the turn — needs user.
+                "Stop" | "SubagentStop" | "Notification" | "AskUserQuestion" => Some("waiting"),
+                // Lifecycle bookends — neither working nor blocked.
+                "SessionEnd" => Some("idle"),
+                _ => None,
+            };
+            if let Some(state) = derived {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                self.workspaces[idx].hook_status = Some((state.to_string(), ts));
+            }
         }
     }
 
