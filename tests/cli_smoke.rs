@@ -37,3 +37,28 @@ fn mc_resolve_prints_workspace_dir() {
         "expected resolve to end with .data/abc-123, got stdout={stdout:?}"
     );
 }
+
+#[test]
+fn mc_setup_creates_data_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Command::new(mc_bin())
+        .env("HOME", tmp.path())
+        .arg("setup")
+        .output()
+        .expect("run setup");
+    assert!(
+        output.status.success(),
+        "setup failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let root = tmp.path().join("data/mission-control");
+    assert!(root.is_dir(), "expected {root:?} created");
+    assert!(root.join(".data").is_dir());
+    assert!(root.join(".archived").is_dir());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Created") || stdout.contains("complete"),
+        "setup output should summarize changes: {stdout}"
+    );
+}
