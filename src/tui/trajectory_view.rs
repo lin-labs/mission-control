@@ -1,4 +1,5 @@
 use crate::mc_data::trajectory::TrajectoryDoc;
+use crate::tui::peek_view::PeekState;
 use crate::tui::trajectory_edit::{EditMode, InsertFocus, TrajectoryEditState};
 use ratatui::{
     Frame,
@@ -11,6 +12,8 @@ use ratatui::{
 /// Render the trajectory detail pane.
 ///
 /// `edit_state` is `None` when no editing session is active for this workspace.
+/// `peek_state` is `Some` when peek mode is active; in that case the pane is
+/// entirely replaced by the peek screen view.
 pub fn render(
     f: &mut Frame,
     area: Rect,
@@ -18,7 +21,13 @@ pub fn render(
     scroll: u16,
     focused: bool,
     edit_state: Option<&TrajectoryEditState>,
+    peek_state: Option<&PeekState>,
 ) {
+    // If in peek mode, delegate entirely to peek_view.
+    if let Some(peek) = peek_state {
+        crate::tui::peek_view::render(f, area, peek, focused);
+        return;
+    }
     let in_insert = edit_state
         .map(|s| matches!(s.mode, EditMode::Insert { .. }))
         .unwrap_or(false);
@@ -223,7 +232,7 @@ workspace: predinvest
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, Rect::new(0, 0, 80, 20), Some(&doc), 0, false, None))
+            .draw(|f| render(f, Rect::new(0, 0, 80, 20), Some(&doc), 0, false, None, None))
             .unwrap();
         let dump = buf_dump(&terminal);
         assert!(dump.contains("Goal"), "missing Goal header: {dump}");
@@ -240,7 +249,7 @@ workspace: predinvest
         let backend = TestBackend::new(80, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, Rect::new(0, 0, 80, 10), None, 0, false, None))
+            .draw(|f| render(f, Rect::new(0, 0, 80, 10), None, 0, false, None, None))
             .unwrap();
         let dump = buf_dump(&terminal);
         assert!(dump.contains("No trajectory") || dump.contains("no trajectory"));
@@ -259,7 +268,7 @@ workspace: predinvest
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, Rect::new(0, 0, 80, 24), Some(&doc), 0, true, Some(&state)))
+            .draw(|f| render(f, Rect::new(0, 0, 80, 24), Some(&doc), 0, true, Some(&state), None))
             .unwrap();
         let buf = terminal.backend().buffer();
         // The cursor cell (first item in Goal) should have a Cyan background.
@@ -303,7 +312,7 @@ workspace: predinvest
         let backend = TestBackend::new(80, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, Rect::new(0, 0, 80, 30), Some(&doc), 0, true, Some(&state)))
+            .draw(|f| render(f, Rect::new(0, 0, 80, 30), Some(&doc), 0, true, Some(&state), None))
             .unwrap();
         let dump = buf_dump(&terminal);
         assert!(dump.contains("input context"), "missing input context strip");
@@ -324,7 +333,7 @@ workspace: predinvest
         let backend = TestBackend::new(80, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, Rect::new(0, 0, 80, 30), Some(&doc), 0, true, Some(&state)))
+            .draw(|f| render(f, Rect::new(0, 0, 80, 30), Some(&doc), 0, true, Some(&state), None))
             .unwrap();
         let dump = buf_dump(&terminal);
         assert!(

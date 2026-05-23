@@ -347,6 +347,13 @@ pub struct WorkspaceState {
     /// started yet for this workspace; `Some(...)` persists across workspace
     /// switches so the cursor position is remembered.
     pub edit_state: Option<crate::tui::trajectory_edit::TrajectoryEditState>,
+    /// Active peek-mode state for this workspace.
+    /// `Some(...)` while the user is viewing a surface's screen in peek mode.
+    /// `None` when not in peek mode.
+    pub peek_state: Option<crate::tui::peek_view::PeekState>,
+    /// Set to `true` when Enter is pressed in peek mode to trigger a cmux
+    /// select-workspace call from the event loop.
+    pub peek_yield_pending: bool,
 }
 
 /// Result of an async screen capture + classification for a single workspace.
@@ -603,6 +610,12 @@ impl App {
             .iter()
             .map(|ws| (ws.workspace.uuid.clone(), ws.edit_state.clone()))
             .collect();
+        // Preserve peek state across refreshes so an active peek session survives.
+        let old_peek_states: HashMap<String, Option<crate::tui::peek_view::PeekState>> = self
+            .workspaces
+            .iter()
+            .map(|ws| (ws.workspace.uuid.clone(), ws.peek_state.clone()))
+            .collect();
 
         self.workspaces = workspaces
             .into_iter()
@@ -642,6 +655,7 @@ impl App {
                 let hook_status = load_hook_status(&ws.uuid);
                 let summary = old_summaries.get(&ws.uuid).cloned().flatten();
                 let edit_state = old_edit_states.get(&ws.uuid).cloned().flatten();
+                let peek_state = old_peek_states.get(&ws.uuid).cloned().flatten();
                 WorkspaceState {
                     workspace: ws,
                     session,
@@ -657,6 +671,8 @@ impl App {
                     summarizing: false,
                     trajectory,
                     edit_state,
+                    peek_state,
+                    peek_yield_pending: false,
                 }
             })
             .collect();
@@ -898,11 +914,47 @@ impl App {
     /// Returns any `EditAction`s that should be persisted on the next Esc-save.
     /// If the focused workspace has no trajectory, or the detail pane is not
     /// focused, returns an empty Vec.
+    ///
+    /// Peek mode is handled first: when `peek_state` is Some, keys are routed
+    /// to peek navigation (j/k/g/G/Esc/Enter) and normal editing is bypassed.
     pub fn handle_trajectory_key(
         &mut self,
         key: crossterm::event::KeyEvent,
     ) -> Vec<crate::tui::trajectory_edit::EditAction> {
+        use crossterm::event::KeyCode;
         let idx = self.selected;
+
+        // ── Peek mode: intercept before the editor sees anything ────────────
+        {
+            let ws = match self.workspaces.get_mut(idx) {
+                Some(w) => w,
+                None => return vec![],
+            };
+            if ws.peek_state.is_some() {
+                let peek = ws.peek_state.as_mut().unwrap();
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => { peek.scroll_down(); }
+                    KeyCode::Char('k') | KeyCode::Up   => { peek.scroll_up(); }
+                    KeyCode::Char('g')                  => { peek.go_top(); }
+                    KeyCode::Char('G')                  => { peek.go_bottom(); }
+                    KeyCode::Esc => {
+                        // Exit peek mode — back to trajectory nav.
+                        ws.peek_state = None;
+                    }
+                    KeyCode::Enter => {
+                        // Yield: select the workspace in cmux, then clear peek.
+                        // The actual cmux call is spawned asynchronously by the
+                        // caller reading `peek_yield_pending` from the workspace.
+                        // We just set a flag; the TUI event loop will act on it.
+                        ws.peek_yield_pending = true;
+                    }
+                    _ => { /* all other keys are no-ops in peek mode */ }
+                }
+                return vec![];
+            }
+        }
+
+        // ── Normal trajectory editing ────────────────────────────────────────
         let ws = match self.workspaces.get_mut(idx) {
             Some(w) => w,
             None => return vec![],
@@ -915,7 +967,93 @@ impl App {
         let state = ws.edit_state.get_or_insert_with(|| {
             crate::tui::trajectory_edit::TrajectoryEditState::default()
         });
+
+        // ── Nav mode + Enter on a Current surfaces row → enter peek ─────────
+        use crate::mc_data::trajectory::SECTION_CURRENT_SURFACES;
+        if key.code == KeyCode::Enter
+            && matches!(state.mode, crate::tui::trajectory_edit::EditMode::Nav)
+        {
+            let sec_idx = state.cursor_section;
+            let item_idx = state.cursor_item;
+            let section = doc.sections.get(sec_idx);
+            if let Some(sec) = section {
+                if sec.name == SECTION_CURRENT_SURFACES {
+                    let item = sec.items.get(item_idx);
+                    // Use surface_id if present; fall back to workspace ref_id.
+                    let surface_ref = item
+                        .and_then(|i| i.surface_id.as_deref())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| ws.workspace.ref_id.clone());
+                    let surface_label = item
+                        .map(|i| {
+                            if let Some(ref sid) = i.surface_id {
+                                format!("{} ({})", i.text.as_str(), sid)
+                            } else {
+                                i.text.clone()
+                            }
+                        })
+                        .unwrap_or_else(|| ws.workspace.ref_id.clone());
+                    ws.peek_state = Some(crate::tui::peek_view::PeekState::new(
+                        surface_ref,
+                        surface_label,
+                    ));
+                    return vec![];
+                }
+            }
+        }
+
         crate::tui::trajectory_edit::handle_key(state, doc, key)
+    }
+
+    /// Called from the event loop to check whether a peek-yield is pending for
+    /// the selected workspace. Clears the flag and returns the workspace ref_id
+    /// to pass to `cmux select-workspace`.
+    pub fn take_peek_yield(&mut self) -> Option<String> {
+        let idx = self.selected;
+        let ws = self.workspaces.get_mut(idx)?;
+        if ws.peek_yield_pending {
+            ws.peek_yield_pending = false;
+            // After yielding, clear peek state (the user is going to work there).
+            let ref_id = ws.peek_state
+                .as_ref()
+                .map(|p| p.surface_ref.clone())
+                .unwrap_or_else(|| ws.workspace.ref_id.clone());
+            ws.peek_state = None;
+            Some(ref_id)
+        } else {
+            None
+        }
+    }
+
+    /// Apply a screen update to the active peek state for the given workspace.
+    pub fn apply_peek_screen_update(&mut self, workspace_uuid: &str, screen_text: String) {
+        if let Some(&idx) = self.workspace_index.get(workspace_uuid) {
+            if let Some(peek) = self.workspaces[idx].peek_state.as_mut() {
+                peek.ingest_screen(&screen_text);
+            }
+        }
+    }
+
+    /// Returns whether the selected workspace is currently in peek mode and
+    /// needs a screen poll.
+    pub fn peek_needs_poll(&self) -> Option<(&str, &str)> {
+        let ws = self.workspaces.get(self.selected)?;
+        let peek = ws.peek_state.as_ref()?;
+        if peek.should_poll() {
+            Some((&ws.workspace.uuid, &peek.surface_ref))
+        } else {
+            None
+        }
+    }
+
+    /// Mark the active peek as polling (prevents duplicate concurrent polls).
+    pub fn mark_peek_polling(&mut self) {
+        let idx = self.selected;
+        if let Some(ws) = self.workspaces.get_mut(idx) {
+            if let Some(peek) = ws.peek_state.as_mut() {
+                peek.polling = true;
+            }
+        }
     }
 
     /// Save the current edit session for the selected workspace to disk.
@@ -1014,4 +1152,293 @@ fn hash_bullets(bullets: &[String]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bullets.hash(&mut hasher);
     hasher.finish()
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmux::client::Workspace;
+    use crate::mc_data::trajectory::TrajectoryDoc;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn shift_key(c: char) -> KeyEvent {
+        KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    // Trajectory doc with a `## Current surfaces` item that has a surface_id.
+    const SAMPLE_WITH_SURFACE: &str = "---
+workspace: test-ws
+---
+
+## Goal
+- Build investment agent
+
+## Current surfaces
+- claude · mbp · working              <!-- mc:surface:sid-42 -->
+
+## Tasks & Progress
+- [ ] sprint-01
+";
+
+    // Trajectory doc with a `## Current surfaces` item with NO surface_id.
+    const SAMPLE_NO_SURFACE_ID: &str = "---
+workspace: test-ws
+---
+
+## Goal
+- Build investment agent
+
+## Current surfaces
+- claude · mbp · working
+
+## Tasks & Progress
+- [ ] sprint-01
+";
+
+    fn make_ws(doc_text: &str) -> WorkspaceState {
+        let mut doc = TrajectoryDoc::parse(doc_text).unwrap();
+        doc.ensure_sections();
+        WorkspaceState {
+            workspace: Workspace {
+                ref_id: "workspace:3".to_string(),
+                uuid: "test-uuid-1".to_string(),
+                name: "test-ws".to_string(),
+                selected: false,
+            },
+            session: None,
+            surfaces: Vec::new(),
+            screen_preview: None,
+            screen_insights: ScreenInsights::default(),
+            tool_call_count: 0,
+            notes: None,
+            hook_status: None,
+            classification: None,
+            loading: false,
+            summary: None,
+            summarizing: false,
+            trajectory: Some(doc),
+            edit_state: None,
+            peek_state: None,
+            peek_yield_pending: false,
+        }
+    }
+
+    fn make_app(doc_text: &str) -> App {
+        let ws = make_ws(doc_text);
+        let mut app = App::new();
+        app.workspaces.push(ws);
+        app.workspace_index.insert("test-uuid-1".to_string(), 0);
+        app.selected = 0;
+        app
+    }
+
+    // ── Enter on Current surfaces row → enters peek mode ─────────────────────
+
+    #[test]
+    fn enter_on_current_surfaces_row_enters_peek_mode() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        // Navigate to section 1 (Current surfaces), item 0.
+        let state = app.workspaces[0].edit_state.get_or_insert_with(Default::default);
+        state.cursor_section = 1;
+        state.cursor_item = 0;
+
+        app.handle_trajectory_key(key(KeyCode::Enter));
+
+        assert!(
+            app.workspaces[0].peek_state.is_some(),
+            "peek_state should be Some after Enter on Current surfaces row"
+        );
+    }
+
+    #[test]
+    fn enter_on_current_surfaces_row_uses_surface_id() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let state = app.workspaces[0].edit_state.get_or_insert_with(Default::default);
+        state.cursor_section = 1;
+        state.cursor_item = 0;
+
+        app.handle_trajectory_key(key(KeyCode::Enter));
+
+        let peek = app.workspaces[0].peek_state.as_ref().unwrap();
+        assert_eq!(
+            peek.surface_ref, "sid-42",
+            "surface_ref should match surface_id in comment"
+        );
+    }
+
+    #[test]
+    fn enter_on_current_surfaces_row_falls_back_to_workspace_ref() {
+        let mut app = make_app(SAMPLE_NO_SURFACE_ID);
+        let state = app.workspaces[0].edit_state.get_or_insert_with(Default::default);
+        state.cursor_section = 1;
+        state.cursor_item = 0;
+
+        app.handle_trajectory_key(key(KeyCode::Enter));
+
+        let peek = app.workspaces[0].peek_state.as_ref().unwrap();
+        assert_eq!(
+            peek.surface_ref, "workspace:3",
+            "should fall back to workspace ref_id when no surface_id"
+        );
+    }
+
+    // ── Esc in peek mode → clears peek_state ─────────────────────────────────
+
+    #[test]
+    fn esc_in_peek_mode_clears_peek_state() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        // Put app into peek mode manually.
+        app.workspaces[0].peek_state = Some(
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string())
+        );
+
+        app.handle_trajectory_key(key(KeyCode::Esc));
+
+        assert!(
+            app.workspaces[0].peek_state.is_none(),
+            "peek_state should be None after Esc"
+        );
+    }
+
+    // ── j / k in peek mode adjust scroll_offset ──────────────────────────────
+
+    #[test]
+    fn j_in_peek_mode_scrolls_down() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let mut ps =
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string());
+        // Fill buffer so scrolling has room.
+        for i in 0..50 {
+            ps.screen_buffer.push(format!("line {i}"));
+        }
+        app.workspaces[0].peek_state = Some(ps);
+
+        app.handle_trajectory_key(key(KeyCode::Char('j')));
+
+        let offset = app.workspaces[0].peek_state.as_ref().unwrap().scroll_offset;
+        assert_eq!(offset, 3, "j should increase scroll_offset by 3");
+    }
+
+    #[test]
+    fn k_in_peek_mode_scrolls_up() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let mut ps =
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string());
+        for i in 0..50 {
+            ps.screen_buffer.push(format!("line {i}"));
+        }
+        ps.scroll_offset = 10;
+        app.workspaces[0].peek_state = Some(ps);
+
+        app.handle_trajectory_key(key(KeyCode::Char('k')));
+
+        let offset = app.workspaces[0].peek_state.as_ref().unwrap().scroll_offset;
+        assert_eq!(offset, 7, "k should decrease scroll_offset by 3");
+    }
+
+    // ── g / G in peek mode ────────────────────────────────────────────────────
+
+    #[test]
+    fn g_in_peek_mode_goes_to_top() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let mut ps =
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string());
+        for i in 0..50 {
+            ps.screen_buffer.push(format!("line {i}"));
+        }
+        ps.scroll_offset = 20;
+        app.workspaces[0].peek_state = Some(ps);
+
+        app.handle_trajectory_key(key(KeyCode::Char('g')));
+
+        let offset = app.workspaces[0].peek_state.as_ref().unwrap().scroll_offset;
+        assert_eq!(offset, 0, "g should reset scroll_offset to 0");
+    }
+
+    #[test]
+    fn big_g_in_peek_mode_goes_to_bottom() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let mut ps =
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string());
+        for i in 0..30 {
+            ps.screen_buffer.push(format!("line {i}"));
+        }
+        app.workspaces[0].peek_state = Some(ps);
+
+        app.handle_trajectory_key(shift_key('G'));
+
+        let peek = app.workspaces[0].peek_state.as_ref().unwrap();
+        assert_eq!(
+            peek.scroll_offset,
+            peek.max_scroll(),
+            "G should go to max scroll offset"
+        );
+    }
+
+    // ── Enter in peek mode sets yield_pending ─────────────────────────────────
+
+    #[test]
+    fn enter_in_peek_mode_sets_yield_pending() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.workspaces[0].peek_state = Some(
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string())
+        );
+
+        app.handle_trajectory_key(key(KeyCode::Enter));
+
+        assert!(
+            app.workspaces[0].peek_yield_pending,
+            "peek_yield_pending should be true after Enter in peek mode"
+        );
+    }
+
+    // ── take_peek_yield ───────────────────────────────────────────────────────
+
+    #[test]
+    fn take_peek_yield_returns_ref_id_and_clears_peek() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.workspaces[0].peek_state = Some(
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string())
+        );
+        app.workspaces[0].peek_yield_pending = true;
+
+        let ref_id = app.take_peek_yield();
+
+        assert_eq!(ref_id, Some("workspace:3".to_string()));
+        assert!(app.workspaces[0].peek_state.is_none(), "peek_state cleared on yield");
+        assert!(!app.workspaces[0].peek_yield_pending, "flag cleared");
+    }
+
+    #[test]
+    fn take_peek_yield_returns_none_when_not_pending() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.workspaces[0].peek_state = Some(
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string())
+        );
+        // peek_yield_pending is false (default)
+
+        let ref_id = app.take_peek_yield();
+        assert!(ref_id.is_none());
+        assert!(app.workspaces[0].peek_state.is_some(), "peek_state unchanged");
+    }
 }

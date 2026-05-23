@@ -28,16 +28,18 @@ pub fn render_detail(
         }
     };
 
-    // If a trajectory doc is available, delegate entirely to the trajectory view.
-    // Fall through to the legacy rendering for workspaces without one.
-    if let Some(doc) = ws.trajectory.as_ref() {
+    // If a trajectory doc is available (or peek mode is active), delegate to
+    // the trajectory view. Peek mode can be active without a trajectory doc.
+    // Fall through to the legacy rendering for workspaces without either.
+    if ws.trajectory.is_some() || ws.peek_state.is_some() {
         crate::tui::trajectory_view::render(
             f,
             area,
-            Some(doc),
+            ws.trajectory.as_ref(),
             scroll,
             focused,
             ws.edit_state.as_ref(),
+            ws.peek_state.as_ref(),
         );
         return;
     }
