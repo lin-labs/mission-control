@@ -7,3 +7,4 @@
 // module tree (which would pull in cmux/llm/session and generate dozens
 // of dead-code warnings).
 pub mod mc_data;
+pub mod cli;

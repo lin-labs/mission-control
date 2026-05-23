@@ -73,6 +73,9 @@ async fn main() -> Result<()> {
         None => run_tui(cli.tui).await,
         Some(config::Command::Resolve { workspace_id }) => cli::resolve::run(&workspace_id),
         Some(config::Command::Setup) => cli::setup::run(),
+        Some(config::Command::PromoteRules { proposals_file }) => cli::promote_rules::run(&proposals_file),
+        Some(config::Command::RecordHit { project, rule_id }) => cli::record_hit::run(&project, &rule_id),
+        Some(config::Command::Gc) => cli::gc::run(),
     }
 }
 

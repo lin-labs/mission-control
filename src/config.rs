@@ -22,6 +22,20 @@ pub enum Command {
     },
     /// One-time setup: create ~/data/mission-control/, print install summary.
     Setup,
+    /// Promote ticked rules from a proposals file into the project's rules.md.
+    PromoteRules {
+        /// Path to the proposals .md file.
+        proposals_file: PathBuf,
+    },
+    /// Bump the hit count for a matched prompt rule.
+    RecordHit {
+        /// The project the rule belongs to.
+        project: String,
+        /// Stable short hash of the rule's PATTERN.
+        rule_id: String,
+    },
+    /// Garbage-collect stale rules across all projects' rules.md.
+    Gc,
 }
 
 /// Configuration for the TUI (all existing flags live here).
