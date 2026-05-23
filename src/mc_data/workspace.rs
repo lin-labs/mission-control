@@ -57,6 +57,22 @@ pub fn read_project(uuid: &str) -> Result<String> {
         .to_string())
 }
 
+/// Rename a workspace's display name. Moves the symlink only; the data dir
+/// (keyed by UUID) does not move. Rewrites the `name` file.
+pub fn rename_workspace(uuid: &str, new_name: &str) -> Result<()> {
+    let old_name = read_display_name(uuid)?;
+    if old_name == new_name {
+        return Ok(());
+    }
+    let old_link = paths::display_symlink(&old_name);
+    let new_link = paths::display_symlink(new_name);
+    // mv on the symlink only. Atomic via rename(2).
+    fs::rename(&old_link, &new_link)
+        .with_context(|| format!("rename symlink {old_link:?} -> {new_link:?}"))?;
+    write_atomic(&paths::name_path(uuid), new_name)?;
+    Ok(())
+}
+
 fn write_atomic(path: &std::path::Path, contents: &str) -> Result<()> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, contents)?;

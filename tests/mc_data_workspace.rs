@@ -1,5 +1,6 @@
 use mission_control::mc_data::{paths, workspace};
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 
 // All tests in this file work against a per-test temp data root.
 // We do this by setting HOME via env var so dirs::home_dir() returns it.
@@ -73,5 +74,38 @@ fn read_project_reads_project_file() {
         // Overwriting the project file is reflected on subsequent reads.
         fs::write(paths::project_path("uuid-4"), "different-project").unwrap();
         assert_eq!(workspace::read_project("uuid-4").unwrap(), "different-project");
+    });
+}
+
+#[test]
+fn rename_workspace_moves_only_the_symlink() {
+    with_tmp_home(|_| {
+        workspace::ensure_workspace("uuid-r1", "predinvest", "predinvest").unwrap();
+        let data_path = paths::workspace_dir("uuid-r1");
+        let inode_before = fs::metadata(&data_path).unwrap().ino();
+
+        workspace::rename_workspace("uuid-r1", "predinvest-v2").unwrap();
+
+        // The data dir is untouched.
+        assert_eq!(inode_before, fs::metadata(&data_path).unwrap().ino());
+        // The old symlink is gone.
+        assert!(!paths::display_symlink("predinvest").exists());
+        // The new symlink exists and resolves.
+        let new_link = paths::display_symlink("predinvest-v2");
+        assert!(new_link.exists());
+        let resolved = fs::canonicalize(&new_link).unwrap();
+        assert_eq!(resolved, fs::canonicalize(&data_path).unwrap());
+        // The name file reflects the new name.
+        assert_eq!(workspace::read_display_name("uuid-r1").unwrap(), "predinvest-v2");
+    });
+}
+
+#[test]
+fn rename_workspace_to_same_name_is_noop() {
+    with_tmp_home(|_| {
+        workspace::ensure_workspace("uuid-r2", "alpha", "alpha").unwrap();
+        workspace::rename_workspace("uuid-r2", "alpha").unwrap(); // should succeed silently
+        assert!(paths::display_symlink("alpha").exists());
+        assert_eq!(workspace::read_display_name("uuid-r2").unwrap(), "alpha");
     });
 }
