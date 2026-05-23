@@ -297,6 +297,57 @@ async fn run_app(
                         if key.kind != KeyEventKind::Press {
                             continue;
                         }
+
+                        // ── Trajectory key routing ────────────────────────────
+                        // When in Detail focus and the selected workspace has a
+                        // trajectory loaded, intercept keys for the editor.
+                        {
+                            use crate::tui::trajectory_edit::EditMode;
+                            let in_detail = app.focus == crate::tui::app::Focus::Detail;
+                            let has_traj = app
+                                .selected_workspace()
+                                .map_or(false, |ws| ws.trajectory.is_some());
+
+                            if in_detail && has_traj {
+                                let in_insert = app
+                                    .selected_workspace()
+                                    .and_then(|ws| ws.edit_state.as_ref())
+                                    .map_or(false, |s| {
+                                        matches!(s.mode, EditMode::Insert { .. })
+                                    });
+
+                                let is_traj_nav_key = matches!(
+                                    key.code,
+                                    KeyCode::Char('j')
+                                        | KeyCode::Down
+                                        | KeyCode::Char('k')
+                                        | KeyCode::Up
+                                        | KeyCode::Char('g')
+                                        | KeyCode::Char('G')
+                                        | KeyCode::Char('i')
+                                        | KeyCode::Enter
+                                        | KeyCode::Char(' ')
+                                        | KeyCode::Char('x')
+                                        | KeyCode::Char('d')
+                                        | KeyCode::Char('o')
+                                        | KeyCode::Char('O')
+                                        | KeyCode::Char('J')
+                                        | KeyCode::Char('K')
+                                );
+
+                                if in_insert || is_traj_nav_key {
+                                    let actions = app.handle_trajectory_key(key);
+                                    if !actions.is_empty() {
+                                        if let Err(e) = app.save_trajectory_edits(&actions) {
+                                            eprintln!("save_trajectory_edits: {e:?}");
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        // ─────────────────────────────────────────────────────
+
                         match (key.code, key.modifiers) {
                             (KeyCode::Char('q'), _)
                             | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
@@ -309,6 +360,22 @@ async fn run_app(
                                 if app.focus == crate::tui::app::Focus::Detail {
                                     app.scroll_down();
                                 } else {
+                                    // Auto-save in-flight trajectory edits if in insert mode before
+                                    // switching workspace (commit_insert produces the actions).
+                                    let in_insert = app
+                                        .selected_workspace()
+                                        .and_then(|ws| ws.edit_state.as_ref())
+                                        .map_or(false, |s| {
+                                            matches!(
+                                                s.mode,
+                                                crate::tui::trajectory_edit::EditMode::Insert { .. }
+                                            )
+                                        });
+                                    if in_insert {
+                                        if let Err(e) = app.save_trajectory_edits(&[]) {
+                                            eprintln!("auto-save on switch: {e:?}");
+                                        }
+                                    }
                                     app.next();
                                     app.spawn_load_screen_preview(
                                         cmux_client.clone(),
@@ -321,6 +388,22 @@ async fn run_app(
                                 if app.focus == crate::tui::app::Focus::Detail {
                                     app.scroll_up();
                                 } else {
+                                    // Auto-save in-flight trajectory edits if in insert mode before
+                                    // switching workspace (commit_insert produces the actions).
+                                    let in_insert = app
+                                        .selected_workspace()
+                                        .and_then(|ws| ws.edit_state.as_ref())
+                                        .map_or(false, |s| {
+                                            matches!(
+                                                s.mode,
+                                                crate::tui::trajectory_edit::EditMode::Insert { .. }
+                                            )
+                                        });
+                                    if in_insert {
+                                        if let Err(e) = app.save_trajectory_edits(&[]) {
+                                            eprintln!("auto-save on switch: {e:?}");
+                                        }
+                                    }
                                     app.previous();
                                     app.spawn_load_screen_preview(
                                         cmux_client.clone(),
