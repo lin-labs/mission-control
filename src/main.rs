@@ -7,10 +7,10 @@ mod tui;
 use crate::cmux::client::CmuxClient;
 use crate::cmux::events;
 use crate::config::Config;
+use crate::llm::Summarizer;
 use crate::llm::codex::CodexSummarizer;
 use crate::llm::openai::OpenAISummarizer;
 use crate::llm::typesafe::TypeSafeClassifier;
-use crate::llm::Summarizer;
 use crate::session::watcher::SessionWatcher;
 use crate::tui::app::App;
 
@@ -19,59 +19,110 @@ use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Layout},
-    Terminal,
 };
 use std::io;
+use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
 
+enum AppControl {
+    Quit,
+    Reload,
+}
+
+struct BinaryStamp {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl BinaryStamp {
+    fn capture() -> Option<Self> {
+        let path = std::env::current_exe().ok()?;
+        let metadata = std::fs::metadata(&path).ok()?;
+        Some(Self {
+            path,
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+
+    fn has_changed(&self) -> bool {
+        let Ok(metadata) = std::fs::metadata(&self.path) else {
+            return false;
+        };
+
+        metadata.len() != self.len || metadata.modified().ok() != self.modified
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = Config::parse();
-    let cmux_client = CmuxClient::new(config.cmux_bin.clone(), config.cmux_socket.clone());
+    let binary_stamp = BinaryStamp::capture();
 
-    // Prefer Codex (local auth, no API key) when use_codex is set,
-    // fall back to OpenAI if explicitly requested or as a backup.
-    let summarizer: Option<Arc<dyn Summarizer>> = if config.use_codex {
-        Some(Arc::new(CodexSummarizer::new(
-            config.codex_bin.clone(),
-            config::SUMMARIZE_PROMPT.to_string(),
-            None, // use codex's default model
-        )) as Arc<dyn Summarizer>)
-    } else {
-        config.openai_api_key.as_ref().map(|key| {
-            Arc::new(OpenAISummarizer::new(
-                key.clone(),
-                config.model.clone(),
+    loop {
+        let config = Config::parse();
+        let cmux_client = CmuxClient::new(config.cmux_bin.clone(), config.cmux_socket.clone());
+
+        // Prefer Codex (local auth, no API key) when use_codex is set,
+        // fall back to OpenAI if explicitly requested or as a backup.
+        let summarizer: Option<Arc<dyn Summarizer>> = if config.use_codex {
+            Some(Arc::new(CodexSummarizer::new(
+                config.codex_bin.clone(),
                 config::SUMMARIZE_PROMPT.to_string(),
-            )) as Arc<dyn Summarizer>
-        })
-    };
+                None, // use codex's default model
+            )) as Arc<dyn Summarizer>)
+        } else {
+            config.openai_api_key.as_ref().map(|key| {
+                Arc::new(OpenAISummarizer::new(
+                    key.clone(),
+                    config.model.clone(),
+                    config::SUMMARIZE_PROMPT.to_string(),
+                )) as Arc<dyn Summarizer>
+            })
+        };
 
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend)?;
 
-    let classifier = config
-        .typesafe_api_key
-        .as_ref()
-        .map(|key| TypeSafeClassifier::new(key.clone()));
+        let classifier = config
+            .typesafe_api_key
+            .as_ref()
+            .map(|key| TypeSafeClassifier::new(key.clone()));
 
-    let result = run_app(&mut terminal, &config, &cmux_client, summarizer, classifier.as_ref()).await;
+        let result = run_app(
+            &mut terminal,
+            &config,
+            &cmux_client,
+            summarizer,
+            classifier.as_ref(),
+        )
+        .await;
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+        disable_raw_mode()?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        terminal.show_cursor()?;
 
-    result
+        match result? {
+            AppControl::Quit => return Ok(()),
+            AppControl::Reload => {
+                if binary_stamp.as_ref().is_some_and(BinaryStamp::has_changed) {
+                    restart_current_process()?;
+                }
+            }
+        }
+    }
 }
 
 async fn run_app(
@@ -80,21 +131,16 @@ async fn run_app(
     cmux_client: &CmuxClient,
     summarizer: Option<Arc<dyn Summarizer>>,
     classifier: Option<&TypeSafeClassifier>,
-) -> Result<()> {
+) -> Result<AppControl> {
     let mut app = App::new();
     app.refresh_workspaces(cmux_client, &config.histories_dir)
         .await?;
 
     // Channel for async screen-capture results (per-workspace, parallel)
-    let (screen_tx, mut screen_rx) =
-        mpsc::unbounded_channel::<crate::tui::app::ScreenUpdate>();
+    let (screen_tx, mut screen_rx) = mpsc::unbounded_channel::<crate::tui::app::ScreenUpdate>();
 
     // Kick off initial screen capture for the selected workspace
-    app.spawn_load_screen_preview(
-        cmux_client.clone(),
-        classifier.cloned(),
-        screen_tx.clone(),
-    );
+    app.spawn_load_screen_preview(cmux_client.clone(), classifier.cloned(), screen_tx.clone());
 
     // Spawn cmux event stream subscriber
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -117,15 +163,27 @@ async fn run_app(
     loop {
         terminal.draw(|f| {
             // Split vertically: main area on top, single-line shortcut footer on the bottom.
-            let vchunks = Layout::vertical([Constraint::Min(5), Constraint::Length(1)])
-                .split(f.area());
+            let vchunks =
+                Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).split(f.area());
 
-            let chunks = Layout::horizontal([Constraint::Length(32), Constraint::Min(40)])
-                .split(vchunks[0]);
+            let chunks =
+                Layout::horizontal([Constraint::Length(32), Constraint::Min(40)]).split(vchunks[0]);
 
             let sidebar_focused = app.focus == crate::tui::app::Focus::Sidebar;
-            tui::sidebar::render_sidebar(f, chunks[0], &app.workspaces, app.selected, sidebar_focused);
-            tui::detail::render_detail(f, chunks[1], app.selected_workspace(), app.detail_scroll, !sidebar_focused);
+            tui::sidebar::render_sidebar(
+                f,
+                chunks[0],
+                &app.workspaces,
+                app.selected,
+                sidebar_focused,
+            );
+            tui::detail::render_detail(
+                f,
+                chunks[1],
+                app.selected_workspace(),
+                app.detail_scroll,
+                !sidebar_focused,
+            );
             tui::footer::render_footer(f, vchunks[1], app.focus);
         })?;
 
@@ -142,6 +200,9 @@ async fn run_app(
                             (KeyCode::Char('q'), _)
                             | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                                 app.should_quit = true;
+                            }
+                            (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                                return Ok(AppControl::Reload);
                             }
                             (KeyCode::Char('j') | KeyCode::Down, _) => {
                                 if app.focus == crate::tui::app::Focus::Detail {
@@ -367,9 +428,17 @@ async fn run_app(
         }
 
         if app.should_quit {
-            return Ok(());
+            return Ok(AppControl::Quit);
         }
     }
+}
+
+fn restart_current_process() -> Result<()> {
+    let current_exe = std::env::current_exe()?;
+    let err = std::process::Command::new(current_exe)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    Err(err.into())
 }
 
 /// Assemble the summarization context from all available signals.

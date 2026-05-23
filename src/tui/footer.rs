@@ -1,10 +1,10 @@
 use crate::tui::app::Focus;
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
-    Frame,
 };
 
 /// Render the keyboard-shortcut footer line at the bottom of the screen.
@@ -25,6 +25,7 @@ pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus) {
             ("⏎", "switch ws"),
             ("s", "rescreen"),
             ("r", "summarize"),
+            ("^r", "reload"),
             ("n", "notes"),
             ("q", "quit"),
         ],
@@ -34,6 +35,7 @@ pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus) {
             ("⏎", "switch ws"),
             ("s", "rescreen"),
             ("r", "summarize"),
+            ("^r", "reload"),
             ("n", "notes"),
             ("q", "quit"),
         ],
