@@ -31,7 +31,14 @@ pub fn render_detail(
     // If a trajectory doc is available, delegate entirely to the trajectory view.
     // Fall through to the legacy rendering for workspaces without one.
     if let Some(doc) = ws.trajectory.as_ref() {
-        crate::tui::trajectory_view::render(f, area, Some(doc), scroll, focused);
+        crate::tui::trajectory_view::render(
+            f,
+            area,
+            Some(doc),
+            scroll,
+            focused,
+            ws.edit_state.as_ref(),
+        );
         return;
     }
 

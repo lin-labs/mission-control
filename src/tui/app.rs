@@ -343,6 +343,10 @@ pub struct WorkspaceState {
     /// Parsed trajectory doc for this workspace (loaded from `.data/<uuid>/trajectory.md`).
     /// `None` if the file does not exist or could not be read.
     pub trajectory: Option<crate::mc_data::trajectory::TrajectoryDoc>,
+    /// Per-workspace trajectory editing state. `None` means no editing has
+    /// started yet for this workspace; `Some(...)` persists across workspace
+    /// switches so the cursor position is remembered.
+    pub edit_state: Option<crate::tui::trajectory_edit::TrajectoryEditState>,
 }
 
 /// Result of an async screen capture + classification for a single workspace.
@@ -593,6 +597,12 @@ impl App {
             .iter()
             .map(|ws| (ws.workspace.uuid.clone(), ws.summary.clone()))
             .collect();
+        // Preserve editing state across refreshes so cursor position is remembered.
+        let old_edit_states: HashMap<String, Option<crate::tui::trajectory_edit::TrajectoryEditState>> = self
+            .workspaces
+            .iter()
+            .map(|ws| (ws.workspace.uuid.clone(), ws.edit_state.clone()))
+            .collect();
 
         self.workspaces = workspaces
             .into_iter()
@@ -631,6 +641,7 @@ impl App {
                 let notes = load_workspace_notes(&ws.name);
                 let hook_status = load_hook_status(&ws.uuid);
                 let summary = old_summaries.get(&ws.uuid).cloned().flatten();
+                let edit_state = old_edit_states.get(&ws.uuid).cloned().flatten();
                 WorkspaceState {
                     workspace: ws,
                     session,
@@ -645,6 +656,7 @@ impl App {
                     summary,
                     summarizing: false,
                     trajectory,
+                    edit_state,
                 }
             })
             .collect();
@@ -849,6 +861,85 @@ impl App {
         for ws in &mut self.workspaces {
             ws.notes = load_workspace_notes(&ws.workspace.name);
         }
+    }
+
+    /// Called when the file watcher detects a write to `<.data>/<uuid>/trajectory.md`.
+    /// Re-reads the trajectory doc from disk and updates the in-memory workspace state.
+    ///
+    /// If the workspace is currently being edited, the update is silently skipped —
+    /// the next 30 s refresh tick or a future watcher event will pick it up once
+    /// editing is done.
+    pub fn apply_trajectory_update(&mut self, uuid: &str) {
+        let Some(&idx) = self.workspace_index.get(uuid) else {
+            return;
+        };
+        // Skip if we're in an active insert-mode edit to avoid clobbering
+        // in-flight changes.
+        let is_editing = self.workspaces[idx]
+            .edit_state
+            .as_ref()
+            .map(|s| matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. }))
+            .unwrap_or(false);
+        if is_editing {
+            return;
+        }
+        let traj_path = crate::mc_data::paths::trajectory_path(uuid);
+        if traj_path.exists() {
+            if let Ok(doc) =
+                crate::mc_data::trajectory::TrajectoryDoc::load_from_file(&traj_path)
+            {
+                self.workspaces[idx].trajectory = Some(doc);
+            }
+        }
+    }
+
+    /// Dispatch a key event to the trajectory editor for the selected workspace.
+    ///
+    /// Returns any `EditAction`s that should be persisted on the next Esc-save.
+    /// If the focused workspace has no trajectory, or the detail pane is not
+    /// focused, returns an empty Vec.
+    pub fn handle_trajectory_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> Vec<crate::tui::trajectory_edit::EditAction> {
+        let idx = self.selected;
+        let ws = match self.workspaces.get_mut(idx) {
+            Some(w) => w,
+            None => return vec![],
+        };
+        let doc = match ws.trajectory.as_mut() {
+            Some(d) => d,
+            None => return vec![],
+        };
+        // Lazily initialise edit_state when first needed.
+        let state = ws.edit_state.get_or_insert_with(|| {
+            crate::tui::trajectory_edit::TrajectoryEditState::default()
+        });
+        crate::tui::trajectory_edit::handle_key(state, doc, key)
+    }
+
+    /// Save the current edit session for the selected workspace to disk.
+    /// Returns the snapshot number N on success.
+    pub fn save_trajectory_edits(
+        &mut self,
+        actions: &[crate::tui::trajectory_edit::EditAction],
+    ) -> anyhow::Result<Option<u32>> {
+        let idx = self.selected;
+        let ws = match self.workspaces.get_mut(idx) {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        let doc = match ws.trajectory.as_mut() {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let state = match ws.edit_state.as_ref() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let uuid = ws.workspace.uuid.clone();
+        let n = crate::tui::trajectory_edit::save(&uuid, doc, state, actions)?;
+        Ok(Some(n))
     }
 }
 
