@@ -263,6 +263,14 @@ async fn run_app(
     let mut refresh_interval = interval(Duration::from_secs(30));
     let mut screen_interval = interval(Duration::from_secs(15));
 
+    // Channel for peek-mode screen-poll results: (workspace_uuid, screen_text)
+    let (peek_tx, mut peek_rx) = mpsc::channel::<(String, String)>(64);
+
+    // Tick for peek-mode polling (~200ms; cheap because peek_needs_poll is a no-op
+    // unless a workspace is actually in peek mode and past its poll deadline).
+    let mut peek_tick = tokio::time::interval(Duration::from_millis(200));
+    peek_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         terminal.draw(|f| {
             // Split vertically: main area on top, single-line shortcut footer on the bottom.
@@ -614,6 +622,41 @@ async fn run_app(
 
             Some(update) = screen_rx.recv() => {
                 app.apply_screen_update(update);
+            }
+
+            _ = peek_tick.tick() => {
+                if let Some((uuid, surface_ref)) = app.peek_needs_poll() {
+                    // Owned copies for the spawned task.
+                    let uuid = uuid.to_string();
+                    let surface_ref = surface_ref.to_string();
+                    app.mark_peek_polling();
+                    let client = cmux_client.clone();
+                    let tx = peek_tx.clone();
+                    tokio::spawn(async move {
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            client.read_screen(&surface_ref, 100),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .unwrap_or_default();
+                        let _ = tx.send((uuid, result)).await;
+                    });
+                }
+            }
+
+            Some((uuid, screen_text)) = peek_rx.recv() => {
+                app.apply_peek_screen_update(&uuid, screen_text);
+            }
+        }
+
+        // Check for peek yield (Enter pressed in peek mode) after every select!
+        // iteration. This is async but resolves immediately (no I/O in the
+        // hot path) and keeps the redraw path unblocked.
+        if let Some(workspace_ref) = app.take_peek_yield() {
+            if let Err(e) = cmux_client.select_workspace(&workspace_ref).await {
+                eprintln!("peek-yield select_workspace({workspace_ref}): {e:?}");
             }
         }
 
