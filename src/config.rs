@@ -1,9 +1,32 @@
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+/// Top-level CLI parser — subcommand optional; no subcommand launches the TUI.
 #[derive(Parser, Debug, Clone)]
-#[command(name = "mission-control", about = "cmux workspace mission control")]
-pub struct Config {
+#[command(name = "mc", about = "cmux workspace mission control")]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
+    #[command(flatten)]
+    pub tui: TuiConfig,
+}
+
+/// Subcommands available alongside the default TUI mode.
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Resolve a workspace UUID to its local data dir path.
+    Resolve {
+        /// The cmux workspace UUID.
+        workspace_id: String,
+    },
+    /// One-time setup: create ~/data/mission-control/, print install summary.
+    Setup,
+}
+
+/// Configuration for the TUI (all existing flags live here).
+#[derive(Args, Debug, Clone)]
+pub struct TuiConfig {
     /// Path to session history files
     #[arg(long, default_value_os_t = default_histories_dir())]
     pub histories_dir: PathBuf,
@@ -46,6 +69,9 @@ pub struct Config {
     #[arg(long, default_value_t = true)]
     pub use_codex: bool,
 }
+
+/// Backwards-compatibility alias so existing code referencing `Config` keeps working.
+pub type Config = TuiConfig;
 
 fn default_histories_dir() -> PathBuf {
     dirs::home_dir()
