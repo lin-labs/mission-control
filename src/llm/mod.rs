@@ -1,4 +1,5 @@
 pub mod codex;
+pub mod learning;
 pub mod log;
 pub mod openai;
 pub mod surface_summary;

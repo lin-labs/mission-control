@@ -61,6 +61,27 @@ pub struct SurfaceSummaryState {
     pub lines_since_last_summary: u32,
 }
 
+/// Per-workspace dismissal tracking state.
+#[derive(Debug, Clone)]
+pub struct DismissalState {
+    /// Current count of open cmux surfaces for this workspace.
+    pub open_surfaces: u32,
+    /// When the surface count first dropped to zero (grace timer start).
+    pub grace_started_at: Option<Instant>,
+    /// True once the dismissal task has been spawned (prevents duplicate spawns).
+    pub dismissing: bool,
+}
+
+impl Default for DismissalState {
+    fn default() -> Self {
+        Self {
+            open_surfaces: 0,
+            grace_started_at: None,
+            dismissing: false,
+        }
+    }
+}
+
 /// Key insights extracted from raw screen text.
 #[derive(Debug, Clone, Default)]
 pub struct ScreenInsights {
@@ -386,6 +407,8 @@ pub struct WorkspaceState {
     pub peek_yield_pending: bool,
     /// Regen scheduler state for trajectory regeneration.
     pub regen: RegenSchedulerState,
+    /// Dismissal tracking: surface count, grace timer, dismissing flag.
+    pub dismissal: DismissalState,
 }
 
 /// Result of an async screen capture + classification for a single workspace.
@@ -654,6 +677,12 @@ impl App {
             .iter()
             .map(|ws| (ws.workspace.uuid.clone(), ws.regen.clone()))
             .collect();
+        // Preserve dismissal state across refreshes.
+        let old_dismissal_states: HashMap<String, DismissalState> = self
+            .workspaces
+            .iter()
+            .map(|ws| (ws.workspace.uuid.clone(), ws.dismissal.clone()))
+            .collect();
 
         self.workspaces = workspaces
             .into_iter()
@@ -698,6 +727,10 @@ impl App {
                     .get(&ws.uuid)
                     .cloned()
                     .unwrap_or_default();
+                let dismissal = old_dismissal_states
+                    .get(&ws.uuid)
+                    .cloned()
+                    .unwrap_or_default();
                 WorkspaceState {
                     workspace: ws,
                     session,
@@ -716,6 +749,7 @@ impl App {
                     peek_state,
                     peek_yield_pending: false,
                     regen,
+                    dismissal,
                 }
             })
             .collect();
@@ -1327,6 +1361,217 @@ impl App {
         }
     }
 
+    // ──────────────────────────────────────────────────────────────────────
+    // Dismissal methods
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Update the open_surfaces count for a workspace.
+    /// When count drops to zero, start the grace timer.
+    /// When count rises above zero, cancel the grace timer.
+    pub fn set_open_surfaces(&mut self, uuid: &str, count: u32) {
+        if let Some(&idx) = self.workspace_index.get(uuid) {
+            let ds = &mut self.workspaces[idx].dismissal;
+            let was_zero = ds.open_surfaces == 0;
+            ds.open_surfaces = count;
+            if count == 0 && !was_zero {
+                // Surfaces just dropped to zero — start grace timer.
+                ds.grace_started_at = Some(Instant::now());
+            } else if count > 0 {
+                // A surface re-attached — cancel the grace timer.
+                ds.grace_started_at = None;
+            }
+        }
+    }
+
+    /// Return UUIDs of workspaces whose grace timer has elapsed.
+    /// Excludes workspaces already marked as dismissing.
+    pub fn workspaces_ready_for_dismissal(&self, grace: std::time::Duration) -> Vec<String> {
+        self.workspaces
+            .iter()
+            .filter(|ws| {
+                if ws.dismissal.dismissing {
+                    return false;
+                }
+                if let Some(started_at) = ws.dismissal.grace_started_at {
+                    started_at.elapsed() >= grace
+                } else {
+                    false
+                }
+            })
+            .map(|ws| ws.workspace.uuid.clone())
+            .collect()
+    }
+
+    /// Gather all available data for the learning LLM call.
+    pub fn build_learning_inputs(&self, uuid: &str) -> crate::llm::learning::LearningInputs {
+        let idx = self.workspace_index.get(uuid).copied();
+        let ws = idx.and_then(|i| self.workspaces.get(i));
+
+        let workspace_name = ws
+            .map(|w| w.workspace.name.clone())
+            .unwrap_or_else(|| uuid.to_string());
+        let project = crate::mc_data::workspace::read_project(uuid)
+            .unwrap_or_else(|_| workspace_name.clone());
+
+        // Duration from screen insights if available.
+        let duration = ws
+            .and_then(|w| w.screen_insights.duration.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Surfaces summary from surface titles.
+        let surfaces_summary = ws
+            .map(|w| w.surfaces.iter().map(|s| s.title.clone()).collect())
+            .unwrap_or_default();
+
+        // Final trajectory from disk.
+        let final_trajectory = {
+            let path = crate::mc_data::paths::trajectory_path(uuid);
+            std::fs::read_to_string(&path).unwrap_or_default()
+        };
+
+        // History snapshots: histories/trajectory-N.md in chronological order.
+        let history_snapshots = {
+            let histories_dir = crate::mc_data::paths::histories_dir(uuid);
+            let mut snaps: Vec<(u32, String)> = std::fs::read_dir(&histories_dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    let stem = p.file_stem()?.to_str()?.to_string();
+                    // filename: trajectory-N.md
+                    let n: u32 = stem.strip_prefix("trajectory-")?.parse().ok()?;
+                    let content = std::fs::read_to_string(&p).ok()?;
+                    Some((n, content))
+                })
+                .collect();
+            snaps.sort_by_key(|(n, _)| *n);
+            snaps.into_iter().map(|(_, c)| c).collect()
+        };
+
+        // User inputs: inputs/N.txt in order.
+        let inputs = {
+            let inputs_dir = crate::mc_data::paths::inputs_dir(uuid);
+            let mut entries: Vec<(u32, String)> = std::fs::read_dir(&inputs_dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    if p.extension().and_then(|x| x.to_str()) != Some("txt") {
+                        return None;
+                    }
+                    let n: u32 = p.file_stem()?.to_str()?.parse().ok()?;
+                    let content = std::fs::read_to_string(&p).ok()?;
+                    Some((n, content))
+                })
+                .collect();
+            entries.sort_by_key(|(n, _)| *n);
+            entries.into_iter().map(|(_, c)| c).collect()
+        };
+
+        // Full events log.
+        let events_jsonl = {
+            let path = crate::mc_data::paths::events_log(uuid);
+            std::fs::read_to_string(&path).unwrap_or_default()
+        };
+
+        // Agent session history files: surfaces/<sid>.session-path pointer.
+        let session_history_files = {
+            let surfaces_dir = crate::mc_data::paths::surfaces_dir(uuid);
+            let mut histories = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&surfaces_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("session-path") {
+                        if let Ok(session_path) = std::fs::read_to_string(&p) {
+                            let session_path = session_path.trim();
+                            if let Ok(content) = std::fs::read_to_string(session_path) {
+                                histories.push(content);
+                            }
+                        }
+                    }
+                }
+            }
+            histories
+        };
+
+        // Shell logs: surfaces/<sid>.log.
+        let shell_logs = {
+            let surfaces_dir = crate::mc_data::paths::surfaces_dir(uuid);
+            let mut logs = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&surfaces_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("log") {
+                        if let Ok(content) = std::fs::read_to_string(&p) {
+                            logs.push(content);
+                        }
+                    }
+                }
+            }
+            logs
+        };
+
+        // Surface summary files.
+        let surface_summaries = {
+            let surfaces_dir = crate::mc_data::paths::surfaces_dir(uuid);
+            let mut summaries = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&surfaces_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("summary") {
+                        if let Ok(content) = std::fs::read_to_string(&p) {
+                            let trimmed = content.trim().to_string();
+                            if !trimmed.is_empty() {
+                                summaries.push(trimmed);
+                            }
+                        }
+                    }
+                }
+            }
+            summaries
+        };
+
+        crate::llm::learning::LearningInputs {
+            workspace_uuid: uuid.to_string(),
+            workspace_name,
+            project,
+            duration,
+            surfaces_summary,
+            final_trajectory,
+            history_snapshots,
+            inputs,
+            events_jsonl,
+            session_history_files,
+            shell_logs,
+            surface_summaries,
+        }
+    }
+
+    /// Mark a workspace as currently being dismissed (prevents re-triggering).
+    pub fn mark_dismissing(&mut self, uuid: &str) {
+        if let Some(&idx) = self.workspace_index.get(uuid) {
+            self.workspaces[idx].dismissal.dismissing = true;
+        }
+    }
+
+    /// Remove a workspace from in-memory state after successful dismissal.
+    pub fn drop_dismissed_workspace(&mut self, uuid: &str) {
+        if let Some(&idx) = self.workspace_index.get(uuid) {
+            self.workspaces.remove(idx);
+            // Rebuild the index.
+            self.workspace_index.clear();
+            for (i, ws) in self.workspaces.iter().enumerate() {
+                self.workspace_index.insert(ws.workspace.uuid.clone(), i);
+            }
+            // Clamp selected index.
+            if !self.workspaces.is_empty() && self.selected >= self.workspaces.len() {
+                self.selected = self.workspaces.len() - 1;
+            }
+        }
+    }
+
     /// Save the current edit session for the selected workspace to disk.
     /// Returns the snapshot number N on success.
     pub fn save_trajectory_edits(
@@ -1571,6 +1816,7 @@ workspace: test-ws
             peek_state: None,
             peek_yield_pending: false,
             regen: RegenSchedulerState::default(),
+            dismissal: DismissalState::default(),
         }
     }
 

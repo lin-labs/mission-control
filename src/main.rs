@@ -266,10 +266,18 @@ async fn run_app(
     // Channel for surface summary completions: (uuid, sid, summary)
     let (surface_summary_tx, mut surface_summary_rx) = mpsc::channel::<(String, String, String)>(32);
 
+    // Channel for dismissal results: (uuid, Result<DismissalArtifacts, String>)
+    let (dismiss_tx, mut dismiss_rx) = mpsc::channel::<(String, Result<crate::mc_data::dismissal::DismissalArtifacts, String>)>(8);
+
     let mut refresh_interval = interval(Duration::from_secs(30));
     let mut screen_interval = interval(Duration::from_secs(15));
     let mut regen_tick = interval(Duration::from_secs(30));
     let mut surface_summary_tick = interval(Duration::from_secs(60));
+    let mut dismiss_tick = interval(Duration::from_secs(30));
+
+    // Track per-workspace surface count from the previous cmux refresh.
+    // Used to detect surface detachments between cmux event stream events.
+    let mut prev_surface_counts: HashMap<String, u32> = HashMap::new();
 
     // Channel for peek-mode screen-poll results: (workspace_uuid, screen_text)
     let (peek_tx, mut peek_rx) = mpsc::channel::<(String, String)>(64);
@@ -483,6 +491,21 @@ async fn run_app(
                                     app.load_notes();
                                 }
                             }
+                            (KeyCode::Char('D'), _) => {
+                                // Manual immediate dismissal: capital D in sidebar focus.
+                                // For v1 we skip confirmation and set grace to already-elapsed
+                                // so the next dismiss_tick fires the dismissal.
+                                if app.focus == crate::tui::app::Focus::Sidebar {
+                                    if let Some(ws) = app.workspaces.get_mut(app.selected) {
+                                        if !ws.dismissal.dismissing {
+                                            // Set grace_started_at far enough in the past
+                                            // that it is immediately past the 5-min threshold.
+                                            ws.dismissal.grace_started_at =
+                                                Some(Instant::now() - Duration::from_secs(600));
+                                        }
+                                    }
+                                }
+                            }
                             (KeyCode::Char('r'), _) => {
                                 // Summarize the selected workspace.
                                 // We do a DEEP capture (500 lines of scrollback) so codex
@@ -618,6 +641,27 @@ async fn run_app(
 
             _ = refresh_interval.tick() => {
                 let _ = app.refresh_workspaces(cmux_client, &config.histories_dir).await;
+                // After refresh, diff surface counts to detect detachments.
+                // cmux doesn't yet emit surface.opened/surface.closed events, so
+                // we poll on each refresh tick (every 30 s).
+                let surface_diffs: Vec<(String, u32)> = app
+                    .workspaces
+                    .iter()
+                    .filter_map(|ws| {
+                        let uuid = ws.workspace.uuid.clone();
+                        let new_count = ws.surfaces.len() as u32;
+                        let old_count = prev_surface_counts.get(&uuid).copied();
+                        prev_surface_counts.insert(uuid.clone(), new_count);
+                        if old_count.is_none() || old_count == Some(new_count) {
+                            None
+                        } else {
+                            Some((uuid, new_count))
+                        }
+                    })
+                    .collect();
+                for (uuid, count) in surface_diffs {
+                    app.set_open_surfaces(&uuid, count);
+                }
             }
 
             _ = screen_interval.tick() => {
@@ -738,6 +782,69 @@ async fn run_app(
 
             Some((uuid, sid, summary)) = surface_summary_rx.recv() => {
                 app.apply_surface_summary(&uuid, &sid, summary);
+            }
+
+            _ = dismiss_tick.tick() => {
+                // Check for workspaces whose grace timer has elapsed.
+                let due = app.workspaces_ready_for_dismissal(Duration::from_secs(300));
+                for uuid in due {
+                    app.mark_dismissing(&uuid);
+                    let inputs = app.build_learning_inputs(&uuid);
+                    let tx = dismiss_tx.clone();
+                    // If we have a summarizer, run the learning LLM call.
+                    // If not, skip the LLM call and finalize with a placeholder record.
+                    let summarizer_opt = summarizer.clone();
+                    tokio::spawn(async move {
+                        let learning_result = if let Some(ref summarizer) = summarizer_opt {
+                            crate::llm::learning::produce_learning(summarizer, &inputs).await
+                        } else {
+                            Ok(crate::llm::learning::LearningOutputs {
+                                full_record_md: format!(
+                                    "# Workspace record: {}\n\n(No LLM configured — record generated without learning extraction.)\n",
+                                    inputs.workspace_name
+                                ),
+                                candidates_only_md: None,
+                            })
+                        };
+                        match learning_result {
+                            Ok(out) => {
+                                match crate::mc_data::dismissal::finalize(
+                                    &inputs.workspace_uuid,
+                                    &out.full_record_md,
+                                    out.candidates_only_md.as_deref(),
+                                ) {
+                                    Ok(artifacts) => {
+                                        let _ = tx.send((inputs.workspace_uuid, Ok(artifacts))).await;
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send((inputs.workspace_uuid, Err(format!("{:#}", e)))).await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send((inputs.workspace_uuid, Err(format!("LLM error: {:#}", e)))).await;
+                            }
+                        }
+                    });
+                }
+            }
+
+            Some((uuid, result)) = dismiss_rx.recv() => {
+                match result {
+                    Ok(artifacts) => {
+                        eprintln!(
+                            "dismissed {uuid}: archived to {:?}, published to {:?}",
+                            artifacts.local_archive, artifacts.obsidian_record
+                        );
+                        app.drop_dismissed_workspace(&uuid);
+                    }
+                    Err(e) => {
+                        eprintln!("dismiss failed for {uuid}: {e}");
+                        // For v1: log and leave dismissing=true so we don't retry
+                        // automatically (avoids infinite retry loops on permanent errors).
+                        // A future enhancement could unset dismissing for transient errors.
+                    }
+                }
             }
         }
 
