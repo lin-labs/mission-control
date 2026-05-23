@@ -116,24 +116,30 @@ fn malformed_surface_comment_yields_none_surface_id() {
 
 #[test]
 fn write_then_parse_round_trips() {
-    let mut doc = TrajectoryDoc::parse(SAMPLE).unwrap();
+    let doc = TrajectoryDoc::parse(SAMPLE).unwrap();
     let serialized = doc.to_markdown();
     let reparsed = TrajectoryDoc::parse(&serialized).unwrap();
+
+    // Frontmatter survives round-trip.
+    assert_eq!(reparsed.frontmatter.workspace, doc.frontmatter.workspace);
+    assert_eq!(reparsed.frontmatter.workspace_id, doc.frontmatter.workspace_id);
+    assert_eq!(reparsed.frontmatter.snapshot, doc.frontmatter.snapshot);
 
     assert_eq!(
         doc.section("Goal").unwrap().items.len(),
         reparsed.section("Goal").unwrap().items.len()
     );
-    assert_eq!(
-        doc.section("Current surfaces").unwrap().items[0].surface_id,
-        reparsed.section("Current surfaces").unwrap().items[0].surface_id
-    );
+
+    // Surface items: ID and visible text both survive.
+    let orig_surface = &doc.section("Current surfaces").unwrap().items[0];
+    let rep_surface = &reparsed.section("Current surfaces").unwrap().items[0];
+    assert_eq!(orig_surface.surface_id, rep_surface.surface_id);
+    assert_eq!(orig_surface.text, rep_surface.text);
+
     let original_task = &doc.section("Tasks & Progress").unwrap().items[0];
     let rep_task = &reparsed.section("Tasks & Progress").unwrap().items[0];
     assert_eq!(original_task.text, rep_task.text);
     assert_eq!(original_task.checked, rep_task.checked);
-
-    let _ = &mut doc; // mut used by ensure_sections in earlier test
 }
 
 #[test]

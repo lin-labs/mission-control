@@ -11,13 +11,13 @@ pub const SECTIONS_IN_ORDER: &[&str] =
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Frontmatter {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<u32>,
 }
 
@@ -138,18 +138,22 @@ impl TrajectoryDoc {
 
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create parent dir for {path:?}"))?;
         }
         let tmp = path.with_extension("md.tmp");
-        std::fs::write(&tmp, self.to_markdown())?;
-        std::fs::rename(&tmp, path)?;
+        std::fs::write(&tmp, self.to_markdown())
+            .with_context(|| format!("write tmp {tmp:?}"))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename {tmp:?} -> {path:?}"))?;
         Ok(())
     }
 
     pub fn load_from_file(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                let mut d = Self::parse(&text)?;
+                let mut d = Self::parse(&text)
+                    .with_context(|| format!("parse {path:?}"))?;
                 d.ensure_sections();
                 Ok(d)
             }
@@ -158,7 +162,7 @@ impl TrajectoryDoc {
                 d.ensure_sections();
                 Ok(d)
             }
-            Err(e) => Err(e.into()),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("read {path:?}"))),
         }
     }
 }
