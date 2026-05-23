@@ -131,11 +131,12 @@ fn parse_item(line: &str, section_name: &str) -> Option<Item> {
             (body.to_string(), false, None)
         };
 
-    // Pull HTML comment surface marker if present.
+    // Pull HTML comment surface marker if present. A malformed comment with
+    // no closing `-->` yields surface_id = None rather than a garbage id.
     let (text, surface_id) = match text.split_once("<!-- mc:surface:") {
         Some((head, tail)) => {
             let head = head.trim_end().to_string();
-            let id = tail.split("-->").next().map(|s| s.trim().to_string());
+            let id = tail.split_once("-->").map(|(s, _)| s.trim().to_string());
             (head, id)
         }
         None => (text, None),

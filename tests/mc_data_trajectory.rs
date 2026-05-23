@@ -83,3 +83,33 @@ fn parse_missing_section_returns_empty_section() {
     assert_eq!(filled.sections[1].name, "Current surfaces");
     assert!(filled.sections[1].items.is_empty());
 }
+
+#[test]
+fn uppercase_checkbox_is_recognized_as_checked() {
+    let doc = TrajectoryDoc::parse("## Tasks & Progress\n- [X] done\n").unwrap();
+    let item = &doc.sections[0].items[0];
+    assert!(item.is_checkbox);
+    assert_eq!(item.checked, Some(true));
+    assert_eq!(item.text, "done");
+}
+
+#[test]
+fn ensure_sections_reorders_to_canonical_order() {
+    let doc_str = "## Tasks & Progress\n- [x] done\n\n## Goal\n- thing\n";
+    let mut doc = TrajectoryDoc::parse(doc_str).unwrap();
+    doc.ensure_sections();
+    assert_eq!(doc.sections[0].name, "Goal");
+    assert_eq!(doc.sections[1].name, "Current surfaces");
+    assert_eq!(doc.sections[2].name, "Tasks & Progress");
+    // Items preserved through reorder.
+    assert_eq!(doc.sections[0].items[0].text, "thing");
+    assert_eq!(doc.sections[2].items[0].text, "done");
+}
+
+#[test]
+fn malformed_surface_comment_yields_none_surface_id() {
+    let src = "## Current surfaces\n- claude · mbp · working · stuff <!-- mc:surface:no-closer\n";
+    let doc = TrajectoryDoc::parse(src).unwrap();
+    let item = &doc.sections[0].items[0];
+    assert!(item.surface_id.is_none(), "missing --> must not produce a garbage surface id");
+}
