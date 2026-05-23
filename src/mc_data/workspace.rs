@@ -19,10 +19,10 @@ pub fn ensure_workspace(uuid: &str, unique_name: &str, project: &str) -> Result<
     fs::create_dir_all(paths::inputs_dir(uuid))?;
     fs::create_dir_all(paths::surfaces_dir(uuid))?;
 
-    // name and project files. Overwrite if already present (cmux may have
-    // renamed in the meantime; write the current truth).
-    write_atomic(&paths::name_path(uuid), unique_name)?;
-    write_atomic(&paths::project_path(uuid), project)?;
+    // name and project files. Only write if the content differs — this
+    // keeps the parent dir mtime stable across repeated calls (idempotent).
+    write_if_changed(&paths::name_path(uuid), unique_name)?;
+    write_if_changed(&paths::project_path(uuid), project)?;
 
     // Display symlink at the data root. Relative target so the symlink
     // resolves correctly inside the data dir regardless of cwd.
@@ -78,4 +78,15 @@ fn write_atomic(path: &std::path::Path, contents: &str) -> Result<()> {
     fs::write(&tmp, contents)?;
     fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Write only if the file is absent or its contents differ. This avoids
+/// touching the parent directory's mtime on repeated no-op calls.
+fn write_if_changed(path: &std::path::Path, contents: &str) -> Result<()> {
+    if let Ok(existing) = fs::read_to_string(path) {
+        if existing.trim() == contents.trim() {
+            return Ok(());
+        }
+    }
+    write_atomic(path, contents)
 }

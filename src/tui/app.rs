@@ -602,6 +602,16 @@ impl App {
                 // rather than re-parsing from the truncated 15-line preview
                 let screen_insights = old_insights.get(&ws.uuid).cloned()
                     .unwrap_or_default();
+                // Provision the per-workspace data dir + display symlink.
+                // Non-fatal: log to stderr and continue so mc-tui never
+                // crashes just because the home dir is unwriteable.
+                if let Err(e) = crate::mc_data::workspace::ensure_workspace(
+                    &ws.uuid,
+                    &ws.name,
+                    &ws.name, // project defaults to name for now
+                ) {
+                    eprintln!("ensure_workspace({}): {e:?}", &ws.uuid);
+                }
                 let notes = load_workspace_notes(&ws.name);
                 let hook_status = load_hook_status(&ws.uuid);
                 let summary = old_summaries.get(&ws.uuid).cloned().flatten();
