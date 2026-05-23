@@ -1,6 +1,7 @@
 mod cmux;
 mod config;
 mod llm;
+mod mc_data;
 mod session;
 mod tui;
 
