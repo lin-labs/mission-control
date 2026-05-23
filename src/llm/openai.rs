@@ -96,6 +96,48 @@ impl Summarizer for OpenAISummarizer {
         let text = result?;
         parse_summary(&text)
     }
+
+    async fn regenerate_trajectory(&self, prompt: &str) -> Result<String> {
+        let timer = CallTimer::start();
+
+        let request = ChatRequest {
+            model: self.model.clone(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: prompt.to_string(),
+            }],
+            max_tokens: 2048,
+            temperature: 0.2,
+        };
+
+        let result: Result<String> = async {
+            let response = self
+                .client
+                .post("https://api.openai.com/v1/chat/completions")
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .json(&request)
+                .send()
+                .await
+                .context("OpenAI API request failed")?
+                .json::<ChatResponse>()
+                .await
+                .context("failed to parse OpenAI response")?;
+
+            Ok(response
+                .choices
+                .first()
+                .map(|c| c.message.content.clone())
+                .unwrap_or_default())
+        }
+        .await;
+
+        match &result {
+            Ok(text) => log_call("openai-regen", prompt, Ok(text.as_str()), timer.ms()),
+            Err(e) => log_call("openai-regen", prompt, Err(&format!("{:#}", e)), timer.ms()),
+        }
+
+        result
+    }
 }
 
 fn parse_summary(text: &str) -> Result<Summary> {

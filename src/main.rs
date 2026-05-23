@@ -260,8 +260,16 @@ async fn run_app(
     // Channel for LLM summary completions
     let (summary_tx, mut summary_rx) = mpsc::unbounded_channel::<(String, crate::llm::Summary)>();
 
+    // Channel for trajectory regen completions: (uuid, Result<TrajectoryDoc, String>)
+    let (regen_tx, mut regen_rx) = mpsc::channel::<(String, Result<crate::mc_data::trajectory::TrajectoryDoc, String>)>(16);
+
+    // Channel for surface summary completions: (uuid, sid, summary)
+    let (surface_summary_tx, mut surface_summary_rx) = mpsc::channel::<(String, String, String)>(32);
+
     let mut refresh_interval = interval(Duration::from_secs(30));
     let mut screen_interval = interval(Duration::from_secs(15));
+    let mut regen_tick = interval(Duration::from_secs(30));
+    let mut surface_summary_tick = interval(Duration::from_secs(60));
 
     // Channel for peek-mode screen-poll results: (workspace_uuid, screen_text)
     let (peek_tx, mut peek_rx) = mpsc::channel::<(String, String)>(64);
@@ -545,6 +553,8 @@ async fn run_app(
             Some(agent_event) = event_rx.recv() => {
                 let ws_uuid = agent_event.workspace_id.clone();
                 app.handle_agent_event(&agent_event);
+                // Accumulate events for the regen scheduler.
+                app.increment_regen_event_count(&ws_uuid);
 
                 if app.needs_summary(&ws_uuid, config.summary_threshold) {
                     app.reset_tool_count(&ws_uuid);
@@ -648,6 +658,86 @@ async fn run_app(
 
             Some((uuid, screen_text)) = peek_rx.recv() => {
                 app.apply_peek_screen_update(&uuid, screen_text);
+            }
+
+            _ = regen_tick.tick() => {
+                // Check each workspace to see if a trajectory regen is due.
+                if let Some(ref summarizer) = summarizer {
+                    let due = app.workspaces_due_for_regen();
+                    for uuid in due {
+                        if let Some(inputs) = app.build_regen_inputs(&uuid) {
+                            app.mark_regen_in_flight(&uuid);
+                            let summarizer = Arc::clone(summarizer);
+                            let tx = regen_tx.clone();
+                            let uuid_for_task = uuid.clone();
+                            tokio::spawn(async move {
+                                match crate::llm::trajectory_regen::regenerate(&summarizer, &inputs).await {
+                                    Ok(doc) => {
+                                        let _ = tx.send((uuid_for_task, Ok(doc))).await;
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send((uuid_for_task, Err(format!("{:#}", e)))).await;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+
+            Some((uuid, result)) = regen_rx.recv() => {
+                match result {
+                    Ok(doc) => app.apply_regenerated_trajectory(&uuid, doc),
+                    Err(e) => eprintln!("regen({uuid}): {e}"),
+                }
+            }
+
+            _ = surface_summary_tick.tick() => {
+                // Check for shell surfaces due for LLM summarization.
+                if let Some(ref summarizer) = summarizer {
+                    let due = app.surfaces_due_for_summary();
+                    for (uuid, sid, log_path) in due {
+                        // Read last 15 lines from the log file.
+                        let recent_commands: Vec<String> = match std::fs::read_to_string(&log_path) {
+                            Ok(content) => content
+                                .lines()
+                                .rev()
+                                .take(15)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .map(|s| s.to_string())
+                                .collect(),
+                            Err(_) => continue,
+                        };
+                        if recent_commands.is_empty() {
+                            continue;
+                        }
+                        let summarizer = Arc::clone(summarizer);
+                        let tx = surface_summary_tx.clone();
+                        let uuid_for_task = uuid.clone();
+                        let sid_for_task = sid.clone();
+                        tokio::spawn(async move {
+                            let inputs = crate::llm::surface_summary::SurfaceSummaryInputs {
+                                kind: "shell".to_string(),
+                                cwd: String::new(), // no cwd from log path alone
+                                recent_commands,
+                            };
+                            match crate::llm::surface_summary::summarize(&summarizer, &inputs).await {
+                                Ok(summary) => {
+                                    let _ = tx.send((uuid_for_task, sid_for_task, summary)).await;
+                                }
+                                Err(e) => {
+                                    eprintln!("surface_summary({uuid_for_task}/{sid_for_task}): {e}");
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+
+            Some((uuid, sid, summary)) = surface_summary_rx.recv() => {
+                app.apply_surface_summary(&uuid, &sid, summary);
             }
         }
 
