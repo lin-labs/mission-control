@@ -109,6 +109,16 @@ pub fn handle_key(
     }
 }
 
+/// Returns true if the cursor is on the `## Current surfaces` section.
+/// Edit-mutating keys are blocked there because the cmux-projection refresh
+/// loop would immediately clobber any user changes.
+fn is_current_surfaces_row(state: &TrajectoryEditState, doc: &TrajectoryDoc) -> bool {
+    doc.sections
+        .get(state.cursor_section)
+        .map(|s| s.name == SECTION_CURRENT_SURFACES)
+        .unwrap_or(false)
+}
+
 fn handle_nav_key(
     state: &mut TrajectoryEditState,
     doc: &mut TrajectoryDoc,
@@ -139,12 +149,21 @@ fn handle_nav_key(
         // ── Editing ─────────────────────────────────────────────────────────
         KeyCode::Char(' ') => {
             state.pending_d_at = None;
+            // Space (checkbox toggle) is a no-op on Current surfaces — surface
+            // items aren't checkboxes and edits would be clobbered by the refresh loop.
+            if is_current_surfaces_row(state, doc) {
+                return actions;
+            }
             if let Some(action) = toggle_checkbox(state, doc) {
                 actions.push(action);
             }
         }
         KeyCode::Char('x') => {
             state.pending_d_at = None;
+            // Delete is blocked on Current surfaces (refresh loop owns that section).
+            if is_current_surfaces_row(state, doc) {
+                return actions;
+            }
             if let Some(action) = delete_item(state, doc) {
                 actions.push(action);
             }
@@ -154,8 +173,11 @@ fn handle_nav_key(
                 if t.elapsed() <= std::time::Duration::from_secs(1) {
                     // Second `d` within window — delete.
                     state.pending_d_at = None;
-                    if let Some(action) = delete_item(state, doc) {
-                        actions.push(action);
+                    // dd is also blocked on Current surfaces.
+                    if !is_current_surfaces_row(state, doc) {
+                        if let Some(action) = delete_item(state, doc) {
+                            actions.push(action);
+                        }
                     }
                     return actions;
                 }
@@ -165,25 +187,49 @@ fn handle_nav_key(
         }
         KeyCode::Char('o') => {
             state.pending_d_at = None;
+            // Insert-below is blocked on Current surfaces.
+            if is_current_surfaces_row(state, doc) {
+                return actions;
+            }
             insert_item_below(state, doc);
         }
         KeyCode::Char('O') => {
             state.pending_d_at = None;
+            // Insert-above is blocked on Current surfaces.
+            if is_current_surfaces_row(state, doc) {
+                return actions;
+            }
             insert_item_above(state, doc);
         }
         KeyCode::Char('i') | KeyCode::Enter => {
             state.pending_d_at = None;
+            // i / Enter to enter insert mode is blocked on Current surfaces.
+            // (Enter on a surface row with a surface_id is already intercepted
+            // in app.rs to enter peek mode before this function is called, so
+            // the Enter case here is only reached for rows without a surface_id,
+            // or when peek mode is already active — both should be no-ops.)
+            if is_current_surfaces_row(state, doc) {
+                return actions;
+            }
             enter_insert_mode(state, doc);
         }
         // ── Move item within section ─────────────────────────────────────────
         KeyCode::Char('J') => {
             state.pending_d_at = None;
+            // Move-down is blocked on Current surfaces.
+            if is_current_surfaces_row(state, doc) {
+                return actions;
+            }
             if let Some(action) = move_item_down(state, doc) {
                 actions.push(action);
             }
         }
         KeyCode::Char('K') => {
             state.pending_d_at = None;
+            // Move-up is blocked on Current surfaces.
+            if is_current_surfaces_row(state, doc) {
+                return actions;
+            }
             if let Some(action) = move_item_up(state, doc) {
                 actions.push(action);
             }
@@ -1309,5 +1355,154 @@ workspace: test-ws
         let mut state = TrajectoryEditState::default();
         handle_key(&mut state, &mut doc, key(KeyCode::Char('x')));
         assert_eq!(doc.sections[0].items.len(), 0);
+    }
+
+    // ── Part 1: block edit keys on Current surfaces ──────────────────────────
+
+    #[test]
+    fn i_is_blocked_on_current_surfaces_row() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        // Add a fake surface row.
+        doc.sections[1].items.push(Item {
+            text: "claude · mbp · working · stuff".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: Some("sid-1".to_string()),
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 1; // Current surfaces
+        state.cursor_item = 0;
+        let actions = handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        assert!(actions.is_empty());
+        assert!(
+            !matches!(state.mode, EditMode::Insert { .. }),
+            "i must NOT enter insert mode on Current surfaces"
+        );
+    }
+
+    #[test]
+    fn x_is_blocked_on_current_surfaces_row() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[1].items.push(Item {
+            text: "shell · mbp · idle".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: Some("sid-1".to_string()),
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 1;
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('x')));
+        // Item must still be there.
+        assert_eq!(doc.sections[1].items.len(), 1);
+    }
+
+    #[test]
+    fn dd_is_blocked_on_current_surfaces_row() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[1].items.push(Item {
+            text: "shell · mbp · idle".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: Some("sid-2".to_string()),
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 1;
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('d')));
+        let actions = handle_key(&mut state, &mut doc, key(KeyCode::Char('d')));
+        // Item must still be there; no delete action.
+        assert_eq!(doc.sections[1].items.len(), 1);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn o_is_blocked_on_current_surfaces_row() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[1].items.push(Item {
+            text: "surface".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: Some("sid-3".to_string()),
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 1;
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('o')));
+        // No new item inserted; still in nav mode.
+        assert_eq!(doc.sections[1].items.len(), 1);
+        assert!(matches!(state.mode, EditMode::Nav));
+    }
+
+    #[test]
+    fn i_still_works_on_goal_section() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0; // Goal
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        assert!(matches!(state.mode, EditMode::Insert { .. }));
+    }
+
+    #[test]
+    fn i_still_works_on_tasks_section() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 2; // Tasks & Progress
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        assert!(matches!(state.mode, EditMode::Insert { .. }));
+    }
+
+    #[test]
+    fn cursor_movement_still_works_on_current_surfaces() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[1].items.push(Item {
+            text: "a".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: Some("s1".to_string()),
+        });
+        doc.sections[1].items.push(Item {
+            text: "b".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: Some("s2".to_string()),
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 1;
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
+        assert_eq!(state.cursor_item, 1, "j must still move cursor on Current surfaces");
+    }
+
+    // ── Part 2 helpers: description ↔ Goal round-trip ────────────────────────
+
+    #[test]
+    fn goal_items_render_to_multi_line_description() {
+        let items = vec![
+            Item { text: "first goal".to_string(), is_checkbox: false, checked: None, surface_id: None },
+            Item { text: "second refinement".to_string(), is_checkbox: false, checked: None, surface_id: None },
+        ];
+        let desc = items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert_eq!(desc, "first goal\nsecond refinement");
+    }
+
+    #[test]
+    fn description_parses_to_goal_items() {
+        let desc = "first\nsecond\n\nthird";
+        let items: Vec<String> = desc
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_string())
+            .collect();
+        assert_eq!(items, vec!["first", "second", "third"]);
     }
 }

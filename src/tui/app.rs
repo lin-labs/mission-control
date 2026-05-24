@@ -767,6 +767,56 @@ impl App {
             self.workspace_index.insert(ws.workspace.uuid.clone(), i);
         }
 
+        // Seed the Goal section from the cmux workspace description (first pass).
+        // We only seed when the Goal section is currently empty so we never
+        // clobber user-authored content. Each non-empty description line becomes
+        // one Goal bullet.
+        for ws_state in self.workspaces.iter_mut() {
+            let desc = match ws_state.workspace.description.as_ref() {
+                Some(d) if !d.trim().is_empty() => d.clone(),
+                _ => continue,
+            };
+            // Only seed when there is a trajectory doc already. If there is no
+            // trajectory file yet we leave it as None — the detail pane falls
+            // back to legacy rendering and the seeding happens on next refresh
+            // once the file is created by ensure_workspace or the user's first edit.
+            let doc = match ws_state.trajectory.as_mut() {
+                Some(d) => d,
+                None => continue,
+            };
+            let goal_section_empty = doc
+                .section(crate::mc_data::trajectory::SECTION_GOAL)
+                .map(|s| s.items.is_empty())
+                .unwrap_or(true);
+            if !goal_section_empty {
+                continue;
+            }
+            let goal_items: Vec<crate::mc_data::trajectory::Item> = desc
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| crate::mc_data::trajectory::Item {
+                    text: l.trim().to_string(),
+                    is_checkbox: false,
+                    checked: None,
+                    surface_id: None,
+                })
+                .collect();
+            if goal_items.is_empty() {
+                continue;
+            }
+            doc.replace_section_items(
+                crate::mc_data::trajectory::SECTION_GOAL,
+                goal_items,
+            );
+            let traj_path = crate::mc_data::paths::trajectory_path(&ws_state.workspace.uuid);
+            if let Err(e) = doc.save_to_file(&traj_path) {
+                eprintln!(
+                    "seed Goal from description ({}): {e:?}",
+                    ws_state.workspace.uuid
+                );
+            }
+        }
+
         // Project cmux surfaces into the trajectory's ## Current surfaces section.
         // We do this in a second pass (after the map/collect above) so we have
         // access to both the built WorkspaceState and can mutate it.
@@ -1750,6 +1800,42 @@ impl App {
         let n = crate::tui::trajectory_edit::save(&uuid, doc, state, actions)?;
         Ok(Some(n))
     }
+
+    /// Spawn a fire-and-forget task to push the current Goal section back to
+    /// the cmux workspace description. Non-fatal: errors are logged to stderr.
+    ///
+    /// Call this after every successful `save_trajectory_edits` so that the
+    /// cmux description stays in sync with the trajectory Goal.
+    ///
+    /// NOTE: This intentionally does NOT mock the cmux binary in tests —
+    /// the cmux call is exercised at runtime only.
+    pub fn spawn_push_goal_to_cmux(&self, cmux: CmuxClient) {
+        let idx = self.selected;
+        let ws = match self.workspaces.get(idx) {
+            Some(w) => w,
+            None => return,
+        };
+        let doc = match ws.trajectory.as_ref() {
+            Some(d) => d,
+            None => return,
+        };
+        let goal_section = match doc.section(crate::mc_data::trajectory::SECTION_GOAL) {
+            Some(s) => s,
+            None => return,
+        };
+        let description: String = goal_section
+            .items
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ref_id = ws.workspace.ref_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = cmux.set_workspace_description(&ref_id, &description).await {
+                eprintln!("set_workspace_description({ref_id}): {e:?}");
+            }
+        });
+    }
 }
 
 /// Spawn a background task that captures a workspace's screen (and optionally
@@ -1954,6 +2040,7 @@ workspace: test-ws
                 uuid: "test-uuid-1".to_string(),
                 name: "test-ws".to_string(),
                 selected: false,
+                description: None,
             },
             session: None,
             surfaces: Vec::new(),

@@ -4,12 +4,36 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::process::Command;
 
+// ── Transient JSON types for `cmux list-workspaces --json` ────────────────────
+
+#[derive(Deserialize)]
+struct WorkspacesJson {
+    workspaces: Vec<WorkspaceJson>,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceJson {
+    #[serde(rename = "ref")]
+    ref_id: String,
+    uuid: String,
+    /// Display name of the workspace (the `title` field in cmux JSON output).
+    title: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    selected: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Workspace {
     pub ref_id: String,      // e.g. "workspace:2"
     pub uuid: String,        // e.g. "32E47B1E-..."
     pub name: String,        // e.g. "gmail-labs"
     pub selected: bool,
+    /// The cmux workspace description (from `cmux workspace-action set-description`).
+    /// Non-empty description is used to seed the Goal section of the trajectory doc.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,14 +58,15 @@ impl CmuxClient {
         cmd
     }
 
-    /// Parse `cmux list-workspaces --id-format both` output.
-    /// Each line: `[*] workspace:N UUID  name [selected]`
+    /// Parse `cmux list-workspaces --json` output.
+    /// JSON shape: `{ "workspaces": [{ "ref": "workspace:N", "uuid": "...",
+    ///               "title": "name", "description": null, "selected": false, ... }] }`
     pub async fn list_workspaces(&self) -> Result<Vec<Workspace>> {
         let output = self.cmd()
-            .args(["list-workspaces", "--id-format", "both"])
+            .args(["list-workspaces", "--json"])
             .output()
             .await
-            .context("failed to run cmux list-workspaces")?;
+            .context("failed to run cmux list-workspaces --json")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -49,38 +74,61 @@ impl CmuxClient {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut workspaces = Vec::new();
+        let parsed: WorkspacesJson = serde_json::from_str(&stdout)
+            .context("failed to parse cmux list-workspaces --json output")?;
 
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let selected = line.starts_with('*');
-            let line = line.trim_start_matches('*').trim();
-
-            // Format: "workspace:N UUID  name  [selected]"
-            let parts: Vec<&str> = line.splitn(3, char::is_whitespace).collect();
-            if parts.len() < 3 {
-                continue;
-            }
-            let ref_id = parts[0].to_string();
-            let uuid = parts[1].to_string();
-            let name = parts[2]
-                .trim()
-                .trim_end_matches("[selected]")
-                .trim()
-                .to_string();
-
-            workspaces.push(Workspace {
-                ref_id,
-                uuid,
-                name,
-                selected,
-            });
-        }
+        let workspaces = parsed
+            .workspaces
+            .into_iter()
+            .map(|w| Workspace {
+                ref_id: w.ref_id,
+                uuid: w.uuid,
+                name: w.title,
+                selected: w.selected,
+                description: w.description,
+            })
+            .collect();
 
         Ok(workspaces)
+    }
+
+    /// Set (or clear) the cmux workspace description for the given workspace ref.
+    ///
+    /// This is used to push the Goal section of the trajectory back to cmux so
+    /// that the description is visible in the workspace tab tooltip.
+    ///
+    /// Non-fatal by convention: callers should log errors to stderr and continue.
+    pub async fn set_workspace_description(
+        &self,
+        workspace_ref: &str,
+        description: &str,
+    ) -> Result<()> {
+        let action = if description.is_empty() {
+            "clear-description"
+        } else {
+            "set-description"
+        };
+        let mut cmd = self.cmd();
+        cmd.arg("workspace-action")
+            .arg("--workspace")
+            .arg(workspace_ref)
+            .arg("--action")
+            .arg(action);
+        if !description.is_empty() {
+            cmd.arg("--description").arg(description);
+        }
+        let output = cmd
+            .output()
+            .await
+            .context("run cmux workspace-action set-description")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "cmux workspace-action {} failed: {}",
+                action,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
     }
 
     /// Read the last N lines of a surface's screen.
