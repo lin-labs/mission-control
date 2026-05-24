@@ -53,7 +53,10 @@ struct TrajectoryUpdate {
 /// Pattern matched: `<dir>/<uuid>/trajectory.md`.
 fn start_trajectory_watcher(
     dir: PathBuf,
-) -> anyhow::Result<(RecommendedWatcher, mpsc::UnboundedReceiver<TrajectoryUpdate>)> {
+) -> anyhow::Result<(
+    RecommendedWatcher,
+    mpsc::UnboundedReceiver<TrajectoryUpdate>,
+)> {
     // Ensure the watched directory exists so the watcher never panics on
     // first-time-user setups.
     std::fs::create_dir_all(&dir)?;
@@ -144,11 +147,17 @@ async fn main() -> Result<()> {
         None => run_tui(cli.tui).await,
         Some(config::Command::Resolve { workspace_id }) => cli::resolve::run(&workspace_id),
         Some(config::Command::Setup) => cli::setup::run(),
-        Some(config::Command::PromoteRules { proposals_file }) => cli::promote_rules::run(&proposals_file),
-        Some(config::Command::RecordHit { project, rule_id }) => cli::record_hit::run(&project, &rule_id),
+        Some(config::Command::PromoteRules { proposals_file }) => {
+            cli::promote_rules::run(&proposals_file)
+        }
+        Some(config::Command::RecordHit { project, rule_id }) => {
+            cli::record_hit::run(&project, &rule_id)
+        }
         Some(config::Command::Gc) => cli::gc::run(),
-        Some(config::Command::Bind { surface_id, session_file }) =>
-            cli::bind::run(&surface_id, session_file.as_deref()),
+        Some(config::Command::Bind {
+            surface_id,
+            session_file,
+        }) => cli::bind::run(&surface_id, session_file.as_deref()),
     }
 }
 
@@ -263,13 +272,20 @@ async fn run_app(
     let (summary_tx, mut summary_rx) = mpsc::unbounded_channel::<(String, crate::llm::Summary)>();
 
     // Channel for trajectory regen completions: (uuid, Result<TrajectoryDoc, String>)
-    let (regen_tx, mut regen_rx) = mpsc::channel::<(String, Result<crate::mc_data::trajectory::TrajectoryDoc, String>)>(16);
+    let (regen_tx, mut regen_rx) = mpsc::channel::<(
+        String,
+        Result<crate::mc_data::trajectory::TrajectoryDoc, String>,
+    )>(16);
 
     // Channel for surface summary completions: (uuid, sid, summary)
-    let (surface_summary_tx, mut surface_summary_rx) = mpsc::channel::<(String, String, String)>(32);
+    let (surface_summary_tx, mut surface_summary_rx) =
+        mpsc::channel::<(String, String, String)>(32);
 
     // Channel for dismissal results: (uuid, Result<DismissalArtifacts, String>)
-    let (dismiss_tx, mut dismiss_rx) = mpsc::channel::<(String, Result<crate::mc_data::dismissal::DismissalArtifacts, String>)>(8);
+    let (dismiss_tx, mut dismiss_rx) = mpsc::channel::<(
+        String,
+        Result<crate::mc_data::dismissal::DismissalArtifacts, String>,
+    )>(8);
 
     let mut refresh_interval = interval(Duration::from_secs(30));
     let mut screen_interval = interval(Duration::from_secs(15));
@@ -396,6 +412,80 @@ async fn run_app(
                         {
                             app.clear_pending_dismissal();
                         }
+
+                        // ── Command-mode key routing ─────────────────────────────────────────
+                        // When `:` was pressed, all keys are typed into the command buffer
+                        // until the user submits (Enter), cancels (Esc), or backspaces past
+                        // the empty buffer.
+                        if let crate::tui::command::InputMode::Command(ref mut cl) = app.input_mode {
+                            use crate::tui::command::{InputMode, StatusLine};
+                            match (key.code, key.modifiers) {
+                                (KeyCode::Esc, _) => {
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                (KeyCode::Enter, _) => {
+                                    let buffer = cl.buffer.trim().to_string();
+                                    if buffer.is_empty() {
+                                        app.input_mode = InputMode::Normal;
+                                    } else {
+                                        let cmd = buffer.split_whitespace().next().unwrap_or("");
+                                        match cmd {
+                                            "summarize" => {
+                                                // Reject if another summarize is in flight.
+                                                let already_running = matches!(
+                                                    cl.status,
+                                                    Some(StatusLine::Running(_))
+                                                );
+                                                if already_running {
+                                                    cl.status = Some(StatusLine::Err(
+                                                        "summarize already running".into(),
+                                                    ));
+                                                } else {
+                                                    cl.status = Some(StatusLine::Running(
+                                                        "summarize…".into(),
+                                                    ));
+                                                    let digests = crate::commands::summarize::collect_digests(&app);
+                                                    let summarizer_opt = summarizer.clone();
+                                                    let tx = command_tx.clone();
+                                                    tokio::spawn(async move {
+                                                        let res = crate::commands::summarize::run(
+                                                            digests,
+                                                            summarizer_opt,
+                                                        )
+                                                        .await;
+                                                        let _ = tx.send(res).await;
+                                                    });
+                                                }
+                                            }
+                                            other => {
+                                                cl.status = Some(StatusLine::Err(format!(
+                                                    "unknown command: {}",
+                                                    other
+                                                )));
+                                            }
+                                        }
+                                    }
+                                }
+                                (KeyCode::Backspace, _) => {
+                                    if !cl.backspace() {
+                                        app.input_mode = InputMode::Normal;
+                                    }
+                                }
+                                (KeyCode::Tab, _) => {
+                                    let _ = cl.tab();
+                                }
+                                (KeyCode::Left, _) => cl.cursor_left(),
+                                (KeyCode::Right, _) => cl.cursor_right(),
+                                (KeyCode::Home, _) => cl.cursor_home(),
+                                (KeyCode::End, _) => cl.cursor_end(),
+                                (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+                                    cl.insert_char(c);
+                                }
+                                _ => {}
+                            }
+                            continue; // swallow this key — never fall through to Normal-mode match
+                        }
+                        // ─────────────────────────────────────────────────────────────────────
 
                         match (key.code, key.modifiers) {
                             (KeyCode::Char('q'), _)
@@ -599,6 +689,12 @@ async fn run_app(
                                         });
                                     }
                                 }
+                            }
+                            (KeyCode::Char(':'), _) => {
+                                app.input_mode =
+                                    crate::tui::command::InputMode::Command(
+                                        crate::tui::command::CommandLine::new(),
+                                    );
                             }
                             _ => {}
                         }
