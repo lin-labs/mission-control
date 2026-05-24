@@ -1,6 +1,6 @@
 use mission_control::mc_data::events::{self, Event, Kind, Source};
 use mission_control::mc_data::paths;
-use mission_control::mc_data::trajectory::{Item, SECTION_TASKS, Section, TrajectoryDoc};
+use mission_control::mc_data::trajectory::{Item, Section, TrajectoryDoc, SECTION_GOALS};
 use mission_control::mc_data::user_intent::{
     UserIntent, apply_to_tasks, load_for_workspace, normalize_text,
 };
@@ -23,7 +23,7 @@ fn with_tmp_home<F: FnOnce()>(f: F) {
 }
 
 fn append(uuid: &str, source: Source, kind: Kind, before: Option<&str>, after: Option<&str>) {
-    let mut ev = Event::new_now(source, kind, SECTION_TASKS);
+    let mut ev = Event::new_now(source, kind, SECTION_GOALS);
     if let Some(b) = before {
         ev = ev.with_before(b);
     }

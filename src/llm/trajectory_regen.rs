@@ -47,8 +47,7 @@ pub fn build_prompt(inputs: &RegenInputs) -> RegenPrompt {
         "You maintain a 3-section trajectory doc for workspace '{}'.\n",
         inputs.workspace_name
     ));
-    system
-        .push_str("Sections (exact order): ## Goal, ## Current surfaces, ## Tasks & Progress.\n\n");
+    system.push_str("Sections (exact order): ## Mission, ## Current surfaces, ## Goals & Progress.\n\n");
     system.push_str("Rules:\n");
     system.push_str("- User edits are TYPED ACTIONS. Interpret intent:\n");
     system.push_str("  check -> user marked done; don't re-open the item\n");
@@ -56,7 +55,7 @@ pub fn build_prompt(inputs: &RegenInputs) -> RegenPrompt {
     system.push_str("  add -> user identified gap; preserve and build on it\n");
     system.push_str("  edit -> user rephrased; treat new phrasing as authoritative\n");
     system.push_str("  move -> user re-ordered; respect the priority signal\n");
-    system.push_str("- Goal section is continuously refined, never replaced wholesale.\n");
+    system.push_str("- Mission section is continuously refined, never replaced wholesale.\n");
     system.push_str("- Each `## Current surfaces` line ends with `<!-- mc:surface:<sid> -->`.\n");
     system.push_str("  Preserve these markers exactly. Do not invent surface IDs.\n");
     system.push_str("- Output the full new trajectory.md verbatim — no commentary.\n");

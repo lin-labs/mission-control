@@ -8,3 +8,6 @@ pub mod snapshots;
 pub mod trajectory; // declared now even though Task 4 fills it
 pub mod user_intent;
 pub mod workspace; // declared now even though Task 2 fills it
+pub mod goals_json;
+pub mod surface_kind;
+pub mod surface_render;

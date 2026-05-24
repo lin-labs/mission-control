@@ -36,7 +36,22 @@ pub fn render_detail(
     // the trajectory view. Peek mode can be active without a trajectory doc.
     // Fall through to the legacy rendering for workspaces without either.
     if ws.trajectory.is_some() || ws.peek_state.is_some() {
-        crate::tui::trajectory_view::render(
+        // Compute the "just-exited agent" dim set: surfaces where the live
+        // foreground kind is Shell/Unknown but `effective_kind` upgraded to
+        // an agent kind via a fresh last-agent snapshot. The trajectory view
+        // uses this to apply Modifier::DIM to the glyph + label.
+        let mut hints = crate::tui::trajectory_view::RenderHints::default();
+        for s in &ws.surfaces {
+            let eff = crate::mc_data::surface_kind::effective_kind(
+                &ws.workspace.uuid,
+                &s.ref_id,
+                s.kind,
+            );
+            if eff != s.kind && eff.is_agent() {
+                hints.dim_surface_refs.insert(s.ref_id.clone());
+            }
+        }
+        crate::tui::trajectory_view::render_with_hints(
             f,
             area,
             ws.trajectory.as_ref(),
@@ -45,7 +60,14 @@ pub fn render_detail(
             ws.edit_state.as_ref(),
             ws.peek_state.as_ref(),
             ws.workspace.custom_color.as_deref(),
+            &hints,
         );
+        // Overlay the dispatch modal at the bottom of the detail pane when
+        // active. The trajectory view above remains visible (the user is
+        // dispatching from a specific row and seeing context matters).
+        if let Some(modal) = ws.dispatch_modal.as_ref() {
+            crate::tui::dispatch_modal::render(f, area, modal);
+        }
         return;
     }
 
@@ -95,7 +117,7 @@ pub fn render_detail(
     if ws.screen_insights.tasks_total > 0 {
         let mut task_spans = vec![Span::styled(
             format!(
-                "  Tasks: {}/{} ✔",
+                "  Goals: {}/{} ✔",
                 ws.screen_insights.tasks_done, ws.screen_insights.tasks_total
             ),
             Style::default().fg(Color::Cyan),

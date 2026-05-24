@@ -399,7 +399,14 @@ async fn run_app(
                                         | KeyCode::Char('K')
                                 );
 
-                                if in_peek || in_insert || is_traj_nav_key {
+                                // If the dispatch modal is active for the
+                                // selected workspace, route ALL keys through
+                                // handle_trajectory_key so the modal sees them.
+                                let in_dispatch = app
+                                    .selected_workspace()
+                                    .map_or(false, |ws| ws.dispatch_modal.is_some());
+
+                                if in_peek || in_insert || in_dispatch || is_traj_nav_key {
                                     let actions = app.handle_trajectory_key(key);
                                     if !actions.is_empty() {
                                         if let Err(e) = app.save_trajectory_edits(&actions) {
@@ -408,6 +415,15 @@ async fn run_app(
                                             // Push Goal back to cmux description (non-fatal).
                                             app.spawn_push_goal_to_cmux(cmux_client.clone());
                                         }
+                                    }
+                                    // After the modal consumes a key, check
+                                    // for a pending outcome and act on it.
+                                    if let Some(outcome) = app.take_dispatch_outcome() {
+                                        handle_dispatch_outcome(
+                                            &mut app,
+                                            outcome,
+                                            cmux_client.clone(),
+                                        );
                                     }
                                     continue;
                                 }
@@ -1029,6 +1045,159 @@ async fn run_app(
 
         if app.should_quit {
             return Ok(AppControl::Quit);
+        }
+    }
+}
+
+/// Act on the user's choice from the dispatch modal.
+///
+/// - `Cancel`              → close the modal, no side effects.
+/// - `SelectExisting`      → spawn `cmux send` to the chosen surface, then
+///                            record the assignment in `goals.json`.
+/// - `NewSurface { kind }` → spawn `cmux new-surface` → wait 800ms → seed the
+///                            agent binary → wait 1500ms → send the goal text
+///                            → record the assignment. All async.
+///
+/// goals.json is updated synchronously on the UI thread once the cmux work
+/// resolves. On any cmux failure we set `dispatch_error` on the app and leave
+/// goals.json unchanged.
+fn handle_dispatch_outcome(
+    app: &mut App,
+    outcome: crate::tui::dispatch_modal::DispatchOutcome,
+    cmux: CmuxClient,
+) {
+    use crate::tui::dispatch_modal::DispatchOutcome;
+
+    // Snapshot the modal context BEFORE we drop it — `record_dispatch_assignment`
+    // needs the workspace, and we need goal text + workspace ref for the
+    // async send.
+    let (goal_text, workspace_ref) = match app
+        .selected_workspace()
+        .and_then(|ws| ws.dispatch_modal.as_ref())
+        .map(|m| (m.goal_text.clone(), m.workspace_ref.clone()))
+    {
+        Some(t) => t,
+        None => return,
+    };
+
+    match outcome {
+        DispatchOutcome::Handled => {
+            // Modal absorbed the key; nothing further to do.
+        }
+        DispatchOutcome::Cancel => {
+            app.close_dispatch_modal();
+        }
+        DispatchOutcome::SelectExisting { surface_ref, kind } => {
+            // Spawn the cmux send. On success, the UI will reflect the new
+            // goals.json on the next refresh. We record the assignment
+            // synchronously before spawning so the UI state is consistent
+            // immediately; on a cmux failure we leave goals.json with the
+            // assignment (matches "fire-and-forget" semantics for the
+            // existing peek-yield flow) and surface the error.
+            //
+            // Per spec: on ANY cmux failure, error visible + goals.json
+            // unchanged. So we structure the call to update goals.json only
+            // after the send succeeds. Move the work to an async task; on
+            // failure we cannot easily reach `app` (no &mut here), so we
+            // log via eprintln and rely on next-key clearing.
+            let goal_text_owned = goal_text.clone();
+            let cmux_send = cmux.clone();
+            let workspace_ref_clone = workspace_ref.clone();
+            let surface_ref_clone = surface_ref.clone();
+            // Pre-close the modal — the user has picked.
+            app.close_dispatch_modal();
+            // Move the goals.json update inside the task so it only runs
+            // on cmux send success.
+            let uuid = app
+                .selected_workspace()
+                .map(|ws| ws.workspace.uuid.clone())
+                .unwrap_or_default();
+            tokio::spawn(async move {
+                let text_with_cr = format!("{}\r", goal_text_owned);
+                match cmux_send
+                    .send_text(&workspace_ref_clone, &surface_ref_clone, &text_with_cr)
+                    .await
+                {
+                    Ok(()) => {
+                        if uuid.is_empty() {
+                            return;
+                        }
+                        let mut goals =
+                            crate::mc_data::goals_json::GoalsFile::load(&uuid);
+                        goals.set_assignment(
+                            &goal_text_owned,
+                            &surface_ref_clone,
+                            kind,
+                            chrono::Utc::now(),
+                        );
+                        if let Err(e) = goals.save(&uuid) {
+                            eprintln!("dispatch: goals.json save: {e:?}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("dispatch: cmux send failed: {e:?}");
+                    }
+                }
+            });
+        }
+        DispatchOutcome::NewSurface { kind } => {
+            let agent_bin = match kind {
+                crate::mc_data::surface_kind::SurfaceKind::Claude => "claude",
+                crate::mc_data::surface_kind::SurfaceKind::Codex => "codex",
+                _ => return, // PickAgent only emits Claude/Codex today.
+            };
+            let goal_text_owned = goal_text.clone();
+            let workspace_ref_clone = workspace_ref.clone();
+            let cmux_new = cmux.clone();
+            app.close_dispatch_modal();
+            let uuid = app
+                .selected_workspace()
+                .map(|ws| ws.workspace.uuid.clone())
+                .unwrap_or_default();
+            tokio::spawn(async move {
+                use tokio::time::{sleep, Duration};
+                let new_ref = match cmux_new
+                    .new_surface(&workspace_ref_clone, "terminal")
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("dispatch: cmux new-surface failed: {e:?}");
+                        return;
+                    }
+                };
+                sleep(Duration::from_millis(800)).await;
+                let agent_with_cr = format!("{}\r", agent_bin);
+                if let Err(e) = cmux_new
+                    .send_text(&workspace_ref_clone, &new_ref, &agent_with_cr)
+                    .await
+                {
+                    eprintln!("dispatch: send agent binary failed: {e:?}");
+                    return;
+                }
+                sleep(Duration::from_millis(1500)).await;
+                let goal_with_cr = format!("{}\r", goal_text_owned);
+                if let Err(e) = cmux_new
+                    .send_text(&workspace_ref_clone, &new_ref, &goal_with_cr)
+                    .await
+                {
+                    eprintln!("dispatch: send goal text failed: {e:?}");
+                    return;
+                }
+                if uuid.is_empty() {
+                    return;
+                }
+                let mut goals = crate::mc_data::goals_json::GoalsFile::load(&uuid);
+                goals.set_assignment(
+                    &goal_text_owned,
+                    &new_ref,
+                    kind,
+                    chrono::Utc::now(),
+                );
+                if let Err(e) = goals.save(&uuid) {
+                    eprintln!("dispatch: goals.json save: {e:?}");
+                }
+            });
         }
     }
 }

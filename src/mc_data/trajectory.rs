@@ -2,11 +2,29 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const SECTION_GOAL: &str = "Goal";
+pub const SECTION_MISSION: &str = "Mission";
 pub const SECTION_CURRENT_SURFACES: &str = "Current surfaces";
-pub const SECTION_TASKS: &str = "Tasks & Progress";
+pub const SECTION_GOALS: &str = "Goals & Progress";
 
-pub const SECTIONS_IN_ORDER: &[&str] = &[SECTION_GOAL, SECTION_CURRENT_SURFACES, SECTION_TASKS];
+/// Legacy section names accepted by the parser for back-compat. When we
+/// encounter these on read, they are normalized to the canonical new names so
+/// the rest of the codebase only sees `SECTION_MISSION` / `SECTION_GOALS`.
+const LEGACY_SECTION_GOAL: &str = "Goal";
+const LEGACY_SECTION_TASKS: &str = "Tasks & Progress";
+
+pub const SECTIONS_IN_ORDER: &[&str] =
+    &[SECTION_MISSION, SECTION_CURRENT_SURFACES, SECTION_GOALS];
+
+/// Normalize a section header from the trajectory.md to its canonical name,
+/// folding legacy headers (`Goal`, `Tasks & Progress`) onto the new taxonomy
+/// (`Mission`, `Goals & Progress`).
+fn canonicalize_section_name(name: &str) -> String {
+    match name {
+        LEGACY_SECTION_GOAL => SECTION_MISSION.to_string(),
+        LEGACY_SECTION_TASKS => SECTION_GOALS.to_string(),
+        other => other.to_string(),
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Frontmatter {
@@ -76,7 +94,7 @@ impl TrajectoryDoc {
                     sections.push(s);
                 }
                 current = Some(Section {
-                    name: name.trim().to_string(),
+                    name: canonicalize_section_name(name.trim()),
                     items: Vec::new(),
                 });
                 continue;
@@ -168,7 +186,7 @@ impl TrajectoryDoc {
 
     pub fn sort_tasks_if_long(&mut self) {
         for s in self.sections.iter_mut() {
-            if s.name != SECTION_TASKS {
+            if s.name != SECTION_GOALS {
                 continue;
             }
             if s.items.len() <= 10 {

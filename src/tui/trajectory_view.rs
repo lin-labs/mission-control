@@ -1,4 +1,9 @@
-use crate::mc_data::trajectory::TrajectoryDoc;
+use std::collections::HashSet;
+
+use crate::mc_data::surface_kind::SurfaceKind;
+use crate::mc_data::trajectory::{
+    Section, TrajectoryDoc, SECTION_CURRENT_SURFACES, SECTION_GOALS,
+};
 use crate::tui::peek_view::PeekState;
 use crate::tui::trajectory_edit::{EditMode, InsertFocus, TrajectoryEditState};
 use ratatui::{
@@ -9,11 +14,118 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
+/// Map a kind to the text color used for its glyph + label in surface rows.
+pub fn kind_color(kind: SurfaceKind) -> Color {
+    match kind {
+        SurfaceKind::Claude => Color::Rgb(217, 119, 6),
+        SurfaceKind::Codex => Color::Rgb(6, 182, 212),
+        SurfaceKind::OtherAgent => Color::Magenta,
+        SurfaceKind::Shell => Color::Gray,
+        SurfaceKind::Unknown => Color::DarkGray,
+    }
+}
+
+/// Recognize a row-leading character as a kind glyph.
+///
+/// trajectory rows in `## Current surfaces` are written by
+/// `surface_render::format_surface_text` and always start with one of these.
+fn glyph_kind(c: char) -> Option<SurfaceKind> {
+    match c {
+        '✻' => Some(SurfaceKind::Claude),
+        '▲' => Some(SurfaceKind::Codex),
+        '◆' => Some(SurfaceKind::OtherAgent),
+        '$' => Some(SurfaceKind::Shell),
+        '·' => Some(SurfaceKind::Unknown),
+        _ => None,
+    }
+}
+
+/// Split a surface-row text into 3 styled spans:
+/// (glyph_label_span, body_span, badge_span). If a `← goal:` badge is
+/// present it gets the third span styled as DarkGray; the leading
+/// `{glyph} {label} · ` slice gets the kind color. When `dim` is set the
+/// glyph+label span carries `Modifier::DIM` so a "just-exited" agent
+/// surface still renders with the agent glyph but visually de-emphasized.
+fn surface_row_spans<'a>(
+    text: &'a str,
+    dim: bool,
+    base_style: Style,
+) -> Vec<Span<'a>> {
+    // Find the first whitespace char (between glyph and label).
+    let mut chars = text.chars();
+    let first = chars.next();
+    let kind = first.and_then(glyph_kind);
+
+    let (head_end, badge_start) = {
+        // head = `{glyph} {label} · ` if the row matches the format.
+        // Find the FIRST " · " separator (between label and rest-of-title).
+        let head_end = text
+            .find(" · ")
+            .map(|i| i + " · ".len())
+            .unwrap_or(0);
+        // Badge = `   ← goal:…` if present.
+        let badge_start = text.find("   ← goal:").unwrap_or(text.len());
+        (head_end.min(badge_start), badge_start)
+    };
+
+    let mut spans = Vec::new();
+    if let Some(kind) = kind {
+        let mut glyph_style = base_style.fg(kind_color(kind));
+        if dim {
+            glyph_style = glyph_style.add_modifier(Modifier::DIM);
+        }
+        spans.push(Span::styled(&text[..head_end], glyph_style));
+        spans.push(Span::styled(&text[head_end..badge_start], base_style));
+    } else {
+        // Row doesn't lead with a known glyph → render as a plain row.
+        spans.push(Span::styled(&text[..badge_start], base_style));
+    }
+    if badge_start < text.len() {
+        spans.push(Span::styled(
+            &text[badge_start..],
+            base_style.fg(Color::DarkGray),
+        ));
+    }
+    spans
+}
+
+/// Build spans for a Goals & Progress row, splitting off any trailing
+/// `   → <glyph> <surface_ref>` badge so it can be DarkGray.
+fn goal_row_spans<'a>(text: &'a str, base_style: Style) -> Vec<Span<'a>> {
+    let badge_start = text.find("   → ").unwrap_or(text.len());
+    let mut spans = Vec::new();
+    spans.push(Span::styled(&text[..badge_start], base_style));
+    if badge_start < text.len() {
+        spans.push(Span::styled(
+            &text[badge_start..],
+            base_style.fg(Color::DarkGray),
+        ));
+    }
+    spans
+}
+
+fn is_goals_section(section: &Section) -> bool {
+    section.name == SECTION_GOALS
+}
+
+/// Per-section, per-item context for dim-glyph decisions. Empty by default.
+#[derive(Default, Debug, Clone)]
+pub struct RenderHints {
+    /// Set of surface refs whose glyph should be rendered with Modifier::DIM
+    /// (current kind is Shell/Unknown but effective_kind elevated it from a
+    /// fresh last-agent snapshot).
+    pub dim_surface_refs: HashSet<String>,
+}
+
 /// Render the trajectory detail pane.
 ///
 /// `edit_state` is `None` when no editing session is active for this workspace.
 /// `peek_state` is `Some` when peek mode is active; in that case the pane is
 /// entirely replaced by the peek screen view.
+///
+/// Wrapper kept for the existing test surface; binary callers use
+/// `render_with_hints`.
+#[allow(dead_code)]
 pub fn render(
     f: &mut Frame,
     area: Rect,
@@ -23,6 +135,34 @@ pub fn render(
     edit_state: Option<&TrajectoryEditState>,
     peek_state: Option<&PeekState>,
     workspace_color: Option<&str>,
+) {
+    render_with_hints(
+        f,
+        area,
+        doc,
+        scroll,
+        focused,
+        edit_state,
+        peek_state,
+        workspace_color,
+        &RenderHints::default(),
+    )
+}
+
+/// Variant of `render` that accepts per-surface styling hints. Existing
+/// call sites (and tests) keep using `render`; the binary uses this from
+/// `detail.rs` so it can plumb the dim-glyph hint set from
+/// `WorkspaceState.surfaces`.
+pub fn render_with_hints(
+    f: &mut Frame,
+    area: Rect,
+    doc: Option<&TrajectoryDoc>,
+    scroll: u16,
+    focused: bool,
+    edit_state: Option<&TrajectoryEditState>,
+    peek_state: Option<&PeekState>,
+    workspace_color: Option<&str>,
+    hints: &RenderHints,
 ) {
     // If in peek mode, delegate entirely to peek_view.
     if let Some(peek) = peek_state {
@@ -178,10 +318,30 @@ pub fn render(
                         ),
                     ])
                 } else {
-                    Line::from(Span::styled(
-                        format!("{prefix}{display_text}"),
-                        Style::default().fg(text_color),
-                    ))
+                    // Non-cursor, non-insert path: split the row into styled
+                    // spans for surface rows (glyph + label colored by kind,
+                    // optional `← goal:` badge dimmed) and goal rows (with
+                    // an optional `→ <glyph> <ref>` badge).
+                    let base = Style::default().fg(text_color);
+                    if section.name == SECTION_CURRENT_SURFACES {
+                        let dim = item
+                            .surface_id
+                            .as_deref()
+                            .map(|sid| hints.dim_surface_refs.contains(sid))
+                            .unwrap_or(false);
+                        let mut spans = vec![Span::styled(prefix.to_string(), base)];
+                        spans.extend(surface_row_spans(display_text, dim, base));
+                        Line::from(spans)
+                    } else if is_goals_section(section) {
+                        let mut spans = vec![Span::styled(prefix.to_string(), base)];
+                        spans.extend(goal_row_spans(display_text, base));
+                        Line::from(spans)
+                    } else {
+                        Line::from(Span::styled(
+                            format!("{prefix}{display_text}"),
+                            base,
+                        ))
+                    }
                 };
                 lines.push(line);
             }
@@ -254,13 +414,13 @@ mod tests {
 workspace: predinvest
 ---
 
-## Goal
+## Mission
 - Build self-improvement-enabled investment agent
 
 ## Current surfaces
 - claude · mbp · working · writing tests              <!-- mc:surface:sid-1 -->
 
-## Tasks & Progress
+## Goals & Progress
 - [x] sprint-01 done
 - [ ] sprint-02
 ";
@@ -300,13 +460,10 @@ workspace: predinvest
             })
             .unwrap();
         let dump = buf_dump(&terminal);
-        assert!(dump.contains("Goal"), "missing Goal header: {dump}");
-        assert!(
-            dump.contains("Current surfaces"),
-            "missing Current surfaces header"
-        );
-        assert!(dump.contains("Tasks & Progress"), "missing Tasks header");
-        assert!(dump.contains("Build self-improvement"), "missing Goal item");
+        assert!(dump.contains("Mission"), "missing Mission header: {dump}");
+        assert!(dump.contains("Current surfaces"), "missing Current surfaces header");
+        assert!(dump.contains("Goals & Progress"), "missing Goals header");
+        assert!(dump.contains("Build self-improvement"), "missing Mission item");
         assert!(dump.contains("writing tests"), "missing surface text");
         assert!(dump.contains("sprint-01 done"), "missing task text");
         assert!(
@@ -540,5 +697,280 @@ workspace: predinvest
             .cell((0, 0))
             .expect("top-left border cell should exist");
         assert_eq!(border_cell.style().fg, Some(Color::Rgb(0xC0, 0x39, 0x2B)));
+    }
+
+    // ── T3: surface glyphs + goal/surface badges ──────────────────────────────
+
+    const T3_SAMPLE: &str = "---
+workspace: t3
+---
+
+## Mission
+- Demo
+
+## Current surfaces
+- ✻ claude · claude · mbp · working   ← goal:Wire up T3 rendering              <!-- mc:surface:surface:11 -->
+- ▲ codex · shell · mbp · idle              <!-- mc:surface:surface:22 -->
+
+## Goals & Progress
+- [ ] Wire up T3 rendering   → ✻ surface:11
+- [x] Land T0 rename
+";
+
+    /// Look up the foreground color of the first cell in the row whose text
+    /// contains `needle`, where the cell symbol equals `marker`.
+    fn cell_fg(terminal: &Terminal<TestBackend>, needle: &str, marker: char) -> Option<Color> {
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().chars().next().unwrap_or(' ')))
+                .collect();
+            if row.contains(needle) {
+                for x in 0..buf.area.width {
+                    if let Some(cell) = buf.cell((x, y)) {
+                        if cell.symbol().chars().next() == Some(marker) {
+                            return cell.style().fg;
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn cell_style(
+        terminal: &Terminal<TestBackend>,
+        needle: &str,
+        marker: char,
+    ) -> Option<Style> {
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().chars().next().unwrap_or(' ')))
+                .collect();
+            if row.contains(needle) {
+                for x in 0..buf.area.width {
+                    if let Some(cell) = buf.cell((x, y)) {
+                        if cell.symbol().chars().next() == Some(marker) {
+                            return Some(cell.style());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn surface_glyph_gets_kind_color() {
+        let doc = TrajectoryDoc::parse(T3_SAMPLE).unwrap();
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let hints = RenderHints::default();
+        terminal
+            .draw(|f| {
+                render_with_hints(
+                    f,
+                    Rect::new(0, 0, 120, 20),
+                    Some(&doc),
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    &hints,
+                )
+            })
+            .unwrap();
+
+        // Claude glyph: orange.
+        assert_eq!(
+            cell_fg(&terminal, "claude · claude", '✻'),
+            Some(kind_color(SurfaceKind::Claude)),
+            "Claude glyph should be tinted with Claude's color"
+        );
+        // Codex glyph: cyan-blue.
+        assert_eq!(
+            cell_fg(&terminal, "codex · shell", '▲'),
+            Some(kind_color(SurfaceKind::Codex)),
+            "Codex glyph should be tinted with Codex's color"
+        );
+    }
+
+    #[test]
+    fn just_exited_surface_renders_with_dim_modifier() {
+        let doc = TrajectoryDoc::parse(T3_SAMPLE).unwrap();
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // The Codex surface (surface:22) is in the dim set: it represents a
+        // surface whose current kind is Shell but effective_kind elevated it
+        // to Codex via a fresh last-agent snapshot.
+        let mut hints = RenderHints::default();
+        hints.dim_surface_refs.insert("surface:22".to_string());
+
+        terminal
+            .draw(|f| {
+                render_with_hints(
+                    f,
+                    Rect::new(0, 0, 120, 20),
+                    Some(&doc),
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    &hints,
+                )
+            })
+            .unwrap();
+
+        let style = cell_style(&terminal, "codex · shell", '▲')
+            .expect("codex row should be present in the buffer");
+        assert!(
+            style.add_modifier.contains(Modifier::DIM),
+            "just-exited glyph should carry Modifier::DIM, got {:?}",
+            style
+        );
+
+        // Sanity: the live Claude surface (not in dim set) is NOT dim.
+        let live = cell_style(&terminal, "claude · claude", '✻')
+            .expect("claude row should be present");
+        assert!(
+            !live.add_modifier.contains(Modifier::DIM),
+            "live Claude glyph should not be DIM, got {:?}",
+            live
+        );
+    }
+
+    #[test]
+    fn surface_row_renders_goal_badge_in_dark_gray() {
+        let doc = TrajectoryDoc::parse(T3_SAMPLE).unwrap();
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let hints = RenderHints::default();
+        terminal
+            .draw(|f| {
+                render_with_hints(
+                    f,
+                    Rect::new(0, 0, 120, 20),
+                    Some(&doc),
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    &hints,
+                )
+            })
+            .unwrap();
+
+        let dump: String = {
+            let buf = terminal.backend().buffer();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .filter_map(|x| {
+                            buf.cell((x, y))
+                                .map(|c| c.symbol().chars().next().unwrap_or(' '))
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            dump.contains("← goal:Wire up T3 rendering"),
+            "missing surface goal badge in render: {dump}"
+        );
+        // Badge color is DarkGray on the `←` glyph.
+        assert_eq!(
+            cell_fg(&terminal, "← goal:", '←'),
+            Some(Color::DarkGray),
+            "← goal badge should render in DarkGray"
+        );
+    }
+
+    #[test]
+    fn goal_row_renders_surface_badge_in_dark_gray() {
+        let doc = TrajectoryDoc::parse(T3_SAMPLE).unwrap();
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let hints = RenderHints::default();
+        terminal
+            .draw(|f| {
+                render_with_hints(
+                    f,
+                    Rect::new(0, 0, 120, 20),
+                    Some(&doc),
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    &hints,
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            cell_fg(&terminal, "Wire up T3 rendering   →", '→'),
+            Some(Color::DarkGray),
+            "→ surface badge should render in DarkGray"
+        );
+    }
+
+    #[test]
+    fn no_goals_no_change_in_rendered_buffer() {
+        // A workspace with no goals.json renders exactly as if T3 had never
+        // been applied: no `← goal:` and no `→` badges in the buffer dump.
+        let bare = "---
+workspace: bare
+---
+
+## Mission
+- Mission item
+
+## Current surfaces
+
+## Goals & Progress
+- [ ] An ordinary goal
+";
+        let doc = TrajectoryDoc::parse(bare).unwrap();
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let hints = RenderHints::default();
+        terminal
+            .draw(|f| {
+                render_with_hints(
+                    f,
+                    Rect::new(0, 0, 80, 20),
+                    Some(&doc),
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    &hints,
+                )
+            })
+            .unwrap();
+
+        let dump: String = {
+            let buf = terminal.backend().buffer();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .filter_map(|x| {
+                            buf.cell((x, y))
+                                .map(|c| c.symbol().chars().next().unwrap_or(' '))
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(!dump.contains("← goal:"), "no surface badge expected: {dump}");
+        assert!(!dump.contains("   → "), "no goal badge expected: {dump}");
+        assert!(dump.contains("An ordinary goal"), "goal text missing");
     }
 }

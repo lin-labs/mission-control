@@ -142,30 +142,31 @@ pub fn last_user_turn(text: &str) -> Option<String> {
         .map(|t| t.content)
 }
 
-/// Scan ~obsAgents/Sessions/*.md and return the path of the best-matching
-/// session log for the given workspace, using a two-tier algorithm:
+/// Scan ~obsAgents/Sessions/*.md and return ALL matching session logs for the
+/// given workspace, using a two-tier algorithm.  Results are sorted by mtime
+/// descending (newest first).
 ///
 /// **Tier 1 (host + cwd match -- strongest signal)**
 /// Filter candidates where:
 /// - `fm_host` matches `ctx.host` (case-insensitive)
 /// - `fm_cwd` is a descendant of (or equal to) `ctx.cwd` via path-prefix match
 ///
-/// Among tier-1 candidates, pick the one with the most-specific (deepest) cwd.
-/// Tie-break within the same specificity level by mtime (newest wins).
+/// Among tier-1 candidates, sort by most-specific cwd (deepest) first, then
+/// by newest mtime as a tie-breaker.
 ///
 /// **Tier 2 (workspace_id fallback -- backward compat)**
 /// If tier 1 yields nothing AND `workspace_id` is non-empty, filter by
-/// `fm_workspace_id == workspace_id`. Return newest by mtime.
+/// `fm_workspace_id == workspace_id`. Sort newest-first by mtime.
 ///
-/// Returns `Ok(None)` if no matching file is found.
-pub fn latest_session_file_for_workspace(
+/// Returns `Ok(vec![])` if no matching files are found.
+pub fn matching_session_files_for_workspace(
     workspace_id: &str,
     ctx: &WorkspaceContext,
-) -> Result<Option<PathBuf>> {
+) -> Result<Vec<PathBuf>> {
     let sessions_dir = crate::mc_data::prompts::obsagents_root().join("Sessions");
 
     if !sessions_dir.exists() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     // Build candidate list.
@@ -203,7 +204,7 @@ pub fn latest_session_file_for_workspace(
     if let (Some(ctx_host), Some(ctx_cwd)) = (&ctx.host, &ctx.cwd) {
         let ctx_host_norm = normalize_host(ctx_host);
 
-        let tier1: Vec<&Candidate> = candidates
+        let mut tier1: Vec<&Candidate> = candidates
             .iter()
             .filter(|c| {
                 let host_ok =
@@ -221,16 +222,13 @@ pub fn latest_session_file_for_workspace(
             .collect();
 
         if !tier1.is_empty() {
-            // Pick the most-specific cwd (highest depth), tie-break by newest mtime.
-            let best = tier1
-                .into_iter()
-                .max_by(|a, b| {
-                    let da = a.fm.cwd.as_deref().map(cwd_depth).unwrap_or(0);
-                    let db = b.fm.cwd.as_deref().map(cwd_depth).unwrap_or(0);
-                    da.cmp(&db).then_with(|| a.mtime.cmp(&b.mtime))
-                })
-                .unwrap(); // safe: tier1 is non-empty
-            return Ok(Some(best.path.clone()));
+            // Sort by most-specific cwd (deepest) first, tie-break by newest mtime.
+            tier1.sort_by(|a, b| {
+                let da = a.fm.cwd.as_deref().map(cwd_depth).unwrap_or(0);
+                let db = b.fm.cwd.as_deref().map(cwd_depth).unwrap_or(0);
+                db.cmp(&da).then_with(|| b.mtime.cmp(&a.mtime))
+            });
+            return Ok(tier1.into_iter().map(|c| c.path.clone()).collect());
         }
     }
 
@@ -238,35 +236,58 @@ pub fn latest_session_file_for_workspace(
     // host/cwd tags).  We intentionally do NOT require a host match here so that
     // logs written before host tagging was introduced continue to work.
     if !workspace_id.is_empty() {
-        let mut best: Option<(std::time::SystemTime, &PathBuf)> = None;
-        for c in &candidates {
-            if c.fm.workspace_id.as_deref() == Some(workspace_id) {
-                if best.as_ref().map_or(true, |(bt, _)| c.mtime > *bt) {
-                    best = Some((c.mtime, &c.path));
-                }
-            }
-        }
-        if let Some((_, p)) = best {
-            return Ok(Some(p.clone()));
+        let mut tier2: Vec<&Candidate> = candidates
+            .iter()
+            .filter(|c| c.fm.workspace_id.as_deref() == Some(workspace_id))
+            .collect();
+        if !tier2.is_empty() {
+            tier2.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+            return Ok(tier2.into_iter().map(|c| c.path.clone()).collect());
         }
     }
 
-    Ok(None)
+    Ok(Vec::new())
 }
 
-/// Resolve the session-log file for a given workspace + surface.
+/// Scan ~obsAgents/Sessions/*.md and return the path of the best-matching
+/// session log for the given workspace.  This is a convenience wrapper around
+/// [`matching_session_files_for_workspace`] that returns only the first (newest)
+/// match.
 ///
-/// Two-step lookup:
+/// Returns `Ok(None)` if no matching file is found.
+pub fn latest_session_file_for_workspace(
+    workspace_id: &str,
+    ctx: &WorkspaceContext,
+) -> Result<Option<PathBuf>> {
+    Ok(matching_session_files_for_workspace(workspace_id, ctx)?
+        .into_iter()
+        .next())
+}
+
+/// Resolve the session-log file for a given workspace surface.
+///
+/// Three-step lookup:
 /// 1. Per-surface pointer file: `<surfaces_dir>/<surface_id>.session-path`.
 ///    If it exists and its content points to an existing file, return that path.
-/// 2. Workspace-level fallback: `latest_session_file_for_workspace` with the
-///    provided `WorkspaceContext` for host+cwd disambiguation.
+/// 2. Distribute multiple workspace-matched logs across surfaces by their
+///    `surface_index` (zero-based index_in_pane):
+///    - Call `matching_session_files_for_workspace` to get all matches sorted
+///      newest-first.
+///    - If `matches.len() > surface_index`, return `matches[surface_index]`.
+///    - Else return the last (oldest) match.
+/// 3. Return `None` if no matches exist.
 ///
-/// Returns `Ok(None)` when neither lookup finds a file (Shell source).
+/// **Heuristic** — until cmux env-var injection enables per-surface
+/// `.session-path` pointer files, we distribute multiple workspace-matched logs
+/// across surfaces by their index_in_pane.  Better than collapsing all peeks
+/// to one log.
+///
+/// Returns `Ok(None)` when no matching file is found (Shell source).
 pub fn resolve_session_log_for_surface(
     workspace_uuid: &str,
     surface_id: &str,
     ctx: &WorkspaceContext,
+    surface_index: usize,
 ) -> Result<Option<PathBuf>> {
     // Step 1: per-surface pointer file.
     let pointer = crate::mc_data::paths::surfaces_dir(workspace_uuid)
@@ -277,8 +298,18 @@ pub fn resolve_session_log_for_surface(
             return Ok(Some(p));
         }
     }
-    // Step 2: workspace-level fallback (with host+cwd disambiguation).
-    latest_session_file_for_workspace(workspace_uuid, ctx)
+
+    // Step 2: distribute across surfaces by index; fall back to oldest on overflow.
+    let matches = matching_session_files_for_workspace(workspace_uuid, ctx)?;
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    if surface_index < matches.len() {
+        Ok(Some(matches[surface_index].clone()))
+    } else {
+        // Out of range: return the oldest match (last in mtime-desc order).
+        Ok(matches.into_iter().last())
+    }
 }
 
 // ---------------------------------------------------------------------------

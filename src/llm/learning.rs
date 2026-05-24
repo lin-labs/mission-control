@@ -280,7 +280,7 @@ mod tests {
             project: "test-project".to_string(),
             duration: "1h 30m".to_string(),
             surfaces_summary: vec!["claude".to_string()],
-            final_trajectory: "## Goal\n- Build a thing\n".to_string(),
+            final_trajectory: "## Mission\n- Build a thing\n".to_string(),
             history_snapshots: vec![],
             inputs: vec![],
             events_jsonl: String::new(),

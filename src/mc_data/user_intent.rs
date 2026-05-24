@@ -3,7 +3,7 @@ use crate::mc_data::paths;
 use anyhow::Result;
 use std::collections::HashSet;
 
-/// What the user has explicitly done to Tasks & Progress items.
+/// What the user has explicitly done to Goals & Progress items.
 /// Used to overrule agent regen output that would undo human intent.
 #[derive(Debug, Clone, Default)]
 pub struct UserIntent {
@@ -52,7 +52,7 @@ pub fn normalize_text(s: &str) -> String {
 }
 
 /// Walk this workspace's events.jsonl and build a UserIntent that records
-/// the latest human action on each Tasks-section item.
+/// the latest human action on each Goals-section item.
 ///
 /// "Latest" means: scan in append order; later events overwrite earlier
 /// records for the same normalized text. Delete dominates uncheck dominates
@@ -68,8 +68,13 @@ pub fn load_for_workspace(workspace_id: &str) -> Result<UserIntent> {
         if !is_user {
             continue;
         }
-        // Only events on the Tasks & Progress section matter.
-        if ev.section != crate::mc_data::trajectory::SECTION_TASKS {
+        // Only events on the Goals & Progress section matter. Accept legacy
+        // "Tasks & Progress" events too — older events.jsonl entries on disk
+        // still use the pre-rename section label.
+        let ev_section = ev.section.as_str();
+        let is_goals_section = ev_section == crate::mc_data::trajectory::SECTION_GOALS
+            || ev_section == "Tasks & Progress";
+        if !is_goals_section {
             continue;
         }
         // The text to track: prefer `after` (post-edit), fall back to `before`.
@@ -105,13 +110,13 @@ pub fn load_for_workspace(workspace_id: &str) -> Result<UserIntent> {
     Ok(intent)
 }
 
-/// Apply the human intent to a freshly regenerated trajectory's Tasks
+/// Apply the human intent to a freshly regenerated trajectory's Goals
 /// section: force-check things the human checked, force-uncheck things the
 /// human unchecked, drop things the human deleted.
 pub fn apply_to_tasks(doc: &mut crate::mc_data::trajectory::TrajectoryDoc, intent: &UserIntent) {
-    use crate::mc_data::trajectory::SECTION_TASKS;
+    use crate::mc_data::trajectory::SECTION_GOALS;
     for s in doc.sections.iter_mut() {
-        if s.name != SECTION_TASKS {
+        if s.name != SECTION_GOALS {
             continue;
         }
         s.items.retain(|item| {

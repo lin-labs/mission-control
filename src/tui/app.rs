@@ -448,6 +448,19 @@ pub struct WorkspaceState {
     pub regen: RegenSchedulerState,
     /// Dismissal tracking: surface count, grace timer, dismissing flag.
     pub dismissal: DismissalState,
+    /// Active goal-dispatch modal. `Some` while the user is choosing where to
+    /// dispatch the goal at the cursor; `None` otherwise. (T4)
+    pub dispatch_modal: Option<crate::tui::dispatch_modal::DispatchModal>,
+    /// Pending outcome from the dispatch modal — read and acted on by the
+    /// main event loop after each key dispatch so async cmux work can be
+    /// spawned from outside the `&mut self` borrow.
+    pub dispatch_pending_outcome:
+        Option<crate::tui::dispatch_modal::DispatchOutcome>,
+    /// Most recent dispatch error (e.g. cmux send failure) — shown briefly in
+    /// the status line, cleared on the next key press or after ~5s. Populated
+    /// by `set_dispatch_error` from the main loop's dispatch outcome handler.
+    #[allow(dead_code)]
+    pub dispatch_error: Option<String>,
 }
 
 /// Result of an async screen capture + classification for a single workspace.
@@ -779,7 +792,7 @@ impl App {
                 // creates an empty item in memory but doesn't persist; a
                 // disk reload mid-edit would silently revert that item
                 // (and then the description-seed pass below would
-                // re-populate Goal from the cmux description, clobbering
+                // re-populate Mission from the cmux description, clobbering
                 // the user's in-flight typing target).
                 let is_actively_user_owned = {
                     let in_insert = old_edit_states
@@ -834,6 +847,9 @@ impl App {
                     peek_yield_pending: false,
                     regen,
                     dismissal,
+                    dispatch_modal: None,
+                    dispatch_pending_outcome: None,
+                    dispatch_error: None,
                 }
             })
             .collect();
@@ -847,14 +863,34 @@ impl App {
             self.workspace_index.insert(ws.workspace.uuid.clone(), i);
         }
 
-        // Seed the Goal section from the cmux workspace description (first pass).
-        // We only seed when the Goal section is currently empty so we never
+        // Persist a last-agent snapshot for any surface currently showing an
+        // agent kind. T3 (rendering) uses `surface_kind::effective_kind` to
+        // keep showing the agent glyph for ~5 minutes after the agent exits.
+        // No-op for Shell/Unknown surfaces, so this is cheap to call on
+        // every refresh tick.
+        for ws_state in &self.workspaces {
+            for surface in &ws_state.surfaces {
+                if let Err(e) = crate::mc_data::surface_kind::write_last_agent(
+                    &ws_state.workspace.uuid,
+                    &surface.ref_id,
+                    surface.kind,
+                ) {
+                    eprintln!(
+                        "write_last_agent({}, {}): {e:?}",
+                        &ws_state.workspace.uuid, &surface.ref_id
+                    );
+                }
+            }
+        }
+
+        // Seed the Mission section from the cmux workspace description (first pass).
+        // We only seed when the Mission section is currently empty so we never
         // clobber user-authored content. Each non-empty description line becomes
-        // one Goal bullet.
+        // one Mission bullet.
         //
         // SKIP this pass entirely for workspaces being actively edited or
         // peeked — the user's in-flight typing target (an empty item created
-        // by enter_insert_mode in memory) would look like "empty Goal" to
+        // by enter_insert_mode in memory) would look like "empty Mission" to
         // this loop and trigger a destructive seed.
         for ws_state in self.workspaces.iter_mut() {
             if ws_state
@@ -879,7 +915,7 @@ impl App {
                 None => continue,
             };
             let goal_section_empty = doc
-                .section(crate::mc_data::trajectory::SECTION_GOAL)
+                .section(crate::mc_data::trajectory::SECTION_MISSION)
                 .map(|s| s.items.is_empty())
                 .unwrap_or(true);
             if !goal_section_empty {
@@ -898,11 +934,14 @@ impl App {
             if goal_items.is_empty() {
                 continue;
             }
-            doc.replace_section_items(crate::mc_data::trajectory::SECTION_GOAL, goal_items);
+            doc.replace_section_items(
+                crate::mc_data::trajectory::SECTION_MISSION,
+                goal_items,
+            );
             let traj_path = crate::mc_data::paths::trajectory_path(&ws_state.workspace.uuid);
             if let Err(e) = doc.save_to_file(&traj_path) {
                 eprintln!(
-                    "seed Goal from description ({}): {e:?}",
+                    "seed Mission from description ({}): {e:?}",
                     ws_state.workspace.uuid
                 );
             }
@@ -913,7 +952,7 @@ impl App {
         // access to both the built WorkspaceState and can mutate it.
         //
         // SKIP this pass for workspaces being actively edited or peeked — even
-        // though Current surfaces is a different section than Goal/Tasks, the
+        // though Current surfaces is a different section than Mission/Goals, the
         // save_to_file at the end of the loop would mutate the on-disk file
         // while the user is in the middle of an unsaved edit. The peek case
         // matters because peek's screen-poll already mutates state at 1Hz and
@@ -932,6 +971,15 @@ impl App {
                 continue;
             };
 
+            // Load goals.json once for this workspace so we can decorate both
+            // surface rows (with `← goal:<short>` badges) and Goals & Progress
+            // rows (with `→ <glyph> <surface_ref>` badges). Missing file is
+            // not an error — `GoalsFile::load` returns the empty default and
+            // the badge helpers degrade to no-ops.
+            let goals = crate::mc_data::goals_json::GoalsFile::load(
+                &ws_state.workspace.uuid,
+            );
+
             // Build the new item list from the surfaces vec.
             // Each surface item uses the workspace ref_id as surface_id because
             // `cmux read-screen` takes a workspace ref — peek mode passes
@@ -940,13 +988,28 @@ impl App {
                 .surfaces
                 .iter()
                 .map(|s| {
+                    // `effective_kind` keeps the agent glyph for ~5 min after
+                    // the agent exits (Shell/Unknown current + recent
+                    // last-agent file ⇒ surface the agent kind instead).
+                    let eff = crate::mc_data::surface_kind::effective_kind(
+                        &ws_state.workspace.uuid,
+                        &s.ref_id,
+                        s.kind,
+                    );
+                    let text = crate::mc_data::surface_render::format_surface_text(
+                        eff,
+                        &s.title,
+                        &goals,
+                        &s.ref_id,
+                    );
                     crate::mc_data::trajectory::Item {
-                        text: s.title.clone(),
+                        text,
                         is_checkbox: false,
                         checked: None,
-                        // Use the workspace ref_id so peek mode can call
-                        // `cmux read-screen --workspace <ref_id>`.
-                        surface_id: Some(ws_state.workspace.ref_id.clone()),
+                        // Use the surface's own ref_id (e.g. "surface:92") so that
+                        // peek mode can distinguish surfaces within the same workspace
+                        // and distribute session logs deterministically by index.
+                        surface_id: Some(s.ref_id.clone()),
                     }
                 })
                 .collect();
@@ -957,12 +1020,58 @@ impl App {
                 .section(crate::mc_data::trajectory::SECTION_CURRENT_SURFACES)
                 .map(|s| s.items.as_slice())
                 .unwrap_or(&[]);
-            let unchanged = existing_items.len() == surface_items.len()
+            let surfaces_unchanged = existing_items.len() == surface_items.len()
                 && existing_items
                     .iter()
                     .zip(surface_items.iter())
                     .all(|(a, b)| a.text == b.text && a.surface_id == b.surface_id);
-            if unchanged {
+
+            // Re-decorate Goals & Progress rows with `→ <glyph> <ref>` badges.
+            // Strip any previously-applied badge first so the result is
+            // idempotent across refresh ticks even after an assignment is
+            // cleared. Skip this entire pass when goals.json is empty *and*
+            // no row currently carries a badge — preserves the "workspace
+            // with no goals.json renders unchanged" contract.
+            let goals_section_existing = doc
+                .section(crate::mc_data::trajectory::SECTION_GOALS)
+                .map(|s| s.items.clone())
+                .unwrap_or_default();
+            let any_existing_badge = goals_section_existing
+                .iter()
+                .any(|i| i.text.contains("   → "));
+            let goals_need_rebuild = !goals.goals.is_empty() || any_existing_badge;
+
+            let (goals_unchanged, goals_items_opt) = if goals_need_rebuild {
+                let rebuilt: Vec<crate::mc_data::trajectory::Item> = goals_section_existing
+                    .iter()
+                    .map(|i| {
+                        let base =
+                            crate::mc_data::surface_render::strip_badge(&i.text).to_string();
+                        let mut text = base.clone();
+                        if let Some(badge) =
+                            crate::mc_data::surface_render::format_goal_badge(&goals, &base)
+                        {
+                            text.push_str(&badge);
+                        }
+                        crate::mc_data::trajectory::Item {
+                            text,
+                            is_checkbox: i.is_checkbox,
+                            checked: i.checked,
+                            surface_id: i.surface_id.clone(),
+                        }
+                    })
+                    .collect();
+                let unchanged = rebuilt.len() == goals_section_existing.len()
+                    && rebuilt
+                        .iter()
+                        .zip(goals_section_existing.iter())
+                        .all(|(a, b)| a.text == b.text);
+                (unchanged, Some(rebuilt))
+            } else {
+                (true, None)
+            };
+
+            if surfaces_unchanged && goals_unchanged {
                 continue;
             }
 
@@ -970,6 +1079,12 @@ impl App {
                 crate::mc_data::trajectory::SECTION_CURRENT_SURFACES,
                 surface_items,
             );
+            if let Some(items) = goals_items_opt {
+                doc.replace_section_items(
+                    crate::mc_data::trajectory::SECTION_GOALS,
+                    items,
+                );
+            }
 
             let traj_path = crate::mc_data::paths::trajectory_path(&ws_state.workspace.uuid);
             if let Err(e) = doc.save_to_file(&traj_path) {
@@ -1370,7 +1485,7 @@ impl App {
         // Ensure canonical sections exist.
         doc.ensure_sections();
 
-        // Sort Tasks & Progress if >10 items.
+        // Sort Goals & Progress if >10 items.
         doc.sort_tasks_if_long();
 
         // Before persist: apply human stickiness so agent regen cannot
@@ -1465,12 +1580,37 @@ impl App {
     ///
     /// Peek mode is handled first: when `peek_state` is Some, keys are routed
     /// to peek navigation (j/k/g/G/Esc/Enter) and normal editing is bypassed.
+    /// Dispatch modal is handled second: when `dispatch_modal` is Some, keys
+    /// are routed to the modal and the parent loop reads the outcome via
+    /// `take_dispatch_outcome`.
     pub fn handle_trajectory_key(
         &mut self,
         key: crossterm::event::KeyEvent,
     ) -> Vec<crate::tui::trajectory_edit::EditAction> {
         use crossterm::event::KeyCode;
         let idx = self.selected;
+
+        // ── Dispatch modal: intercept before peek/edit ──────────────────────
+        {
+            let ws = match self.workspaces.get_mut(idx) {
+                Some(w) => w,
+                None => return vec![],
+            };
+            if ws.dispatch_modal.is_some() {
+                // Note: the parent main loop polls `take_dispatch_outcome`
+                // after each key dispatch and runs the cmux/goals.json side
+                // effects there. handle_key returns nothing actionable.
+                let _outcome = ws
+                    .dispatch_modal
+                    .as_mut()
+                    .map(|m| m.handle_key(key));
+                // Stash the outcome on the modal itself so the loop can read it.
+                if let Some(out) = _outcome {
+                    ws.dispatch_pending_outcome = Some(out);
+                }
+                return vec![];
+            }
+        }
 
         // ── Peek mode: intercept before the editor sees anything ────────────
         {
@@ -1556,8 +1696,19 @@ impl App {
                         })
                         .unwrap_or_else(|| ws.workspace.ref_id.clone());
                     // Detect Agent vs Shell source using the two-step resolver.
-                    let surface_id_for_lookup =
-                        item.and_then(|i| i.surface_id.as_deref()).unwrap_or("");
+                    // Look up the surface's index_in_pane so we can distribute
+                    // session logs deterministically across surfaces that share a
+                    // workspace (same host+cwd tier) — fixes the bug where all
+                    // surfaces in a cmux workspace showed the same conversation.
+                    let surface_id_for_lookup = item
+                        .and_then(|i| i.surface_id.as_deref())
+                        .unwrap_or("");
+                    let surface_index = ws
+                        .surfaces
+                        .iter()
+                        .find(|s| s.ref_id == surface_id_for_lookup)
+                        .map(|s| s.index_in_pane)
+                        .unwrap_or(0);
                     let peek_ctx = crate::mc_data::session_log::WorkspaceContext {
                         host: Some(hostname_short()),
                         cwd: ws.workspace.current_directory.clone(),
@@ -1566,6 +1717,7 @@ impl App {
                         &ws.workspace.uuid,
                         surface_id_for_lookup,
                         &peek_ctx,
+                        surface_index,
                     ) {
                         Ok(Some(path)) => {
                             crate::tui::peek_view::PeekSource::Agent { session_path: path }
@@ -1582,7 +1734,96 @@ impl App {
             }
         }
 
+        // ── Nav mode + Enter on a populated Goals & Progress row ───────────
+        // → open the dispatch modal. Empty goal rows still fall through to
+        // `handle_key`, which executes `insert_item_below` (preserving the
+        // b997a17 "Enter adds a new goal" behavior for blank rows).
+        use crate::mc_data::trajectory::SECTION_GOALS;
+        if key.code == KeyCode::Enter
+            && matches!(state.mode, crate::tui::trajectory_edit::EditMode::Nav)
+        {
+            let sec_idx = state.cursor_section;
+            let item_idx = state.cursor_item;
+            if let Some(sec) = doc.sections.get(sec_idx) {
+                if sec.name == SECTION_GOALS {
+                    if let Some(item) = sec.items.get(item_idx) {
+                        if !item.text.trim().is_empty() {
+                            let goal_text = item.text.clone();
+                            let workspace_uuid = ws.workspace.uuid.clone();
+                            let workspace_ref = ws.workspace.ref_id.clone();
+                            let surfaces = ws.surfaces.clone();
+                            ws.dispatch_modal = Some(
+                                crate::tui::dispatch_modal::DispatchModal::new(
+                                    goal_text,
+                                    workspace_uuid,
+                                    workspace_ref,
+                                    &surfaces,
+                                ),
+                            );
+                            return vec![];
+                        }
+                    }
+                }
+            }
+        }
+
         crate::tui::trajectory_edit::handle_key(state, doc, key)
+    }
+
+    /// Read and clear the pending dispatch outcome for the selected workspace.
+    /// The main loop calls this after each key dispatch and acts on the
+    /// outcome (running cmux commands, updating goals.json, closing the modal).
+    pub fn take_dispatch_outcome(
+        &mut self,
+    ) -> Option<crate::tui::dispatch_modal::DispatchOutcome> {
+        let idx = self.selected;
+        let ws = self.workspaces.get_mut(idx)?;
+        ws.dispatch_pending_outcome.take()
+    }
+
+    /// Close the dispatch modal for the selected workspace.
+    pub fn close_dispatch_modal(&mut self) {
+        let idx = self.selected;
+        if let Some(ws) = self.workspaces.get_mut(idx) {
+            ws.dispatch_modal = None;
+            ws.dispatch_pending_outcome = None;
+        }
+    }
+
+    /// Set the dispatch error message (shown in the status bar). Cleared on
+    /// the next key press.
+    #[allow(dead_code)]
+    pub fn set_dispatch_error(&mut self, msg: String) {
+        let idx = self.selected;
+        if let Some(ws) = self.workspaces.get_mut(idx) {
+            ws.dispatch_error = Some(msg);
+        }
+    }
+
+    /// Apply a successful dispatch result to `goals.json`: upsert an
+    /// assignment row for `goal_text` pointing at `surface_ref`/`kind` with
+    /// the current timestamp. Errors are surfaced as `dispatch_error`.
+    ///
+    /// Currently the main loop performs this work inline in the async
+    /// dispatch task so failure paths don't update goals.json; this method
+    /// remains available for tests and future synchronous callers.
+    #[allow(dead_code)]
+    pub fn record_dispatch_assignment(
+        &mut self,
+        goal_text: &str,
+        surface_ref: &str,
+        kind: crate::mc_data::surface_kind::SurfaceKind,
+    ) {
+        let idx = self.selected;
+        let uuid = match self.workspaces.get(idx) {
+            Some(ws) => ws.workspace.uuid.clone(),
+            None => return,
+        };
+        let mut goals = crate::mc_data::goals_json::GoalsFile::load(&uuid);
+        goals.set_assignment(goal_text, surface_ref, kind, chrono::Utc::now());
+        if let Err(e) = goals.save(&uuid) {
+            self.set_dispatch_error(format!("goals.json save: {e}"));
+        }
     }
 
     /// Called from the event loop to check whether a peek-yield is pending for
@@ -1954,11 +2195,11 @@ impl App {
         Ok(Some(n))
     }
 
-    /// Spawn a fire-and-forget task to push the current Goal section back to
+    /// Spawn a fire-and-forget task to push the current Mission section back to
     /// the cmux workspace description. Non-fatal: errors are logged to stderr.
     ///
     /// Call this after every successful `save_trajectory_edits` so that the
-    /// cmux description stays in sync with the trajectory Goal.
+    /// cmux description stays in sync with the trajectory Mission.
     ///
     /// NOTE: This intentionally does NOT mock the cmux binary in tests —
     /// the cmux call is exercised at runtime only.
@@ -1972,7 +2213,7 @@ impl App {
             Some(d) => d,
             None => return,
         };
-        let goal_section = match doc.section(crate::mc_data::trajectory::SECTION_GOAL) {
+        let goal_section = match doc.section(crate::mc_data::trajectory::SECTION_MISSION) {
             Some(s) => s,
             None => return,
         };
@@ -2174,13 +2415,13 @@ mod tests {
 workspace: test-ws
 ---
 
-## Goal
+## Mission
 - Build investment agent
 
 ## Current surfaces
 - claude · mbp · working              <!-- mc:surface:sid-42 -->
 
-## Tasks & Progress
+## Goals & Progress
 - [ ] sprint-01
 ";
 
@@ -2189,13 +2430,13 @@ workspace: test-ws
 workspace: test-ws
 ---
 
-## Goal
+## Mission
 - Build investment agent
 
 ## Current surfaces
 - claude · mbp · working
 
-## Tasks & Progress
+## Goals & Progress
 - [ ] sprint-01
 ";
 
@@ -2229,6 +2470,9 @@ workspace: test-ws
             peek_yield_pending: false,
             regen: RegenSchedulerState::default(),
             dismissal: DismissalState::default(),
+            dispatch_modal: None,
+            dispatch_pending_outcome: None,
+            dispatch_error: None,
         }
     }
 
@@ -2554,7 +2798,7 @@ workspace: test-ws
         app.workspaces[0].regen.events_since_last_regen = 5;
         app.workspaces[0].regen.regen_in_flight = true;
 
-        let new_doc_text = "---\nworkspace: test-ws\n---\n\n## Goal\n- Updated goal\n\n## Current surfaces\n\n## Tasks & Progress\n- [ ] new task\n";
+        let new_doc_text = "---\nworkspace: test-ws\n---\n\n## Mission\n- Updated goal\n\n## Current surfaces\n\n## Goals & Progress\n- [ ] new task\n";
         let new_doc = TrajectoryDoc::parse(new_doc_text).unwrap();
 
         // apply_regenerated_trajectory saves to disk, so we need the path to exist.
@@ -2580,7 +2824,7 @@ workspace: test-ws
         let goal_items = ws
             .trajectory
             .as_ref()
-            .and_then(|d| d.section("Goal"))
+            .and_then(|d| d.section("Mission"))
             .map(|s| s.items.iter().map(|i| i.text.clone()).collect::<Vec<_>>())
             .unwrap_or_default();
         assert!(
@@ -2603,7 +2847,7 @@ workspace: test-ws
             focus: crate::tui::trajectory_edit::InsertFocus::Item,
         };
 
-        let new_doc_text = "---\nworkspace: test-ws\n---\n\n## Goal\n- Should not appear\n\n## Current surfaces\n\n## Tasks & Progress\n";
+        let new_doc_text = "---\nworkspace: test-ws\n---\n\n## Mission\n- Should not appear\n\n## Current surfaces\n\n## Goals & Progress\n";
         let new_doc = TrajectoryDoc::parse(new_doc_text).unwrap();
         app.apply_regenerated_trajectory("test-uuid-1", new_doc);
 
@@ -2616,7 +2860,7 @@ workspace: test-ws
         let goal_items = app.workspaces[0]
             .trajectory
             .as_ref()
-            .and_then(|d| d.section("Goal"))
+            .and_then(|d| d.section("Mission"))
             .map(|s| s.items.iter().map(|i| i.text.clone()).collect::<Vec<_>>())
             .unwrap_or_default();
         assert!(

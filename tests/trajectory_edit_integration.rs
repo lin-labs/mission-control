@@ -16,13 +16,13 @@ const SAMPLE: &str = "---
 workspace: test-ws
 ---
 
-## Goal
+## Mission
 - Build investment agent
 
 ## Current surfaces
 - claude · mbp · working
 
-## Tasks & Progress
+## Goals & Progress
 - [x] sprint-01 done
 - [ ] sprint-02
 - [ ] sprint-03
@@ -180,14 +180,14 @@ fn action_to_event(action: &EditAction, snapshot: u32) -> Event {
 fn checkbox_toggle_saves_check_event_and_updates_trajectory_md() {
     with_tmp_home(|_tmp, uuid| {
         let mut doc = make_doc();
-        // sprint-02 is unchecked (Tasks section = index 2, item 1)
+        // sprint-02 is unchecked (Goals section = index 2, item 1)
         let item = &mut doc.sections[2].items[1];
         let before = format!("- [ ] {}", item.text);
         item.checked = Some(true);
         let after = format!("- [x] {}", item.text);
 
         let actions = vec![EditAction::Check {
-            section: "Tasks & Progress".to_string(),
+            section: "Goals & Progress".to_string(),
             before: before.clone(),
             after: after.clone(),
         }];
@@ -221,7 +221,7 @@ fn empty_input_ctx_produces_no_user_explanation() {
     with_tmp_home(|_tmp, uuid| {
         let mut doc = make_doc();
         let actions = vec![EditAction::Edit {
-            section: "Goal".to_string(),
+            section: "Mission".to_string(),
             before: "- old text".to_string(),
             after: "- new text".to_string(),
         }];
@@ -243,12 +243,12 @@ fn non_empty_input_ctx_attaches_user_explanation_to_last_event() {
         let mut doc = make_doc();
         let actions = vec![
             EditAction::Edit {
-                section: "Goal".to_string(),
+                section: "Mission".to_string(),
                 before: "- old text".to_string(),
                 after: "- new text".to_string(),
             },
             EditAction::Add {
-                section: "Goal".to_string(),
+                section: "Mission".to_string(),
                 after: "- another item".to_string(),
             },
         ];
@@ -274,13 +274,13 @@ fn non_empty_input_ctx_attaches_user_explanation_to_last_event() {
 fn delete_item_emits_delete_event() {
     with_tmp_home(|_tmp, uuid| {
         let mut doc = make_doc();
-        // Delete Tasks item 0 (sprint-01).
+        // Delete Goals item 0 (sprint-01).
         let item_text = doc.sections[2].items[0].text.clone();
         let before = format!("- [x] {item_text}");
         doc.sections[2].items.remove(0);
 
         let actions = vec![EditAction::Delete {
-            section: "Tasks & Progress".to_string(),
+            section: "Goals & Progress".to_string(),
             before: before.clone(),
         }];
         do_save(uuid, &mut doc, &actions, None);
@@ -314,7 +314,7 @@ fn add_new_item_emits_add_event() {
             });
 
         let actions = vec![EditAction::Add {
-            section: "Tasks & Progress".to_string(),
+            section: "Goals & Progress".to_string(),
             after: after.clone(),
         }];
         do_save(uuid, &mut doc, &actions, None);
@@ -358,7 +358,7 @@ fn edit_event_records_before_and_after_text() {
         let after = "- Build best investment agent".to_string();
 
         let actions = vec![EditAction::Edit {
-            section: "Goal".to_string(),
+            section: "Mission".to_string(),
             before: before.clone(),
             after: after.clone(),
         }];
@@ -370,6 +370,6 @@ fn edit_event_records_before_and_after_text() {
         assert!(matches!(loaded[0].kind, Kind::Edit));
         assert_eq!(loaded[0].before.as_deref(), Some(before.as_str()));
         assert_eq!(loaded[0].after.as_deref(), Some(after.as_str()));
-        assert_eq!(loaded[0].section, "Goal");
+        assert_eq!(loaded[0].section, "Mission");
     });
 }

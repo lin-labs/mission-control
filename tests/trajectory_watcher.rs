@@ -89,7 +89,8 @@ async fn watcher_fires_on_trajectory_write() {
 
     // Write the trajectory file — this is the external write we want to detect.
     let traj_path = ws_dir.join("trajectory.md");
-    std::fs::write(&traj_path, "---\n---\n\n## Goal\n- test\n").expect("write trajectory.md");
+    std::fs::write(&traj_path, "---\n---\n\n## Mission\n- test\n")
+        .expect("write trajectory.md");
 
     // Wait up to 3 s for the event; macOS FSEvents can take 1-2 s.
     let deadline = Duration::from_secs(3);

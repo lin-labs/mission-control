@@ -135,9 +135,9 @@ fn ensure_workspace_creates_skeleton_trajectory_on_first_run() {
         let traj_path = paths::trajectory_path("uuid-b1");
         assert!(traj_path.exists(), "trajectory.md should be auto-created");
         let content = std::fs::read_to_string(&traj_path).unwrap();
-        assert!(content.contains("## Goal"));
+        assert!(content.contains("## Mission"));
         assert!(content.contains("## Current surfaces"));
-        assert!(content.contains("## Tasks & Progress"));
+        assert!(content.contains("## Goals & Progress"));
     });
 }
 
@@ -147,7 +147,7 @@ fn ensure_workspace_does_not_overwrite_existing_trajectory() {
         workspace::ensure_workspace("uuid-b2", "beta", "beta").unwrap();
         let traj_path = paths::trajectory_path("uuid-b2");
         // User hand-edits the trajectory.
-        std::fs::write(&traj_path, "## Goal\n- my custom goal\n").unwrap();
+        std::fs::write(&traj_path, "## Mission\n- my custom goal\n").unwrap();
         // Refresh fires ensure_workspace again — must NOT clobber.
         workspace::ensure_workspace("uuid-b2", "beta", "beta").unwrap();
         let content = std::fs::read_to_string(&traj_path).unwrap();

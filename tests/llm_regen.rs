@@ -36,7 +36,7 @@ impl Summarizer for MockSummarizer {
 fn build_prompt_contains_trajectory_text() {
     let inputs = RegenInputs {
         workspace_name: "test-ws".to_string(),
-        current_trajectory: "## Goal\n- Build a thing\n".to_string(),
+        current_trajectory: "## Mission\n- Build a thing\n".to_string(),
         recent_events: vec![],
         recent_user_explanations: vec![],
         session_bullets: vec![],
@@ -50,7 +50,7 @@ fn build_prompt_contains_trajectory_text() {
     let combined = format!("{}\n\n{}", p.system, p.user);
 
     assert!(
-        combined.contains("## Goal"),
+        combined.contains("## Mission"),
         "prompt should contain the trajectory heading"
     );
     assert!(
@@ -83,8 +83,8 @@ fn build_prompt_contains_workspace_name() {
 
 #[test]
 fn build_prompt_includes_recent_events() {
-    let event =
-        Event::new_now(Source::User, Kind::Check, "Tasks & Progress").with_after("deploy to prod");
+    let event = Event::new_now(Source::User, Kind::Check, "Goals & Progress")
+        .with_after("deploy to prod");
 
     let inputs = RegenInputs {
         workspace_name: "ws".to_string(),
@@ -161,7 +161,7 @@ fn build_prompt_includes_session_bullets() {
 fn build_prompt_splits_into_system_and_user() {
     let inputs = RegenInputs {
         workspace_name: "split-ws".to_string(),
-        current_trajectory: "## Goal\n- Test split\n".to_string(),
+        current_trajectory: "## Mission\n- Test split\n".to_string(),
         recent_events: vec![],
         recent_user_explanations: vec![],
         session_bullets: vec![],
@@ -191,7 +191,7 @@ fn build_prompt_splits_into_system_and_user() {
 
 #[tokio::test]
 async fn regenerate_parses_valid_trajectory_response() {
-    let valid_trajectory = "---\nworkspace: test-ws\n---\n\n## Goal\n- Build a thing\n\n## Current surfaces\n\n## Tasks & Progress\n- [ ] do the work\n";
+    let valid_trajectory = "---\nworkspace: test-ws\n---\n\n## Mission\n- Build a thing\n\n## Current surfaces\n\n## Goals & Progress\n- [ ] do the work\n";
 
     let summarizer: Arc<dyn Summarizer> = Arc::new(MockSummarizer {
         response: valid_trajectory.to_string(),
@@ -214,8 +214,8 @@ async fn regenerate_parses_valid_trajectory_response() {
 
     let doc = result.unwrap();
     assert!(
-        doc.section("Goal").is_some(),
-        "parsed doc should have a Goal section"
+        doc.section("Mission").is_some(),
+        "parsed doc should have a Mission section"
     );
 }
 
@@ -223,7 +223,7 @@ async fn regenerate_parses_valid_trajectory_response() {
 async fn regenerate_returns_err_on_invalid_response() {
     // An invalid trajectory that won't round-trip through TrajectoryDoc::parse
     // (broken YAML frontmatter).
-    let invalid = "---\n: broken: yaml:\n---\n\n## Goal\n- Build a thing\n";
+    let invalid = "---\n: broken: yaml:\n---\n\n## Mission\n- Build a thing\n";
 
     // Actually broken YAML in frontmatter won't parse, so test with completely invalid content.
     // TrajectoryDoc::parse is lenient; let's test with a mock that returns an error directly.

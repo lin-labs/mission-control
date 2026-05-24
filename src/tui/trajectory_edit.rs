@@ -9,7 +9,9 @@ use crate::mc_data::events::{Event, Kind, Source};
 use crate::mc_data::inputs::{InputContext, write_input};
 use crate::mc_data::paths;
 use crate::mc_data::snapshots::{highest_snapshot, write_snapshot};
-use crate::mc_data::trajectory::{Item, SECTION_CURRENT_SURFACES, SECTION_TASKS, TrajectoryDoc};
+use crate::mc_data::trajectory::{
+    Item, SECTION_CURRENT_SURFACES, SECTION_GOALS, TrajectoryDoc,
+};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -211,17 +213,33 @@ fn handle_nav_key(
             }
             insert_item_above(state, doc);
         }
-        KeyCode::Char('i') | KeyCode::Enter => {
+        KeyCode::Char('i') => {
             state.pending_d_at = None;
-            // i / Enter to enter insert mode is blocked on Current surfaces.
-            // (Enter on a surface row with a surface_id is already intercepted
-            // in app.rs to enter peek mode before this function is called, so
-            // the Enter case here is only reached for rows without a surface_id,
-            // or when peek mode is already active — both should be no-ops.)
+            // i to enter insert mode is blocked on Current surfaces.
             if is_current_surfaces_row(state, doc) {
                 return actions;
             }
             enter_insert_mode(state, doc);
+        }
+        KeyCode::Enter => {
+            state.pending_d_at = None;
+            // Enter on Current surfaces is a no-op here; app.rs intercepts it
+            // for rows with a surface_id before this function is called.
+            if is_current_surfaces_row(state, doc) {
+                return actions;
+            }
+            // On Goals & Progress: Enter opens a new item below (like `o`).
+            // On Mission (and any other section): Enter edits the current item (like `i`).
+            let on_tasks = doc
+                .sections
+                .get(state.cursor_section)
+                .map(|s| s.name == SECTION_GOALS)
+                .unwrap_or(false);
+            if on_tasks {
+                insert_item_below(state, doc);
+            } else {
+                enter_insert_mode(state, doc);
+            }
         }
         // ── Move item within section ─────────────────────────────────────────
         KeyCode::Char('J') => {
@@ -312,6 +330,57 @@ fn handle_insert_key(
                 state.cursor_col = state.edit_buffer.chars().count();
             }
         }
+        KeyCode::Backspace if key.modifiers == KeyModifiers::ALT => {
+            if focus == InsertFocus::Item {
+                let start = previous_word_start(&state.edit_buffer, state.cursor_col);
+                if start < state.cursor_col {
+                    let mut chars: Vec<char> = state.edit_buffer.chars().collect();
+                    chars.drain(start..state.cursor_col);
+                    state.edit_buffer = chars.into_iter().collect();
+                    state.cursor_col = start;
+                }
+            }
+        }
+        // T4 Part B: Backspace on an empty goal in Goals & Progress collapses
+        // the row into the previous one (intuitive Markdown editor behavior).
+        // This branch MUST precede the plain-Backspace branch so the
+        // empty-goal case wins. Only fires in the Item buffer (Tab-switched
+        // input-ctx editing is unrelated).
+        KeyCode::Backspace
+            if key.modifiers == KeyModifiers::NONE
+                && focus == InsertFocus::Item
+                && state.edit_buffer.trim().is_empty()
+                && doc
+                    .sections
+                    .get(state.cursor_section)
+                    .map(|s| s.name == SECTION_GOALS)
+                    .unwrap_or(false)
+                && state.cursor_item > 0 =>
+        {
+            // Remove current item; jump to end of previous item; stay in insert.
+            let prev_text = {
+                let section = match doc.sections.get_mut(state.cursor_section) {
+                    Some(s) => s,
+                    None => return vec![],
+                };
+                if state.cursor_item >= section.items.len() {
+                    return vec![];
+                }
+                section.items.remove(state.cursor_item);
+                state.cursor_item -= 1;
+                section
+                    .items
+                    .get(state.cursor_item)
+                    .map(|i| i.text.clone())
+                    .unwrap_or_default()
+            };
+            state.edit_buffer = prev_text.clone();
+            state.cursor_col = prev_text.chars().count();
+            // Keep edit_start_text aligned with the now-current item so the
+            // next commit_insert diffs against the right baseline.
+            state.edit_start_text = Some(prev_text);
+            return vec![];
+        }
         KeyCode::Backspace => {
             if focus == InsertFocus::Item {
                 if state.cursor_col > 0 {
@@ -360,6 +429,26 @@ fn insert_char_at(s: &mut String, char_col: usize, c: char) {
 fn remove_char_at(s: &mut String, char_col: usize) -> Option<char> {
     let (byte_pos, _) = s.char_indices().nth(char_col)?;
     Some(s.remove(byte_pos))
+}
+
+/// Find the start of the word preceding `cursor_col` (in chars).
+/// Skips trailing whitespace, then keeps going backward while chars are
+/// non-whitespace. Returns the char index of the first char of the word.
+fn previous_word_start(s: &str, cursor_col: usize) -> usize {
+    let chars: Vec<char> = s.chars().collect();
+    if cursor_col == 0 {
+        return 0;
+    }
+    let mut i = cursor_col;
+    // Skip whitespace immediately before cursor.
+    while i > 0 && chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    // Then skip word chars.
+    while i > 0 && !chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    i
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -579,8 +668,8 @@ fn move_cursor_up(state: &mut TrajectoryEditState, doc: &TrajectoryDoc) {
 
 fn toggle_checkbox(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> Option<EditAction> {
     let section = doc.sections.get_mut(state.cursor_section)?;
-    // Only Tasks & Progress items have checkboxes (by convention).
-    if section.name != SECTION_TASKS {
+    // Only Goals & Progress items have checkboxes (by convention).
+    if section.name != SECTION_GOALS {
         return None;
     }
     let item = section.items.get_mut(state.cursor_item)?;
@@ -633,7 +722,7 @@ fn insert_item_below(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
     } else {
         state.cursor_item + 1
     };
-    let is_checkbox = section.name == SECTION_TASKS || section.name == SECTION_CURRENT_SURFACES;
+    let is_checkbox = section.name == SECTION_GOALS || section.name == SECTION_CURRENT_SURFACES;
     section.items.insert(
         insert_pos,
         Item {
@@ -663,7 +752,7 @@ fn insert_item_above(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
     } else {
         state.cursor_item
     };
-    let is_checkbox = section.name == SECTION_TASKS || section.name == SECTION_CURRENT_SURFACES;
+    let is_checkbox = section.name == SECTION_GOALS || section.name == SECTION_CURRENT_SURFACES;
     section.items.insert(
         insert_pos,
         Item {
@@ -691,7 +780,7 @@ fn enter_insert_mode(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
 
     // Auto-create the first item if section is empty.
     if section.items.is_empty() {
-        let is_tasks = section.name == SECTION_TASKS;
+        let is_tasks = section.name == SECTION_GOALS;
         section.items.push(Item {
             text: String::new(),
             is_checkbox: is_tasks,
@@ -780,13 +869,13 @@ mod tests {
 workspace: test-ws
 ---
 
-## Goal
+## Mission
 - Build investment agent
 
 ## Current surfaces
 - claude · mbp · working
 
-## Tasks & Progress
+## Goals & Progress
 - [x] sprint-01 done
 - [ ] sprint-02
 - [ ] sprint-03
@@ -1128,11 +1217,11 @@ workspace: test-ws
         let mut doc = TrajectoryDoc::default();
         doc.ensure_sections(); // all 3 sections empty
         let mut state = TrajectoryEditState::default();
-        state.cursor_section = 0; // Goal
+        state.cursor_section = 0; // Mission
         state.cursor_item = 0;
         let actions = handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
         assert!(matches!(state.mode, EditMode::Insert { .. }));
-        let goal = doc.section("Goal").unwrap();
+        let goal = doc.section("Mission").unwrap();
         assert_eq!(goal.items.len(), 1);
         assert_eq!(goal.items[0].text, "");
         assert!(!goal.items[0].is_checkbox);
@@ -1145,11 +1234,11 @@ workspace: test-ws
         let mut doc = TrajectoryDoc::default();
         doc.ensure_sections();
         let mut state = TrajectoryEditState::default();
-        // section index for "Tasks & Progress" is 2 in canonical order
+        // section index for "Goals & Progress" is 2 in canonical order
         state.cursor_section = 2;
         state.cursor_item = 0;
         handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
-        let tasks = doc.section("Tasks & Progress").unwrap();
+        let tasks = doc.section("Goals & Progress").unwrap();
         assert_eq!(tasks.items.len(), 1);
         assert!(tasks.items[0].is_checkbox);
         assert_eq!(tasks.items[0].checked, Some(false));
@@ -1163,7 +1252,7 @@ workspace: test-ws
         state.cursor_section = 0;
         state.cursor_item = 0;
         handle_key(&mut state, &mut doc, key(KeyCode::Char('o')));
-        let goal = doc.section("Goal").unwrap();
+        let goal = doc.section("Mission").unwrap();
         assert_eq!(goal.items.len(), 1);
         assert!(matches!(state.mode, EditMode::Insert { .. }));
     }
@@ -1515,7 +1604,7 @@ workspace: test-ws
         let mut doc = TrajectoryDoc::default();
         doc.ensure_sections();
         let mut state = TrajectoryEditState::default();
-        state.cursor_section = 2; // Tasks & Progress
+        state.cursor_section = 2; // Goals & Progress
         state.cursor_item = 0;
         handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
         assert!(matches!(state.mode, EditMode::Insert { .. }));
@@ -1560,7 +1649,7 @@ workspace: test-ws
         handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
         assert_eq!(state.cursor_section, 1);
         assert_eq!(state.cursor_item, 0);
-        // j → Tasks & Progress
+        // j → Goals & Progress
         handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
         assert_eq!(state.cursor_section, 2);
         // j again clamps at last section
@@ -1669,5 +1758,246 @@ workspace: test-ws
             .map(|l| l.trim().to_string())
             .collect();
         assert_eq!(items, vec!["first", "second", "third"]);
+    }
+
+    // ── Alt+Backspace (Option+Delete) ─────────────────────────────────────────
+
+    #[test]
+    fn alt_backspace_deletes_previous_word() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: "hello world how are you".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0;
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        // cursor_col now at chars().count() == 23 (end of "hello world how are you")
+        assert_eq!(state.cursor_col, 23);
+        let ev = crossterm::event::KeyEvent::new(KeyCode::Backspace, crossterm::event::KeyModifiers::ALT);
+        handle_key(&mut state, &mut doc, ev);
+        // Should have deleted "you" — "hello world how are " remains
+        assert!(state.edit_buffer.ends_with("are "), "got: {:?}", state.edit_buffer);
+        assert_eq!(state.cursor_col, state.edit_buffer.chars().count());
+    }
+
+    #[test]
+    fn alt_backspace_at_col_zero_is_noop() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: "hello".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        state.cursor_col = 0;
+        let ev = crossterm::event::KeyEvent::new(KeyCode::Backspace, crossterm::event::KeyModifiers::ALT);
+        handle_key(&mut state, &mut doc, ev);
+        assert_eq!(state.edit_buffer, "hello");
+        assert_eq!(state.cursor_col, 0);
+    }
+
+    // ── Ctrl+A / Ctrl+E ───────────────────────────────────────────────────────
+
+    #[test]
+    fn ctrl_a_jumps_to_line_head() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: "abc".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        // cursor at end (3)
+        assert_eq!(state.cursor_col, 3);
+        let ev = crossterm::event::KeyEvent::new(KeyCode::Char('a'), crossterm::event::KeyModifiers::CONTROL);
+        handle_key(&mut state, &mut doc, ev);
+        assert_eq!(state.cursor_col, 0);
+    }
+
+    #[test]
+    fn ctrl_e_jumps_to_line_tail() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: "abc".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        state.cursor_col = 0; // jump to head manually
+        let ev = crossterm::event::KeyEvent::new(KeyCode::Char('e'), crossterm::event::KeyModifiers::CONTROL);
+        handle_key(&mut state, &mut doc, ev);
+        assert_eq!(state.cursor_col, 3);
+    }
+
+    // ── Enter on Tasks / Goal sections ────────────────────────────────────────
+
+    #[test]
+    fn enter_on_tasks_section_creates_new_item_and_enters_insert() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        // Add one task so the section isn't empty.
+        doc.sections[2].items.push(Item {
+            text: "first".to_string(),
+            is_checkbox: true,
+            checked: Some(false),
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 2; // Goals & Progress
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Enter));
+        // A new item should exist below "first".
+        assert_eq!(doc.sections[2].items.len(), 2);
+        assert!(matches!(state.mode, EditMode::Insert { .. }));
+        assert_eq!(state.cursor_item, 1); // cursor moved to new item
+    }
+
+    #[test]
+    fn enter_on_goal_section_edits_current_item() {
+        // Confirm we did NOT break Goal section's Enter behavior.
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: "goal item".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0;
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Enter));
+        // Goal still has 1 item (we entered insert on the existing one, didn't create new).
+        assert_eq!(doc.sections[0].items.len(), 1);
+        assert!(matches!(state.mode, EditMode::Insert { .. }));
+    }
+
+    // ── T4 Part B: Backspace deletes empty goal in insert mode ───────────────
+
+    /// Build a doc with N goal items, the last one empty, cursor on the last.
+    fn doc_with_goals(items: &[&str]) -> TrajectoryDoc {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        // Goals & Progress is section 2 after ensure_sections.
+        for t in items {
+            doc.sections[2].items.push(Item {
+                text: t.to_string(),
+                is_checkbox: true,
+                checked: Some(false),
+                surface_id: None,
+            });
+        }
+        doc
+    }
+
+    #[test]
+    fn backspace_on_empty_goal_deletes_and_jumps_to_previous() {
+        let mut doc = doc_with_goals(&["sprint-01", "sprint-02", ""]);
+        // Enter insert mode on the empty 3rd item.
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 2;
+        state.cursor_item = 2;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        assert!(matches!(state.mode, EditMode::Insert { .. }));
+        assert_eq!(state.edit_buffer, "");
+
+        // Backspace: empty current goal + previous exists → collapse.
+        handle_key(&mut state, &mut doc, key(KeyCode::Backspace));
+
+        // The empty item is removed.
+        assert_eq!(doc.sections[2].items.len(), 2);
+        // Cursor moved to previous item (index 1, "sprint-02").
+        assert_eq!(state.cursor_item, 1);
+        // Edit buffer holds the previous item's text.
+        assert_eq!(state.edit_buffer, "sprint-02");
+        // Cursor is at end of previous text.
+        assert_eq!(state.cursor_col, "sprint-02".chars().count());
+        // Still in insert mode.
+        assert!(matches!(state.mode, EditMode::Insert { .. }));
+    }
+
+    #[test]
+    fn backspace_on_empty_goal_first_item_is_noop() {
+        let mut doc = doc_with_goals(&[""]);
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 2;
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        assert!(matches!(state.mode, EditMode::Insert { .. }));
+        assert_eq!(state.edit_buffer, "");
+
+        handle_key(&mut state, &mut doc, key(KeyCode::Backspace));
+
+        // Item still exists; nothing changed.
+        assert_eq!(doc.sections[2].items.len(), 1);
+        assert_eq!(state.cursor_item, 0);
+        assert_eq!(state.edit_buffer, "");
+        // Still in insert mode.
+        assert!(matches!(state.mode, EditMode::Insert { .. }));
+    }
+
+    #[test]
+    fn backspace_on_goal_with_content_acts_as_char_delete() {
+        // Existing-behavior regression test: Backspace on a non-empty buffer
+        // should still delete the previous character.
+        let mut doc = doc_with_goals(&["sprint-01", "abc"]);
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 2;
+        state.cursor_item = 1;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        assert_eq!(state.edit_buffer, "abc");
+        // Move cursor to end.
+        state.cursor_col = 3;
+
+        handle_key(&mut state, &mut doc, key(KeyCode::Backspace));
+
+        // Buffer trimmed by one char; no item removed.
+        assert_eq!(state.edit_buffer, "ab");
+        assert_eq!(state.cursor_col, 2);
+        assert_eq!(doc.sections[2].items.len(), 2);
+        assert!(matches!(state.mode, EditMode::Insert { .. }));
+    }
+
+    #[test]
+    fn backspace_on_empty_non_goal_section_is_plain_char_delete() {
+        // Mission section (index 0): empty buffer + Backspace should NOT
+        // delete the item — the special-case only fires in Goals & Progress.
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: "first mission".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        doc.sections[0].items.push(Item {
+            text: "".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0;
+        state.cursor_item = 1;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        assert_eq!(state.edit_buffer, "");
+        handle_key(&mut state, &mut doc, key(KeyCode::Backspace));
+        // Item was NOT removed (Mission isn't Goals & Progress).
+        assert_eq!(doc.sections[0].items.len(), 2);
+        assert_eq!(state.cursor_item, 1);
     }
 }
