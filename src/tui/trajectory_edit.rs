@@ -68,6 +68,8 @@ pub struct TrajectoryEditState {
     pub input_ctx_buffer: String,
     /// Text of the item when insert mode was entered — used to detect no-op.
     pub edit_start_text: Option<String>,
+    /// Cursor column within `edit_buffer` in insert mode (char count, not byte count).
+    pub cursor_col: usize,
 }
 
 impl Default for TrajectoryEditState {
@@ -79,6 +81,7 @@ impl Default for TrajectoryEditState {
             edit_buffer: String::new(),
             input_ctx_buffer: String::new(),
             edit_start_text: None,
+            cursor_col: 0,
         }
     }
 }
@@ -188,31 +191,83 @@ fn handle_insert_key(
                 },
             };
         }
-        KeyCode::Backspace => {
-            let buf = active_buffer_mut(state, &focus);
-            buf.pop();
-        }
         KeyCode::Left => {
-            // For now no visual cursor movement within the buffer — just no-op.
-            // Full line-editor cursor is a Phase 1b polish item.
+            if focus == InsertFocus::Item {
+                state.cursor_col = state.cursor_col.saturating_sub(1);
+            }
         }
-        KeyCode::Right => {}
+        KeyCode::Right => {
+            if focus == InsertFocus::Item {
+                let len = state.edit_buffer.chars().count();
+                if state.cursor_col < len {
+                    state.cursor_col += 1;
+                }
+            }
+        }
+        KeyCode::Home => {
+            if focus == InsertFocus::Item {
+                state.cursor_col = 0;
+            }
+        }
+        KeyCode::End => {
+            if focus == InsertFocus::Item {
+                state.cursor_col = state.edit_buffer.chars().count();
+            }
+        }
+        KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => {
+            if focus == InsertFocus::Item {
+                state.cursor_col = 0;
+            }
+        }
+        KeyCode::Char('e') if key.modifiers == KeyModifiers::CONTROL => {
+            if focus == InsertFocus::Item {
+                state.cursor_col = state.edit_buffer.chars().count();
+            }
+        }
+        KeyCode::Backspace => {
+            if focus == InsertFocus::Item {
+                if state.cursor_col > 0 {
+                    remove_char_at(&mut state.edit_buffer, state.cursor_col - 1);
+                    state.cursor_col -= 1;
+                }
+            } else {
+                state.input_ctx_buffer.pop();
+            }
+        }
+        KeyCode::Delete => {
+            if focus == InsertFocus::Item {
+                let len = state.edit_buffer.chars().count();
+                if state.cursor_col < len {
+                    remove_char_at(&mut state.edit_buffer, state.cursor_col);
+                }
+            }
+        }
         KeyCode::Char(c) if key.modifiers == KeyModifiers::NONE
             || key.modifiers == KeyModifiers::SHIFT =>
         {
-            let buf = active_buffer_mut(state, &focus);
-            buf.push(c);
+            if focus == InsertFocus::Item {
+                insert_char_at(&mut state.edit_buffer, state.cursor_col, c);
+                state.cursor_col += 1;
+            } else {
+                state.input_ctx_buffer.push(c);
+            }
         }
         _ => {}
     }
     vec![]
 }
 
-fn active_buffer_mut<'a>(state: &'a mut TrajectoryEditState, focus: &InsertFocus) -> &'a mut String {
-    match focus {
-        InsertFocus::Item => &mut state.edit_buffer,
-        InsertFocus::InputCtx => &mut state.input_ctx_buffer,
-    }
+/// Insert a character at the given char-indexed position in `s`.
+fn insert_char_at(s: &mut String, char_col: usize, c: char) {
+    let byte_pos = s.char_indices().nth(char_col).map(|(b, _)| b).unwrap_or(s.len());
+    s.insert(byte_pos, c);
+}
+
+/// Remove the character at the given char-indexed position in `s`.
+/// Returns the removed char, or `None` if out of bounds.
+fn remove_char_at(s: &mut String, char_col: usize) -> Option<char> {
+    let (byte_pos, _) = s.char_indices().nth(char_col)?;
+    Some(s.remove(byte_pos))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -249,6 +304,7 @@ fn commit_insert(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> Ve
 
     state.mode = EditMode::Nav;
     state.edit_buffer.clear();
+    state.cursor_col = 0;
     state.edit_start_text = None;
     actions
 }
@@ -490,6 +546,7 @@ fn insert_item_below(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
     state.cursor_item = insert_pos;
     state.mode = EditMode::Insert { focus: InsertFocus::Item };
     state.edit_buffer = String::new();
+    state.cursor_col = 0;
     state.input_ctx_buffer = String::new();
     state.edit_start_text = Some(String::new());
 }
@@ -513,6 +570,7 @@ fn insert_item_above(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
     state.cursor_item = insert_pos;
     state.mode = EditMode::Insert { focus: InsertFocus::Item };
     state.edit_buffer = String::new();
+    state.cursor_col = 0;
     state.input_ctx_buffer = String::new();
     state.edit_start_text = Some(String::new());
 }
@@ -543,6 +601,7 @@ fn enter_insert_mode(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
     let item = &section.items[state.cursor_item];
     state.mode = EditMode::Insert { focus: InsertFocus::Item };
     state.edit_buffer = item.text.clone();
+    state.cursor_col = state.edit_buffer.chars().count();
     state.input_ctx_buffer = String::new();
     state.edit_start_text = Some(item.text.clone());
 }
@@ -1002,5 +1061,153 @@ workspace: test-ws
             panic!("not in insert mode");
         }
         assert_eq!(state.edit_buffer, "second");
+    }
+
+    // ── T8: within-line cursor in insert mode ────────────────────────────────
+
+    #[test]
+    fn arrow_left_moves_cursor_within_buffer() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: "hello".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0;
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i'))); // enter insert
+        assert_eq!(state.cursor_col, 5); // end of "hello"
+        handle_key(&mut state, &mut doc, key(KeyCode::Left));
+        assert_eq!(state.cursor_col, 4);
+    }
+
+    #[test]
+    fn arrow_right_clamps_to_buffer_length() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: "hi".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0;
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        assert_eq!(state.cursor_col, 2); // end of "hi"
+        // Right at the end should stay at 2
+        handle_key(&mut state, &mut doc, key(KeyCode::Right));
+        assert_eq!(state.cursor_col, 2);
+    }
+
+    #[test]
+    fn home_jumps_to_zero_end_jumps_to_len() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: "abcde".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0;
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        assert_eq!(state.cursor_col, 5);
+        handle_key(&mut state, &mut doc, key(KeyCode::Home));
+        assert_eq!(state.cursor_col, 0);
+        handle_key(&mut state, &mut doc, key(KeyCode::End));
+        assert_eq!(state.cursor_col, 5);
+    }
+
+    #[test]
+    fn typing_inserts_at_cursor_position() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: "ac".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0;
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        // cursor is at 2 (end of "ac")
+        handle_key(&mut state, &mut doc, key(KeyCode::Left)); // cursor at 1
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('b'))); // insert 'b' at col 1
+        assert_eq!(state.edit_buffer, "abc");
+        assert_eq!(state.cursor_col, 2);
+    }
+
+    #[test]
+    fn backspace_removes_char_before_cursor() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: "abc".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0;
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        // cursor at 3 (end of "abc")
+        handle_key(&mut state, &mut doc, key(KeyCode::Left)); // cursor at 2
+        handle_key(&mut state, &mut doc, key(KeyCode::Backspace)); // removes 'b' (char at col 1)
+        assert_eq!(state.edit_buffer, "ac");
+        assert_eq!(state.cursor_col, 1);
+    }
+
+    #[test]
+    fn delete_removes_char_at_cursor() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: "abc".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0;
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        // cursor at 3
+        handle_key(&mut state, &mut doc, key(KeyCode::Left)); // cursor at 2
+        handle_key(&mut state, &mut doc, key(KeyCode::Left)); // cursor at 1
+        handle_key(&mut state, &mut doc, key(KeyCode::Delete)); // removes 'b' at col 1
+        assert_eq!(state.edit_buffer, "ac");
+        assert_eq!(state.cursor_col, 1); // cursor didn't move
+    }
+
+    #[test]
+    fn cursor_handles_utf8_chars() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: String::new(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0;
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('ä')));
+        // 'ä' is 2 bytes but 1 char — cursor_col should be 1
+        assert_eq!(state.cursor_col, 1);
+        assert_eq!(state.edit_buffer, "ä");
+        // Verify edit_buffer byte length is > 1 (it's multi-byte UTF-8)
+        assert!(state.edit_buffer.len() > 1);
     }
 }
