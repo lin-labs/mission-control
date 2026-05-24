@@ -62,6 +62,9 @@ Run `mc --help` to see all subcommand flags.
 - `h`, left arrow, or `Esc`: return to the sidebar
 - `s`: refresh the current screen preview
 - `n`: open notes for the selected workspace
+- `:`: enter command mode (Tab completes, Esc cancels). v1 commands:
+  - `:summarize` — write a Markdown snapshot of all visible workspaces to
+    `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Agents/mc-workspaces-summaries/`
 - `q`: quit
 
 ## Data storage
