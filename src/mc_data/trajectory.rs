@@ -6,8 +6,7 @@ pub const SECTION_GOAL: &str = "Goal";
 pub const SECTION_CURRENT_SURFACES: &str = "Current surfaces";
 pub const SECTION_TASKS: &str = "Tasks & Progress";
 
-pub const SECTIONS_IN_ORDER: &[&str] =
-    &[SECTION_GOAL, SECTION_CURRENT_SURFACES, SECTION_TASKS];
+pub const SECTIONS_IN_ORDER: &[&str] = &[SECTION_GOAL, SECTION_CURRENT_SURFACES, SECTION_TASKS];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Frontmatter {
@@ -52,7 +51,10 @@ impl TrajectoryDoc {
             updated: Some(chrono::Utc::now().to_rfc3339()),
             snapshot: Some(0),
         };
-        let mut doc = TrajectoryDoc { frontmatter, sections: Vec::new() };
+        let mut doc = TrajectoryDoc {
+            frontmatter,
+            sections: Vec::new(),
+        };
         doc.ensure_sections();
         doc
     }
@@ -89,7 +91,10 @@ impl TrajectoryDoc {
             sections.push(s);
         }
 
-        Ok(TrajectoryDoc { frontmatter, sections })
+        Ok(TrajectoryDoc {
+            frontmatter,
+            sections,
+        })
     }
 
     pub fn section(&self, name: &str) -> Option<&Section> {
@@ -206,18 +211,15 @@ impl TrajectoryDoc {
                 .with_context(|| format!("create parent dir for {path:?}"))?;
         }
         let tmp = path.with_extension("md.tmp");
-        std::fs::write(&tmp, self.to_markdown())
-            .with_context(|| format!("write tmp {tmp:?}"))?;
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("rename {tmp:?} -> {path:?}"))?;
+        std::fs::write(&tmp, self.to_markdown()).with_context(|| format!("write tmp {tmp:?}"))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("rename {tmp:?} -> {path:?}"))?;
         Ok(())
     }
 
     pub fn load_from_file(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                let mut d = Self::parse(&text)
-                    .with_context(|| format!("parse {path:?}"))?;
+                let mut d = Self::parse(&text).with_context(|| format!("parse {path:?}"))?;
                 d.ensure_sections();
                 Ok(d)
             }
@@ -262,16 +264,15 @@ fn parse_item(line: &str, section_name: &str) -> Option<Item> {
     let trimmed = line.trim_start();
     let body = trimmed.strip_prefix("- ")?;
 
-    let (text, is_checkbox, checked) =
-        if let Some(rest) = body.strip_prefix("[x] ") {
-            (rest.to_string(), true, Some(true))
-        } else if let Some(rest) = body.strip_prefix("[X] ") {
-            (rest.to_string(), true, Some(true))
-        } else if let Some(rest) = body.strip_prefix("[ ] ") {
-            (rest.to_string(), true, Some(false))
-        } else {
-            (body.to_string(), false, None)
-        };
+    let (text, is_checkbox, checked) = if let Some(rest) = body.strip_prefix("[x] ") {
+        (rest.to_string(), true, Some(true))
+    } else if let Some(rest) = body.strip_prefix("[X] ") {
+        (rest.to_string(), true, Some(true))
+    } else if let Some(rest) = body.strip_prefix("[ ] ") {
+        (rest.to_string(), true, Some(false))
+    } else {
+        (body.to_string(), false, None)
+    };
 
     // Pull HTML comment surface marker if present. A malformed comment with
     // no closing `-->` yields surface_id = None rather than a garbage id.

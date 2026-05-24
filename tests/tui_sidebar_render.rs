@@ -22,11 +22,8 @@ fn line_text(line: &Line<'_>) -> String {
 #[test]
 fn workspace_with_description_shows_subtitle_in_dim() {
     // Wide enough that there is no truncation.
-    let line = description_subtitle_line(
-        Some("build the calibration backfill agent"),
-        40,
-    )
-    .expect("should return Some for non-empty description");
+    let line = description_subtitle_line(Some("build the calibration backfill agent"), 40)
+        .expect("should return Some for non-empty description");
 
     let text = line_text(&line);
 
@@ -70,7 +67,10 @@ fn workspace_without_description_has_no_subtitle() {
 
     // Whitespace-only → no subtitle.
     let result = description_subtitle_line(Some("   "), 40);
-    assert!(result.is_none(), "expected None for whitespace-only description");
+    assert!(
+        result.is_none(),
+        "expected None for whitespace-only description"
+    );
 }
 
 #[test]
@@ -143,6 +143,6 @@ fn parse_hex_color_returns_none_for_invalid() {
     assert_eq!(parse_hex_color(""), None);
     assert_eq!(parse_hex_color("not a color"), None);
     assert_eq!(parse_hex_color("#XYZ"), None);
-    assert_eq!(parse_hex_color("#12345"), None);    // too short
-    assert_eq!(parse_hex_color("#1234567"), None);  // too long
+    assert_eq!(parse_hex_color("#12345"), None); // too short
+    assert_eq!(parse_hex_color("#1234567"), None); // too long
 }

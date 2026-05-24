@@ -200,7 +200,9 @@ mod tests {
     #[test]
     fn cursor_moves() {
         let mut cl = CommandLine::new();
-        for c in "summ".chars() { cl.insert_char(c); }
+        for c in "summ".chars() {
+            cl.insert_char(c);
+        }
         cl.cursor_left();
         assert_eq!(cl.cursor, 3);
         cl.cursor_home();
@@ -214,7 +216,9 @@ mod tests {
     #[test]
     fn tab_unique_match_completes_with_space() {
         let mut cl = CommandLine::new();
-        for c in "sum".chars() { cl.insert_char(c); }
+        for c in "sum".chars() {
+            cl.insert_char(c);
+        }
         let outcome = cl.tab();
         assert_eq!(outcome, TabOutcome::Completed("summarize"));
         assert_eq!(cl.buffer, "summarize ");
@@ -224,7 +228,9 @@ mod tests {
     #[test]
     fn tab_no_match_sets_error_status() {
         let mut cl = CommandLine::new();
-        for c in "zzz".chars() { cl.insert_char(c); }
+        for c in "zzz".chars() {
+            cl.insert_char(c);
+        }
         let outcome = cl.tab();
         assert_eq!(outcome, TabOutcome::NoMatch);
         assert!(matches!(cl.status, Some(StatusLine::Err(_))));
@@ -233,21 +239,27 @@ mod tests {
     #[test]
     fn ghost_when_unique_prefix() {
         let mut cl = CommandLine::new();
-        for c in "sum".chars() { cl.insert_char(c); }
+        for c in "sum".chars() {
+            cl.insert_char(c);
+        }
         assert_eq!(cl.ghost(), "marize");
     }
 
     #[test]
     fn ghost_empty_when_no_match() {
         let mut cl = CommandLine::new();
-        for c in "zzz".chars() { cl.insert_char(c); }
+        for c in "zzz".chars() {
+            cl.insert_char(c);
+        }
         assert_eq!(cl.ghost(), "");
     }
 
     #[test]
     fn ghost_empty_after_space() {
         let mut cl = CommandLine::new();
-        for c in "summarize ".chars() { cl.insert_char(c); }
+        for c in "summarize ".chars() {
+            cl.insert_char(c);
+        }
         assert_eq!(cl.ghost(), "");
     }
 }

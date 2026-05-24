@@ -15,8 +15,7 @@ fn with_tmp_home<F: FnOnce(&std::path::Path)>(f: F) {
     unsafe { std::env::set_var("HOME", tmp.path()) };
     // Restore HOME even if the closure panics — otherwise a failing test
     // leaves later tests pointing at the already-dropped tempdir.
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(tmp.path())));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(tmp.path())));
     match prior {
         Some(v) => unsafe { std::env::set_var("HOME", v) },
         None => unsafe { std::env::remove_var("HOME") },
@@ -39,11 +38,15 @@ fn ensure_workspace_dir_creates_full_tree() {
         assert!(paths::surfaces_dir("uuid-1").is_dir());
 
         assert_eq!(
-            std::fs::read_to_string(paths::name_path("uuid-1")).unwrap().trim(),
+            std::fs::read_to_string(paths::name_path("uuid-1"))
+                .unwrap()
+                .trim(),
             "predinvest"
         );
         assert_eq!(
-            std::fs::read_to_string(paths::project_path("uuid-1")).unwrap().trim(),
+            std::fs::read_to_string(paths::project_path("uuid-1"))
+                .unwrap()
+                .trim(),
             "predinvest"
         );
 
@@ -68,7 +71,10 @@ fn ensure_workspace_is_idempotent() {
 fn read_display_name_reads_name_file() {
     with_tmp_home(|_| {
         workspace::ensure_workspace("uuid-3", "predinvest", "predinvest").unwrap();
-        assert_eq!(workspace::read_display_name("uuid-3").unwrap(), "predinvest");
+        assert_eq!(
+            workspace::read_display_name("uuid-3").unwrap(),
+            "predinvest"
+        );
     });
 }
 
@@ -79,7 +85,10 @@ fn read_project_reads_project_file() {
         assert_eq!(workspace::read_project("uuid-4").unwrap(), "ws-name");
         // Overwriting the project file is reflected on subsequent reads.
         fs::write(paths::project_path("uuid-4"), "different-project").unwrap();
-        assert_eq!(workspace::read_project("uuid-4").unwrap(), "different-project");
+        assert_eq!(
+            workspace::read_project("uuid-4").unwrap(),
+            "different-project"
+        );
     });
 }
 
@@ -102,7 +111,10 @@ fn rename_workspace_moves_only_the_symlink() {
         let resolved = fs::canonicalize(&new_link).unwrap();
         assert_eq!(resolved, fs::canonicalize(&data_path).unwrap());
         // The name file reflects the new name.
-        assert_eq!(workspace::read_display_name("uuid-r1").unwrap(), "predinvest-v2");
+        assert_eq!(
+            workspace::read_display_name("uuid-r1").unwrap(),
+            "predinvest-v2"
+        );
     });
 }
 
@@ -139,6 +151,9 @@ fn ensure_workspace_does_not_overwrite_existing_trajectory() {
         // Refresh fires ensure_workspace again — must NOT clobber.
         workspace::ensure_workspace("uuid-b2", "beta", "beta").unwrap();
         let content = std::fs::read_to_string(&traj_path).unwrap();
-        assert!(content.contains("my custom goal"), "must preserve user edits");
+        assert!(
+            content.contains("my custom goal"),
+            "must preserve user edits"
+        );
     });
 }

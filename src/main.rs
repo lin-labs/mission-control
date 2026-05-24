@@ -288,8 +288,7 @@ async fn run_app(
     )>(8);
 
     // Channel for `:command` results (e.g. :summarize completing).
-    let (command_tx, mut command_rx) =
-        mpsc::channel::<crate::commands::CommandResult>(8);
+    let (command_tx, mut command_rx) = mpsc::channel::<crate::commands::CommandResult>(8);
 
     let mut refresh_interval = interval(Duration::from_secs(30));
     let mut screen_interval = interval(Duration::from_secs(15));

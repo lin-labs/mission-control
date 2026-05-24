@@ -34,8 +34,7 @@ pub fn write_summary_file(surface_dir: &Path, sid: &str, summary: &str) -> Resul
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create surface dir {parent:?}"))?;
     }
-    std::fs::write(&path, summary)
-        .with_context(|| format!("write summary file {path:?}"))?;
+    std::fs::write(&path, summary).with_context(|| format!("write summary file {path:?}"))?;
     Ok(())
 }
 
@@ -51,7 +50,15 @@ fn build_prompt(inputs: &SurfaceSummaryInputs) -> String {
 
     if !inputs.recent_commands.is_empty() {
         prompt.push_str("Last 15 commands (tab-separated: ts, rc, cwd, cmd):\n");
-        for cmd in inputs.recent_commands.iter().rev().take(15).collect::<Vec<_>>().iter().rev() {
+        for cmd in inputs
+            .recent_commands
+            .iter()
+            .rev()
+            .take(15)
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+        {
             prompt.push_str(cmd);
             prompt.push('\n');
         }

@@ -30,12 +30,16 @@ pub fn matches(prefix: &str) -> Vec<&'static str> {
 
 /// Longest common prefix among the given strings, or empty if the list is empty.
 pub fn longest_common_prefix(names: &[&'static str]) -> String {
-    let Some(first) = names.first() else { return String::new() };
+    let Some(first) = names.first() else {
+        return String::new();
+    };
     let mut end = first.len();
     for s in &names[1..] {
         let mut i = 0;
         for (a, b) in first.bytes().zip(s.bytes()) {
-            if a != b { break; }
+            if a != b {
+                break;
+            }
             i += 1;
         }
         end = end.min(i);

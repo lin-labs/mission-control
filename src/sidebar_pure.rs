@@ -3,7 +3,7 @@
 /// Kept in the library crate so integration tests can reach them without
 /// pulling in the full TUI (which depends on binary-only modules).
 use ratatui::{
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 
@@ -30,7 +30,9 @@ pub fn description_subtitle_line(
     // We need at least 1 column for content.
     let indent = "  ";
     let indent_len = 2u16;
-    let max_text_cols = sidebar_inner_width.saturating_sub(indent_len).saturating_sub(1);
+    let max_text_cols = sidebar_inner_width
+        .saturating_sub(indent_len)
+        .saturating_sub(1);
     if max_text_cols == 0 {
         return None;
     }
@@ -69,6 +71,28 @@ pub fn parse_hex_color(s: &str) -> Option<Color> {
     Some(Color::Rgb(r, g, b))
 }
 
+pub fn workspace_accent_color(custom_color: Option<&str>) -> Option<Color> {
+    custom_color.and_then(parse_hex_color)
+}
+
+pub fn workspace_panel_border_style(
+    custom_color: Option<&str>,
+    focused: bool,
+    focused_fallback: Color,
+) -> Style {
+    let border_color = workspace_accent_color(custom_color).unwrap_or(if focused {
+        focused_fallback
+    } else {
+        Color::DarkGray
+    });
+
+    let mut style = Style::default().fg(border_color);
+    if focused {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    style
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,12 +103,18 @@ mod tests {
 
     #[test]
     fn parse_hex_color_accepts_well_formed_uppercase() {
-        assert_eq!(parse_hex_color("#C0392B"), Some(Color::Rgb(0xC0, 0x39, 0x2B)));
+        assert_eq!(
+            parse_hex_color("#C0392B"),
+            Some(Color::Rgb(0xC0, 0x39, 0x2B))
+        );
     }
 
     #[test]
     fn parse_hex_color_accepts_well_formed_lowercase() {
-        assert_eq!(parse_hex_color("#4a5c18"), Some(Color::Rgb(0x4a, 0x5c, 0x18)));
+        assert_eq!(
+            parse_hex_color("#4a5c18"),
+            Some(Color::Rgb(0x4a, 0x5c, 0x18))
+        );
     }
 
     #[test]
@@ -112,12 +142,24 @@ mod tests {
     }
 
     #[test]
+    fn workspace_panel_border_style_prefers_workspace_accent() {
+        let style = workspace_panel_border_style(Some("#C0392B"), false, Color::Cyan);
+        assert_eq!(style.fg, Some(Color::Rgb(0xC0, 0x39, 0x2B)));
+    }
+
+    #[test]
+    fn workspace_panel_border_style_falls_back_to_focus_color() {
+        let focused = workspace_panel_border_style(None, true, Color::Cyan);
+        let unfocused = workspace_panel_border_style(None, false, Color::Cyan);
+
+        assert_eq!(focused.fg, Some(Color::Cyan));
+        assert_eq!(unfocused.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
     fn workspace_with_description_shows_subtitle_in_dim() {
-        let line = description_subtitle_line(
-            Some("build the calibration backfill agent"),
-            40,
-        )
-        .expect("should return Some for non-empty description");
+        let line = description_subtitle_line(Some("build the calibration backfill agent"), 40)
+            .expect("should return Some for non-empty description");
 
         let text = line_text(&line);
 

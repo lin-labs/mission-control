@@ -1,10 +1,10 @@
 use crate::tui::app::WorkspaceState;
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState},
-    Frame,
 };
 
 pub fn render_sidebar(
@@ -16,10 +16,13 @@ pub fn render_sidebar(
 ) {
     // Inner width = area width minus 2 border columns.
     let inner_width = area.width.saturating_sub(2);
+    let content_width = inner_width.saturating_sub(row_edge_width());
 
     let items: Vec<ListItem> = workspaces
         .iter()
-        .map(|ws| {
+        .enumerate()
+        .map(|(idx, ws)| {
+            let is_selected = idx == selected;
             // Spinner when an async refresh is in flight, otherwise status dot
             let (leader, leader_color) = if ws.loading {
                 (spinner_frame().to_string(), Color::Cyan)
@@ -35,50 +38,58 @@ pub fn render_sidebar(
                 .map(|h| format!(" [{}]", h))
                 .unwrap_or_default();
 
-            // Tint the workspace name with cmux's user-set color when present.
-            // Falls back to white so workspaces without a color render unchanged.
-            let name_color = ws
-                .workspace
-                .custom_color
-                .as_deref()
-                .and_then(crate::sidebar_pure::parse_hex_color)
-                .unwrap_or(Color::White);
+            let accent_color =
+                crate::sidebar_pure::workspace_accent_color(ws.workspace.custom_color.as_deref());
+            let leader_text = format!("{} ", leader);
+            let display_name = truncate_for_width(
+                &ws.workspace.name,
+                content_width
+                    .saturating_sub(leader_text.chars().count() as u16)
+                    .saturating_sub(host_badge.chars().count() as u16),
+            );
 
-            let name_line = Line::from(vec![
-                Span::styled(format!("{} ", leader), Style::default().fg(leader_color)),
-                Span::styled(
-                    ws.workspace.name.clone(),
-                    Style::default()
-                        .fg(name_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(host_badge, Style::default().fg(Color::DarkGray)),
-            ]);
+            let name_line = decorate_sidebar_line(
+                Line::from(vec![
+                    Span::styled(leader_text, Style::default().fg(leader_color)),
+                    Span::styled(
+                        display_name,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(host_badge, Style::default().fg(Color::DarkGray)),
+                ]),
+                accent_color,
+            );
+            let item_style = if is_selected {
+                Style::default().bg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
 
             // Optionally render a dim description subtitle line.
             if let Some(sub) =
-                description_subtitle_line(ws.workspace.description.as_deref(), inner_width)
+                description_subtitle_line(ws.workspace.description.as_deref(), content_width)
             {
-                ListItem::new(vec![name_line, sub])
+                ListItem::new(vec![name_line, decorate_sidebar_line(sub, accent_color)])
+                    .style(item_style)
             } else {
-                ListItem::new(name_line)
+                ListItem::new(name_line).style(item_style)
             }
         })
         .collect();
 
-    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .title(" Workspaces ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color)),
-        )
-        .highlight_style(
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .bg(Color::DarkGray),
-        );
+    let border_color = if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let list = List::new(items).block(
+        Block::default()
+            .title(" Workspaces ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color)),
+    );
 
     let mut state = ListState::default();
     state.select(Some(selected));
@@ -112,7 +123,9 @@ pub fn description_subtitle_line(
     // We need at least 1 column for content.
     let indent = "  ";
     let indent_len = 2u16;
-    let max_text_cols = sidebar_inner_width.saturating_sub(indent_len).saturating_sub(1);
+    let max_text_cols = sidebar_inner_width
+        .saturating_sub(indent_len)
+        .saturating_sub(1);
     if max_text_cols == 0 {
         return None;
     }
@@ -136,9 +149,9 @@ pub fn description_subtitle_line(
 fn status_indicator(ws: &WorkspaceState) -> (&str, Color) {
     use crate::tui::app::AgentState;
     match ws.agent_state() {
-        AgentState::Working => ("\u{25cf}", Color::Green),     // ● baking
-        AgentState::NeedsMe => ("\u{26a0}", Color::Yellow),    // ⚠ needs you
-        AgentState::Idle    => ("\u{25cb}", Color::DarkGray),   // ○ nothing happening
+        AgentState::Working => ("\u{25cf}", Color::Green), // ● baking
+        AgentState::NeedsMe => ("\u{26a0}", Color::Yellow), // ⚠ needs you
+        AgentState::Idle => ("\u{25cb}", Color::DarkGray), // ○ nothing happening
     }
 }
 
@@ -150,4 +163,128 @@ pub fn spinner_frame() -> char {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     FRAMES[((ms / 80) as usize) % FRAMES.len()]
+}
+
+fn row_edge_width() -> u16 {
+    4
+}
+
+fn decorate_sidebar_line(line: Line<'static>, accent_color: Option<Color>) -> Line<'static> {
+    let mut spans = Vec::with_capacity(line.spans.len() + 2);
+
+    if let Some(color) = accent_color {
+        spans.push(Span::styled("▌ ", Style::default().fg(color)));
+    } else {
+        spans.push(Span::raw("  "));
+    }
+
+    spans.extend(line.spans);
+
+    if let Some(color) = accent_color {
+        spans.push(Span::styled(" ▐", Style::default().fg(color)));
+    } else {
+        spans.push(Span::raw("  "));
+    }
+
+    Line::from(spans)
+}
+
+fn truncate_for_width(text: &str, max_cols: u16) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+
+    let char_count = text.chars().count();
+    if char_count <= max_cols as usize {
+        return text.to_owned();
+    }
+
+    if max_cols == 1 {
+        return "…".to_string();
+    }
+
+    let truncated: String = text.chars().take(max_cols as usize - 1).collect();
+    format!("{truncated}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmux::client::Workspace;
+    use crate::tui::app::{DismissalState, RegenSchedulerState, ScreenInsights, WorkspaceState};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn test_workspace_state(name: &str, custom_color: Option<&str>) -> WorkspaceState {
+        WorkspaceState {
+            workspace: Workspace {
+                ref_id: "workspace:1".to_string(),
+                uuid: "workspace-1".to_string(),
+                name: name.to_string(),
+                selected: true,
+                description: Some("short description".to_string()),
+                current_directory: None,
+                custom_color: custom_color.map(str::to_string),
+            },
+            session: None,
+            surfaces: Vec::new(),
+            screen_preview: None,
+            screen_insights: ScreenInsights::default(),
+            tool_call_count: 0,
+            notes: None,
+            hook_status: None,
+            classification: None,
+            loading: false,
+            summary: None,
+            summarizing: false,
+            trajectory: None,
+            edit_state: None,
+            peek_state: None,
+            peek_yield_pending: false,
+            regen: RegenSchedulerState::default(),
+            dismissal: DismissalState::default(),
+        }
+    }
+
+    #[test]
+    fn render_sidebar_uses_side_accents_instead_of_name_tint() {
+        let workspaces = vec![test_workspace_state("alpha", Some("#C0392B"))];
+        let backend = TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|f| render_sidebar(f, Rect::new(0, 0, 40, 6), &workspaces, 0, true))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let mut found_name = false;
+
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .filter_map(|x| {
+                    buf.cell((x, y))
+                        .map(|c| c.symbol().chars().next().unwrap_or(' '))
+                })
+                .collect();
+
+            if row.contains("alpha") {
+                let left_bar = (0..buf.area.width)
+                    .find_map(|x| buf.cell((x, y)).filter(|cell| cell.symbol() == "▌"))
+                    .expect("left accent bar should be present");
+                assert_eq!(left_bar.style().fg, Some(Color::Rgb(0xC0, 0x39, 0x2B)));
+
+                for x in 0..buf.area.width {
+                    if let Some(cell) = buf.cell((x, y)) {
+                        if cell.symbol() == "a" {
+                            assert_eq!(cell.style().fg, Some(Color::White));
+                            assert_eq!(cell.style().bg, Some(Color::DarkGray));
+                            found_name = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(found_name, "workspace name was not rendered");
+    }
 }

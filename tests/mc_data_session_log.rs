@@ -64,23 +64,28 @@ fn latest_session_file_picks_most_recent_match() {
     fs::create_dir_all(obs.join("Sessions")).unwrap();
     // SAFETY: tests run --test-threads=1
     let prior = std::env::var_os("OBS_AGENTS");
-    unsafe { std::env::set_var("OBS_AGENTS", &obs); }
+    unsafe {
+        std::env::set_var("OBS_AGENTS", &obs);
+    }
 
     let result = std::panic::catch_unwind(|| {
         // Write 2 candidate files + 1 unrelated.
         fs::write(
             obs.join("Sessions/2026-05-23-17-a.md"),
             "---\nworkspace_id: target\n---\n\n## 17:30 PT — boyan\nold\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         fs::write(
             obs.join("Sessions/2026-05-23-18-b.md"),
             "---\nworkspace_id: target\n---\n\n## 18:00 PT — boyan\nnew\n",
-        ).unwrap();
+        )
+        .unwrap();
         fs::write(
             obs.join("Sessions/2026-05-23-19-c.md"),
             "---\nworkspace_id: other\n---\n\n## 19:00 PT — boyan\nunrelated\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         // Use empty ctx → tier 1 skipped, falls back to tier 2 (uuid match).
         let ctx = WorkspaceContext::default();
@@ -103,7 +108,9 @@ fn latest_session_file_picks_most_recent_match() {
 fn latest_session_file_returns_none_when_dir_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let prior = std::env::var_os("OBS_AGENTS");
-    unsafe { std::env::set_var("OBS_AGENTS", tmp.path().join("does-not-exist")); }
+    unsafe {
+        std::env::set_var("OBS_AGENTS", tmp.path().join("does-not-exist"));
+    }
     let result = std::panic::catch_unwind(|| {
         let ctx = WorkspaceContext::default();
         let r = session_log::latest_session_file_for_workspace("any-uuid", &ctx).unwrap();

@@ -63,7 +63,10 @@ where
                 if !is_transient_error(&e) {
                     return Err(e);
                 }
-                eprintln!("llm retry: attempt {} failed (transient): {e:?}", attempt + 1);
+                eprintln!(
+                    "llm retry: attempt {} failed (transient): {e:?}",
+                    attempt + 1
+                );
                 last_err = Some(e);
             }
         }

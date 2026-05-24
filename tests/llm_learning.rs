@@ -6,11 +6,11 @@
 /// - `produce_learning` (mocked summarizer)
 use anyhow::Result;
 use async_trait::async_trait;
-use mission_control::llm::{Summary, Summarizer};
 use mission_control::llm::learning::{
-    build_prompt, extract_candidates_section, format_as_proposals_file, produce_learning,
-    LearningInputs,
+    LearningInputs, build_prompt, extract_candidates_section, format_as_proposals_file,
+    produce_learning,
 };
+use mission_control::llm::{Summarizer, Summary};
 use std::sync::Arc;
 
 // ── Mock Summarizer ──────────────────────────────────────────────────────────
@@ -126,8 +126,14 @@ fn extract_candidates_section_returns_content() {
     let result = extract_candidates_section(response);
     assert!(result.is_some(), "should find the candidates section");
     let content = result.unwrap();
-    assert!(content.contains("build a thing"), "should contain the pattern");
-    assert!(content.contains("widget approach"), "should contain the expansion");
+    assert!(
+        content.contains("build a thing"),
+        "should contain the pattern"
+    );
+    assert!(
+        content.contains("widget approach"),
+        "should contain the expansion"
+    );
 }
 
 #[test]
@@ -145,7 +151,10 @@ fn extract_candidates_section_stops_at_next_heading() {
         !content.contains("should not be included"),
         "should not include content past next heading"
     );
-    assert!(content.contains("the trigger"), "should contain the pattern");
+    assert!(
+        content.contains("the trigger"),
+        "should contain the pattern"
+    );
 }
 
 #[test]
@@ -188,7 +197,11 @@ async fn produce_learning_returns_full_record() {
 
     let inputs = minimal_inputs();
     let result = produce_learning(&summarizer, &inputs).await;
-    assert!(result.is_ok(), "produce_learning should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "produce_learning should succeed: {:?}",
+        result.err()
+    );
 
     let outputs = result.unwrap();
     assert!(
@@ -196,7 +209,9 @@ async fn produce_learning_returns_full_record() {
         "full record should contain Goal arc section"
     );
     assert!(
-        outputs.full_record_md.contains("Prompt-optimization candidates"),
+        outputs
+            .full_record_md
+            .contains("Prompt-optimization candidates"),
         "full record should contain candidates section"
     );
     assert!(
@@ -259,5 +274,8 @@ async fn produce_learning_llm_error_propagates() {
     assert!(result.is_err(), "should propagate LLM error");
     let err = result.unwrap_err();
     let msg = format!("{:#}", err);
-    assert!(msg.contains("llm down"), "error message should be preserved: {msg}");
+    assert!(
+        msg.contains("llm down"),
+        "error message should be preserved: {msg}"
+    );
 }

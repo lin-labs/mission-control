@@ -1,11 +1,11 @@
-use super::log::{log_call, CallTimer};
+use super::log::{CallTimer, log_call};
 use super::{Summarizer, Summary};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 /// Summarizer backed by the locally-installed `codex exec` CLI.
 /// Uses the user's existing Codex authentication — no API key needed.
@@ -116,7 +116,10 @@ impl CodexSummarizer {
         if text.trim().is_empty() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stderr_short: String = stderr.lines().take(5).collect::<Vec<_>>().join(" | ");
-            anyhow::bail!("codex returned empty output. stderr: {}", stderr_short.trim());
+            anyhow::bail!(
+                "codex returned empty output. stderr: {}",
+                stderr_short.trim()
+            );
         }
 
         Ok(text)

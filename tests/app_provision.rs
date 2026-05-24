@@ -6,7 +6,9 @@ fn ensure_workspace_idempotent_across_simulated_refreshes() {
     let prior = std::env::var_os("HOME");
     // SAFETY: integration test; HOME mutation is process-global. We restore
     // it at the end. (--test-threads=1 keeps this safe across tests.)
-    unsafe { std::env::set_var("HOME", tmp.path()); }
+    unsafe {
+        std::env::set_var("HOME", tmp.path());
+    }
 
     let result = std::panic::catch_unwind(|| {
         // First "refresh"

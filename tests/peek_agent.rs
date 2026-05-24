@@ -35,7 +35,9 @@ fn resolve_falls_back_to_workspace_log_when_no_pointer() {
 
     let prior_obs = std::env::var_os("OBS_AGENTS");
     // SAFETY: test runs with --test-threads=1
-    unsafe { std::env::set_var("OBS_AGENTS", &obs); }
+    unsafe {
+        std::env::set_var("OBS_AGENTS", &obs);
+    }
 
     let result = std::panic::catch_unwind(|| {
         // No pointer file will exist for this UUID (it's a made-up UUID).
@@ -44,9 +46,15 @@ fn resolve_falls_back_to_workspace_log_when_no_pointer() {
         let ctx = WorkspaceContext::default();
         let resolved = session_log::resolve_session_log_for_surface(uuid, "sid-no-pointer", &ctx)
             .expect("resolve should not error");
-        assert!(resolved.is_some(), "expected Some from workspace-level fallback");
+        assert!(
+            resolved.is_some(),
+            "expected Some from workspace-level fallback"
+        );
         let text = fs::read_to_string(resolved.unwrap()).unwrap();
-        assert!(text.contains("fallback-question"), "session log content mismatch");
+        assert!(
+            text.contains("fallback-question"),
+            "session log content mismatch"
+        );
     });
 
     match prior_obs {
@@ -67,7 +75,9 @@ fn resolve_returns_none_when_no_log_exists() {
 
     let prior_obs = std::env::var_os("OBS_AGENTS");
     // SAFETY: test runs with --test-threads=1
-    unsafe { std::env::set_var("OBS_AGENTS", &obs); }
+    unsafe {
+        std::env::set_var("OBS_AGENTS", &obs);
+    }
 
     let result = std::panic::catch_unwind(|| {
         let ctx = WorkspaceContext::default();
@@ -77,7 +87,10 @@ fn resolve_returns_none_when_no_log_exists() {
             &ctx,
         )
         .expect("resolve should not error");
-        assert!(resolved.is_none(), "expected None → Shell source when no session log");
+        assert!(
+            resolved.is_none(),
+            "expected None → Shell source when no session log"
+        );
     });
 
     match prior_obs {
@@ -133,7 +146,9 @@ fn resolve_returns_most_recent_session_log() {
 
     let prior_obs = std::env::var_os("OBS_AGENTS");
     // SAFETY: test runs with --test-threads=1
-    unsafe { std::env::set_var("OBS_AGENTS", &obs); }
+    unsafe {
+        std::env::set_var("OBS_AGENTS", &obs);
+    }
 
     let result = std::panic::catch_unwind(|| {
         let ctx = WorkspaceContext::default();

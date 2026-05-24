@@ -44,23 +44,25 @@ pub fn finalize(
 
     // 3. Proposals file (non-fatal inner; if a write fails we skip the file but
     //    do not abort the whole dismissal — the full record is still in obsidian).
-    let proposals_file = proposal_md_content.map(|content| {
-        let dir = obs_root
-            .join("Projects")
-            .join(&project)
-            .join("prompts")
-            .join("proposals");
-        if let Err(e) = fs::create_dir_all(&dir) {
-            eprintln!("dismissal: create proposals dir {dir:?}: {e}");
-            return None;
-        }
-        let path = dir.join(format!("{date}-{display_name}.md"));
-        if let Err(e) = fs::write(&path, content) {
-            eprintln!("dismissal: write proposals {path:?}: {e}");
-            return None;
-        }
-        Some(path)
-    }).flatten();
+    let proposals_file = proposal_md_content
+        .map(|content| {
+            let dir = obs_root
+                .join("Projects")
+                .join(&project)
+                .join("prompts")
+                .join("proposals");
+            if let Err(e) = fs::create_dir_all(&dir) {
+                eprintln!("dismissal: create proposals dir {dir:?}: {e}");
+                return None;
+            }
+            let path = dir.join(format!("{date}-{display_name}.md"));
+            if let Err(e) = fs::write(&path, content) {
+                eprintln!("dismissal: write proposals {path:?}: {e}");
+                return None;
+            }
+            Some(path)
+        })
+        .flatten();
 
     // ── Point of no return ───────────────────────────────────────────────────
 

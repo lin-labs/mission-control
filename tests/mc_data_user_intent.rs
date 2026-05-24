@@ -1,8 +1,8 @@
 use mission_control::mc_data::events::{self, Event, Kind, Source};
 use mission_control::mc_data::paths;
-use mission_control::mc_data::trajectory::{Item, Section, TrajectoryDoc, SECTION_TASKS};
+use mission_control::mc_data::trajectory::{Item, SECTION_TASKS, Section, TrajectoryDoc};
 use mission_control::mc_data::user_intent::{
-    apply_to_tasks, load_for_workspace, normalize_text, UserIntent,
+    UserIntent, apply_to_tasks, load_for_workspace, normalize_text,
 };
 use std::fs;
 

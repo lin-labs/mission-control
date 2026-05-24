@@ -22,12 +22,7 @@ pub fn log_path() -> PathBuf {
 /// Append a single JSON line to the LLM call log.
 /// `service` is e.g. "codex", "openai", "typesafe".
 /// `result` is Ok(output) or Err(error_message).
-pub fn log_call(
-    service: &str,
-    input: &str,
-    result: Result<&str, &str>,
-    duration_ms: u128,
-) {
+pub fn log_call(service: &str, input: &str, result: Result<&str, &str>, duration_ms: u128) {
     let path = log_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -70,7 +65,9 @@ pub struct CallTimer {
 
 impl CallTimer {
     pub fn start() -> Self {
-        Self { start: Instant::now() }
+        Self {
+            start: Instant::now(),
+        }
     }
     pub fn ms(&self) -> u128 {
         self.start.elapsed().as_millis()

@@ -1,9 +1,8 @@
 /// Integration tests for surface summary prompt building and writing.
-
 use anyhow::Result;
 use async_trait::async_trait;
-use mission_control::llm::{Summary, Summarizer};
-use mission_control::llm::surface_summary::{summarize, write_summary_file, SurfaceSummaryInputs};
+use mission_control::llm::surface_summary::{SurfaceSummaryInputs, summarize, write_summary_file};
+use mission_control::llm::{Summarizer, Summary};
 use std::sync::Arc;
 
 // ── Mock Summarizer ──────────────────────────────────────────────────────────
@@ -37,9 +36,7 @@ async fn summarize_returns_non_empty_string() {
     let inputs = SurfaceSummaryInputs {
         kind: "shell".to_string(),
         cwd: "~/projects/my-app".to_string(),
-        recent_commands: vec![
-            "1234\t0\t~/projects/my-app\tcargo test".to_string(),
-        ],
+        recent_commands: vec!["1234\t0\t~/projects/my-app\tcargo test".to_string()],
     };
 
     let result = summarize(&summarizer, &inputs).await;
@@ -64,7 +61,10 @@ async fn summarize_truncates_to_80_chars() {
 
     let result = summarize(&summarizer, &inputs).await;
     assert!(result.is_ok());
-    assert!(result.unwrap().len() <= 80, "summary must be truncated to 80 chars");
+    assert!(
+        result.unwrap().len() <= 80,
+        "summary must be truncated to 80 chars"
+    );
 }
 
 #[tokio::test]
@@ -106,5 +106,8 @@ fn write_summary_file_overwrites_existing() {
     write_summary_file(surfaces_dir, "sid-xyz", "second summary").unwrap();
 
     let content = std::fs::read_to_string(surfaces_dir.join("sid-xyz.summary")).unwrap();
-    assert_eq!(content, "second summary", "should overwrite with newer summary");
+    assert_eq!(
+        content, "second summary",
+        "should overwrite with newer summary"
+    );
 }

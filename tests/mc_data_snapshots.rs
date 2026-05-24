@@ -35,7 +35,10 @@ fn write_snapshot_creates_file_with_markdown() {
         let contents = std::fs::read_to_string(&path).expect("read snapshot");
         // The markdown output should contain the section headers.
         assert!(contents.contains("## Goal"), "contents: {contents}");
-        assert!(contents.contains("## Tasks & Progress"), "contents: {contents}");
+        assert!(
+            contents.contains("## Tasks & Progress"),
+            "contents: {contents}"
+        );
     });
 }
 

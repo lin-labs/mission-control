@@ -20,8 +20,14 @@ fn mc_help_shows_subcommands() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}\n{stderr}");
-    assert!(combined.contains("resolve"), "help should mention `resolve` subcommand. stdout={stdout} stderr={stderr}");
-    assert!(combined.contains("setup"), "help should mention `setup` subcommand. stdout={stdout} stderr={stderr}");
+    assert!(
+        combined.contains("resolve"),
+        "help should mention `resolve` subcommand. stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        combined.contains("setup"),
+        "help should mention `setup` subcommand. stdout={stdout} stderr={stderr}"
+    );
 }
 
 #[test]
@@ -33,7 +39,9 @@ fn mc_resolve_prints_workspace_dir() {
         .expect("run resolve");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.trim().ends_with("data/mission-control/.data/abc-123"),
+        stdout
+            .trim()
+            .ends_with("data/mission-control/.data/abc-123"),
         "expected resolve to end with .data/abc-123, got stdout={stdout:?}"
     );
 }
@@ -77,10 +85,17 @@ fn mc_setup_creates_histories_symlinks() {
         .arg("setup")
         .output()
         .expect("run setup");
-    assert!(output.status.success(), "setup failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "setup failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let sessions = obs_root.join("Sessions");
-    assert!(sessions.is_dir(), "Sessions dir should be created at {sessions:?}");
+    assert!(
+        sessions.is_dir(),
+        "Sessions dir should be created at {sessions:?}"
+    );
 
     for tool in &[".claude/histories", ".codex/histories"] {
         let link = home.join(tool);
@@ -98,15 +113,29 @@ fn mc_setup_is_idempotent_on_histories_symlinks() {
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&obs_root).unwrap();
     std::fs::create_dir_all(&home).unwrap();
-    let env = [("HOME", home.to_str().unwrap()), ("OBS_AGENTS", obs_root.to_str().unwrap())];
+    let env = [
+        ("HOME", home.to_str().unwrap()),
+        ("OBS_AGENTS", obs_root.to_str().unwrap()),
+    ];
     // First run — creates everything.
-    let r1 = Command::new(mc_bin()).envs(env).arg("setup").output().unwrap();
+    let r1 = Command::new(mc_bin())
+        .envs(env)
+        .arg("setup")
+        .output()
+        .unwrap();
     assert!(r1.status.success());
     // Second run — must not error, must not duplicate work.
-    let r2 = Command::new(mc_bin()).envs(env).arg("setup").output().unwrap();
+    let r2 = Command::new(mc_bin())
+        .envs(env)
+        .arg("setup")
+        .output()
+        .unwrap();
     assert!(r2.status.success());
     // Symlinks still correct.
     for tool in &[".claude/histories", ".codex/histories"] {
-        assert_eq!(std::fs::read_link(home.join(tool)).unwrap(), obs_root.join("Sessions"));
+        assert_eq!(
+            std::fs::read_link(home.join(tool)).unwrap(),
+            obs_root.join("Sessions")
+        );
     }
 }

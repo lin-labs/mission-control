@@ -28,7 +28,13 @@ pub fn status_dir() -> PathBuf {
 fn workspace_slug(name: &str) -> String {
     let slug: String = name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     slug.trim_matches('-').to_string()
 }
@@ -115,17 +121,13 @@ pub fn parse_screen_insights(screen: &str) -> ScreenInsights {
     let mut found_divider = false;
     for i in (0..lines.len()).rev() {
         let trimmed = lines[i].trim();
-        let is_pure_divider =
-            !trimmed.is_empty() && trimmed.chars().all(|c| c == '─');
+        let is_pure_divider = !trimmed.is_empty() && trimmed.chars().all(|c| c == '─');
         if is_pure_divider {
             input_area_start = i;
             found_divider = true;
         } else if found_divider {
             // Inside the input area block - skip prompts, status bars, empty lines
-            if trimmed.starts_with('⏵')
-                || trimmed.starts_with('❯')
-                || trimmed.is_empty()
-            {
+            if trimmed.starts_with('⏵') || trimmed.starts_with('❯') || trimmed.is_empty() {
                 continue;
             }
             // Hit a real content line above the input area
@@ -143,8 +145,22 @@ pub fn parse_screen_insights(screen: &str) -> ScreenInsights {
         let first_char = trimmed.chars().next().unwrap_or(' ');
         let is_spinner = !first_char.is_ascii_alphanumeric()
             && !first_char.is_ascii_whitespace()
-            && !matches!(first_char, '─' | '│' | '⏵' | '└' | '├' | '⎿' | '⏺' | '●'
-                         | '▸' | '▹' | '►' | '▶' | '›' | '❯');
+            && !matches!(
+                first_char,
+                '─' | '│'
+                    | '⏵'
+                    | '└'
+                    | '├'
+                    | '⎿'
+                    | '⏺'
+                    | '●'
+                    | '▸'
+                    | '▹'
+                    | '►'
+                    | '▶'
+                    | '›'
+                    | '❯'
+            );
         if is_spinner
             && !trimmed.contains("ctrl+")
             && !trimmed.contains("lines (")
@@ -242,8 +258,22 @@ pub fn parse_screen_insights(screen: &str) -> ScreenInsights {
         let first_char = trimmed.chars().next().unwrap_or(' ');
         let is_spinner_line = !first_char.is_ascii_alphanumeric()
             && !first_char.is_ascii_whitespace()
-            && !matches!(first_char, '─' | '│' | '⏵' | '└' | '├' | '⎿' | '⏺' | '●'
-                         | '▸' | '▹' | '►' | '▶' | '›' | '❯');
+            && !matches!(
+                first_char,
+                '─' | '│'
+                    | '⏵'
+                    | '└'
+                    | '├'
+                    | '⎿'
+                    | '⏺'
+                    | '●'
+                    | '▸'
+                    | '▹'
+                    | '►'
+                    | '▶'
+                    | '›'
+                    | '❯'
+            );
 
         if is_spinner_line {
             // Skip Claude Code collapse markers like "… +301 lines (ctrl+o to expand)"
@@ -258,7 +288,8 @@ pub fn parse_screen_insights(screen: &str) -> ScreenInsights {
                 }
             }
             // Completed: "✻ Cooked for 11m 29s"
-            else if trimmed.contains(" for ") && trimmed.contains('s') && !trimmed.contains('…') {
+            else if trimmed.contains(" for ") && trimmed.contains('s') && !trimmed.contains('…')
+            {
                 insights.activity = Some(trimmed.to_string());
                 if let Some(dur) = extract_duration(trimmed) {
                     insights.duration = Some(dur);
@@ -335,9 +366,15 @@ pub fn parse_screen_insights(screen: &str) -> ScreenInsights {
     // --- Agent detection from screen content ---
     // Detect agent from tmux status bars and model status lines.
     let full_lower = screen.to_lowercase();
-    if full_lower.contains(":claude") || full_lower.contains("\"claude") || full_lower.contains("claude code") {
+    if full_lower.contains(":claude")
+        || full_lower.contains("\"claude")
+        || full_lower.contains("claude code")
+    {
         insights.agent = Some("claude".to_string());
-    } else if full_lower.contains(":codex") || full_lower.contains("\"codex") || full_lower.contains("gpt-") {
+    } else if full_lower.contains(":codex")
+        || full_lower.contains("\"codex")
+        || full_lower.contains("gpt-")
+    {
         insights.agent = Some("codex".to_string());
     } else if full_lower.contains(":opencode") || full_lower.contains("\"opencode") {
         insights.agent = Some("opencode".to_string());
@@ -351,7 +388,9 @@ fn extract_duration(text: &str) -> Option<String> {
     // Match patterns like "Worked for 6m 00s", "Crunched for 54s", or "(18m 31s · ...)"
     if let Some(pos) = text.find("for ") {
         let after = &text[pos + 4..];
-        let end = after.find(|c: char| c == '─' || c == ')' || c == '·').unwrap_or(after.len());
+        let end = after
+            .find(|c: char| c == '─' || c == ')' || c == '·')
+            .unwrap_or(after.len());
         let dur = after[..end].trim();
         if dur.contains('s') || dur.contains('m') || dur.contains('h') {
             return Some(dur.to_string());
@@ -448,9 +487,15 @@ impl WorkspaceState {
         // Check surface titles
         for s in &self.surfaces {
             let t = s.title.to_lowercase();
-            if t.contains("claude") { return "claude"; }
-            if t.contains("codex") { return "codex"; }
-            if t.contains("opencode") { return "opencode"; }
+            if t.contains("claude") {
+                return "claude";
+            }
+            if t.contains("codex") {
+                return "codex";
+            }
+            if t.contains("opencode") {
+                return "opencode";
+            }
         }
         ""
     }
@@ -667,7 +712,10 @@ impl App {
             .map(|ws| (ws.workspace.uuid.clone(), ws.summary.clone()))
             .collect();
         // Preserve editing state across refreshes so cursor position is remembered.
-        let old_edit_states: HashMap<String, Option<crate::tui::trajectory_edit::TrajectoryEditState>> = self
+        let old_edit_states: HashMap<
+            String,
+            Option<crate::tui::trajectory_edit::TrajectoryEditState>,
+        > = self
             .workspaces
             .iter()
             .map(|ws| (ws.workspace.uuid.clone(), ws.edit_state.clone()))
@@ -695,11 +743,11 @@ impl App {
         // editing or peeking. Reloading mid-edit would clobber the
         // in-flight item that `enter_insert_mode` auto-created in memory
         // but never persisted to disk.
-        let old_trajectories: HashMap<String, Option<crate::mc_data::trajectory::TrajectoryDoc>> = self
-            .workspaces
-            .iter()
-            .map(|ws| (ws.workspace.uuid.clone(), ws.trajectory.clone()))
-            .collect();
+        let old_trajectories: HashMap<String, Option<crate::mc_data::trajectory::TrajectoryDoc>> =
+            self.workspaces
+                .iter()
+                .map(|ws| (ws.workspace.uuid.clone(), ws.trajectory.clone()))
+                .collect();
 
         self.workspaces = workspaces
             .into_iter()
@@ -710,15 +758,12 @@ impl App {
                 let screen_preview = old_previews.get(&ws.uuid).cloned().flatten();
                 // Reuse existing insights (parsed from full 100-line capture)
                 // rather than re-parsing from the truncated 15-line preview
-                let screen_insights = old_insights.get(&ws.uuid).cloned()
-                    .unwrap_or_default();
+                let screen_insights = old_insights.get(&ws.uuid).cloned().unwrap_or_default();
                 // Provision the per-workspace data dir + display symlink.
                 // Non-fatal: log to stderr and continue so mc-tui never
                 // crashes just because the home dir is unwriteable.
                 if let Err(e) = crate::mc_data::workspace::ensure_workspace(
-                    &ws.uuid,
-                    &ws.name,
-                    &ws.name, // project defaults to name for now
+                    &ws.uuid, &ws.name, &ws.name, // project defaults to name for now
                 ) {
                     eprintln!("ensure_workspace({}): {e:?}", &ws.uuid);
                 }
@@ -740,7 +785,9 @@ impl App {
                     let in_insert = old_edit_states
                         .get(&ws.uuid)
                         .and_then(|s| s.as_ref())
-                        .map(|s| matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. }))
+                        .map(|s| {
+                            matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. })
+                        })
                         .unwrap_or(false);
                     let in_peek = old_peek_states
                         .get(&ws.uuid)
@@ -749,10 +796,7 @@ impl App {
                     in_insert || in_peek
                 };
                 let trajectory = if is_actively_user_owned {
-                    old_trajectories
-                        .get(&ws.uuid)
-                        .cloned()
-                        .flatten()
+                    old_trajectories.get(&ws.uuid).cloned().flatten()
                 } else {
                     let traj_path = crate::mc_data::paths::trajectory_path(&ws.uuid);
                     if traj_path.exists() {
@@ -766,10 +810,7 @@ impl App {
                 let summary = old_summaries.get(&ws.uuid).cloned().flatten();
                 let edit_state = old_edit_states.get(&ws.uuid).cloned().flatten();
                 let peek_state = old_peek_states.get(&ws.uuid).cloned().flatten();
-                let regen = old_regen_states
-                    .get(&ws.uuid)
-                    .cloned()
-                    .unwrap_or_default();
+                let regen = old_regen_states.get(&ws.uuid).cloned().unwrap_or_default();
                 let dismissal = old_dismissal_states
                     .get(&ws.uuid)
                     .cloned()
@@ -857,10 +898,7 @@ impl App {
             if goal_items.is_empty() {
                 continue;
             }
-            doc.replace_section_items(
-                crate::mc_data::trajectory::SECTION_GOAL,
-                goal_items,
-            );
+            doc.replace_section_items(crate::mc_data::trajectory::SECTION_GOAL, goal_items);
             let traj_path = crate::mc_data::paths::trajectory_path(&ws_state.workspace.uuid);
             if let Err(e) = doc.save_to_file(&traj_path) {
                 eprintln!(
@@ -890,7 +928,9 @@ impl App {
             {
                 continue;
             }
-            let Some(ref mut doc) = ws_state.trajectory else { continue };
+            let Some(ref mut doc) = ws_state.trajectory else {
+                continue;
+            };
 
             // Build the new item list from the surfaces vec.
             // Each surface item uses the workspace ref_id as surface_id because
@@ -1029,11 +1069,7 @@ impl App {
             self.workspaces[idx].session = Some(sf);
         }
 
-        if bullets_changed {
-            Some(ws_id)
-        } else {
-            None
-        }
+        if bullets_changed { Some(ws_id) } else { None }
     }
 
     pub fn selected_workspace(&self) -> Option<&WorkspaceState> {
@@ -1054,7 +1090,13 @@ impl App {
         let idx = self.selected;
         if let Some(ws) = self.workspaces.get_mut(idx) {
             ws.loading = true;
-            spawn_screen_task(ws.workspace.uuid.clone(), ws.workspace.ref_id.clone(), client, classifier, tx);
+            spawn_screen_task(
+                ws.workspace.uuid.clone(),
+                ws.workspace.ref_id.clone(),
+                client,
+                classifier,
+                tx,
+            );
         }
     }
 
@@ -1155,9 +1197,7 @@ impl App {
         }
         let traj_path = crate::mc_data::paths::trajectory_path(uuid);
         if traj_path.exists() {
-            if let Ok(doc) =
-                crate::mc_data::trajectory::TrajectoryDoc::load_from_file(&traj_path)
-            {
+            if let Ok(doc) = crate::mc_data::trajectory::TrajectoryDoc::load_from_file(&traj_path) {
                 self.workspaces[idx].trajectory = Some(doc);
             }
         }
@@ -1336,8 +1376,7 @@ impl App {
         // Before persist: apply human stickiness so agent regen cannot
         // un-check what the user checked, re-check what they unchecked,
         // or re-add what they deleted.
-        let intent = crate::mc_data::user_intent::load_for_workspace(uuid)
-            .unwrap_or_default();
+        let intent = crate::mc_data::user_intent::load_for_workspace(uuid).unwrap_or_default();
         crate::mc_data::user_intent::apply_to_tasks(&mut doc, &intent);
 
         // Persist to disk — non-fatal on error.
@@ -1386,9 +1425,11 @@ impl App {
                     true
                 } else {
                     // Compare mtimes — if log is newer, re-summarize.
-                    let log_mtime = std::fs::metadata(&log_path).ok()
+                    let log_mtime = std::fs::metadata(&log_path)
+                        .ok()
                         .and_then(|m| m.modified().ok());
-                    let summary_mtime = std::fs::metadata(&summary_path).ok()
+                    let summary_mtime = std::fs::metadata(&summary_path)
+                        .ok()
                         .and_then(|m| m.modified().ok());
                     match (log_mtime, summary_mtime) {
                         (Some(lm), Some(sm)) => lm > sm,
@@ -1407,7 +1448,9 @@ impl App {
     pub fn apply_surface_summary(&mut self, uuid: &str, sid: &str, summary: String) {
         // Write to disk immediately; the in-memory value is in the .summary file.
         let surfaces_dir = crate::mc_data::paths::surfaces_dir(uuid);
-        if let Err(e) = crate::llm::surface_summary::write_summary_file(&surfaces_dir, sid, &summary) {
+        if let Err(e) =
+            crate::llm::surface_summary::write_summary_file(&surfaces_dir, sid, &summary)
+        {
             eprintln!("apply_surface_summary({uuid}/{sid}): {e:?}");
         }
     }
@@ -1438,12 +1481,24 @@ impl App {
             if ws.peek_state.is_some() {
                 let peek = ws.peek_state.as_mut().unwrap();
                 match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => { peek.scroll_down(); }
-                    KeyCode::Char('k') | KeyCode::Up   => { peek.scroll_up(); }
-                    KeyCode::Char(' ')                  => { peek.page_down(); }
-                    KeyCode::Char('-')                  => { peek.page_up(); }
-                    KeyCode::Char('g')                  => { peek.go_top(); }
-                    KeyCode::Char('G')                  => { peek.go_bottom(); }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        peek.scroll_down();
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        peek.scroll_up();
+                    }
+                    KeyCode::Char(' ') => {
+                        peek.page_down();
+                    }
+                    KeyCode::Char('-') => {
+                        peek.page_up();
+                    }
+                    KeyCode::Char('g') => {
+                        peek.go_top();
+                    }
+                    KeyCode::Char('G') => {
+                        peek.go_bottom();
+                    }
                     KeyCode::Esc => {
                         // Exit peek mode — back to trajectory nav.
                         ws.peek_state = None;
@@ -1471,9 +1526,9 @@ impl App {
             None => return vec![],
         };
         // Lazily initialise edit_state when first needed.
-        let state = ws.edit_state.get_or_insert_with(|| {
-            crate::tui::trajectory_edit::TrajectoryEditState::default()
-        });
+        let state = ws
+            .edit_state
+            .get_or_insert_with(|| crate::tui::trajectory_edit::TrajectoryEditState::default());
 
         // ── Nav mode + Enter on a Current surfaces row → enter peek ─────────
         use crate::mc_data::trajectory::SECTION_CURRENT_SURFACES;
@@ -1501,9 +1556,8 @@ impl App {
                         })
                         .unwrap_or_else(|| ws.workspace.ref_id.clone());
                     // Detect Agent vs Shell source using the two-step resolver.
-                    let surface_id_for_lookup = item
-                        .and_then(|i| i.surface_id.as_deref())
-                        .unwrap_or("");
+                    let surface_id_for_lookup =
+                        item.and_then(|i| i.surface_id.as_deref()).unwrap_or("");
                     let peek_ctx = crate::mc_data::session_log::WorkspaceContext {
                         host: Some(hostname_short()),
                         cwd: ws.workspace.current_directory.clone(),
@@ -1513,7 +1567,9 @@ impl App {
                         surface_id_for_lookup,
                         &peek_ctx,
                     ) {
-                        Ok(Some(path)) => crate::tui::peek_view::PeekSource::Agent { session_path: path },
+                        Ok(Some(path)) => {
+                            crate::tui::peek_view::PeekSource::Agent { session_path: path }
+                        }
                         _ => crate::tui::peek_view::PeekSource::Shell,
                     };
                     ws.peek_state = Some(crate::tui::peek_view::PeekState::new(
@@ -1538,7 +1594,8 @@ impl App {
         if ws.peek_yield_pending {
             ws.peek_yield_pending = false;
             // After yielding, clear peek state (the user is going to work there).
-            let ref_id = ws.peek_state
+            let ref_id = ws
+                .peek_state
                 .as_ref()
                 .map(|p| p.surface_ref.clone())
                 .unwrap_or_else(|| ws.workspace.ref_id.clone());
@@ -1584,9 +1641,15 @@ impl App {
     /// display buffer. Called from the main loop instead of the cmux read-screen
     /// path when `peek.uses_cmux_screen()` is false.
     pub fn refresh_agent_peek_buffer(&mut self, uuid: &str) {
-        let Some(&idx) = self.workspace_index.get(uuid) else { return };
-        let Some(peek) = self.workspaces[idx].peek_state.as_mut() else { return };
-        let crate::tui::peek_view::PeekSource::Agent { session_path } = &peek.source else { return };
+        let Some(&idx) = self.workspace_index.get(uuid) else {
+            return;
+        };
+        let Some(peek) = self.workspaces[idx].peek_state.as_mut() else {
+            return;
+        };
+        let crate::tui::peek_view::PeekSource::Agent { session_path } = &peek.source else {
+            return;
+        };
         let session_path = session_path.clone();
         crate::tui::peek_view::rebuild_agent_buffer(peek, &session_path);
     }
@@ -1939,7 +2002,7 @@ fn spawn_screen_task(
     tx: tokio::sync::mpsc::UnboundedSender<ScreenUpdate>,
 ) {
     tokio::spawn(async move {
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
         let screen = timeout(Duration::from_secs(3), client.read_screen(&ref_id, 100))
             .await
             .ok()
@@ -2184,7 +2247,9 @@ workspace: test-ws
     fn enter_on_current_surfaces_row_enters_peek_mode() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
         // Navigate to section 1 (Current surfaces), item 0.
-        let state = app.workspaces[0].edit_state.get_or_insert_with(Default::default);
+        let state = app.workspaces[0]
+            .edit_state
+            .get_or_insert_with(Default::default);
         state.cursor_section = 1;
         state.cursor_item = 0;
 
@@ -2199,7 +2264,9 @@ workspace: test-ws
     #[test]
     fn enter_on_current_surfaces_row_uses_surface_id() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
-        let state = app.workspaces[0].edit_state.get_or_insert_with(Default::default);
+        let state = app.workspaces[0]
+            .edit_state
+            .get_or_insert_with(Default::default);
         state.cursor_section = 1;
         state.cursor_item = 0;
 
@@ -2215,7 +2282,9 @@ workspace: test-ws
     #[test]
     fn enter_on_current_surfaces_row_falls_back_to_workspace_ref() {
         let mut app = make_app(SAMPLE_NO_SURFACE_ID);
-        let state = app.workspaces[0].edit_state.get_or_insert_with(Default::default);
+        let state = app.workspaces[0]
+            .edit_state
+            .get_or_insert_with(Default::default);
         state.cursor_section = 1;
         state.cursor_item = 0;
 
@@ -2234,9 +2303,11 @@ workspace: test-ws
     fn esc_in_peek_mode_clears_peek_state() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
         // Put app into peek mode manually.
-        app.workspaces[0].peek_state = Some(
-            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string(), crate::tui::peek_view::PeekSource::Shell)
-        );
+        app.workspaces[0].peek_state = Some(crate::tui::peek_view::PeekState::new(
+            "workspace:3".to_string(),
+            "test".to_string(),
+            crate::tui::peek_view::PeekSource::Shell,
+        ));
 
         app.handle_trajectory_key(key(KeyCode::Esc));
 
@@ -2251,8 +2322,11 @@ workspace: test-ws
     #[test]
     fn j_in_peek_mode_scrolls_down() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
-        let mut ps =
-            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string(), crate::tui::peek_view::PeekSource::Shell);
+        let mut ps = crate::tui::peek_view::PeekState::new(
+            "workspace:3".to_string(),
+            "test".to_string(),
+            crate::tui::peek_view::PeekSource::Shell,
+        );
         // Fill buffer so scrolling has room.
         for i in 0..50 {
             ps.screen_buffer.push(format!("line {i}"));
@@ -2268,8 +2342,11 @@ workspace: test-ws
     #[test]
     fn k_in_peek_mode_scrolls_up() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
-        let mut ps =
-            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string(), crate::tui::peek_view::PeekSource::Shell);
+        let mut ps = crate::tui::peek_view::PeekState::new(
+            "workspace:3".to_string(),
+            "test".to_string(),
+            crate::tui::peek_view::PeekSource::Shell,
+        );
         for i in 0..50 {
             ps.screen_buffer.push(format!("line {i}"));
         }
@@ -2287,8 +2364,11 @@ workspace: test-ws
     #[test]
     fn g_in_peek_mode_goes_to_top() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
-        let mut ps =
-            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string(), crate::tui::peek_view::PeekSource::Shell);
+        let mut ps = crate::tui::peek_view::PeekState::new(
+            "workspace:3".to_string(),
+            "test".to_string(),
+            crate::tui::peek_view::PeekSource::Shell,
+        );
         for i in 0..50 {
             ps.screen_buffer.push(format!("line {i}"));
         }
@@ -2304,8 +2384,11 @@ workspace: test-ws
     #[test]
     fn big_g_in_peek_mode_goes_to_bottom() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
-        let mut ps =
-            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string(), crate::tui::peek_view::PeekSource::Shell);
+        let mut ps = crate::tui::peek_view::PeekState::new(
+            "workspace:3".to_string(),
+            "test".to_string(),
+            crate::tui::peek_view::PeekSource::Shell,
+        );
         for i in 0..30 {
             ps.screen_buffer.push(format!("line {i}"));
         }
@@ -2326,9 +2409,11 @@ workspace: test-ws
     #[test]
     fn enter_in_peek_mode_sets_yield_pending() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
-        app.workspaces[0].peek_state = Some(
-            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string(), crate::tui::peek_view::PeekSource::Shell)
-        );
+        app.workspaces[0].peek_state = Some(crate::tui::peek_view::PeekState::new(
+            "workspace:3".to_string(),
+            "test".to_string(),
+            crate::tui::peek_view::PeekSource::Shell,
+        ));
 
         app.handle_trajectory_key(key(KeyCode::Enter));
 
@@ -2343,29 +2428,39 @@ workspace: test-ws
     #[test]
     fn take_peek_yield_returns_ref_id_and_clears_peek() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
-        app.workspaces[0].peek_state = Some(
-            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string(), crate::tui::peek_view::PeekSource::Shell)
-        );
+        app.workspaces[0].peek_state = Some(crate::tui::peek_view::PeekState::new(
+            "workspace:3".to_string(),
+            "test".to_string(),
+            crate::tui::peek_view::PeekSource::Shell,
+        ));
         app.workspaces[0].peek_yield_pending = true;
 
         let ref_id = app.take_peek_yield();
 
         assert_eq!(ref_id, Some("workspace:3".to_string()));
-        assert!(app.workspaces[0].peek_state.is_none(), "peek_state cleared on yield");
+        assert!(
+            app.workspaces[0].peek_state.is_none(),
+            "peek_state cleared on yield"
+        );
         assert!(!app.workspaces[0].peek_yield_pending, "flag cleared");
     }
 
     #[test]
     fn take_peek_yield_returns_none_when_not_pending() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
-        app.workspaces[0].peek_state = Some(
-            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string(), crate::tui::peek_view::PeekSource::Shell)
-        );
+        app.workspaces[0].peek_state = Some(crate::tui::peek_view::PeekState::new(
+            "workspace:3".to_string(),
+            "test".to_string(),
+            crate::tui::peek_view::PeekSource::Shell,
+        ));
         // peek_yield_pending is false (default)
 
         let ref_id = app.take_peek_yield();
         assert!(ref_id.is_none());
-        assert!(app.workspaces[0].peek_state.is_some(), "peek_state unchanged");
+        assert!(
+            app.workspaces[0].peek_state.is_some(),
+            "peek_state unchanged"
+        );
     }
 
     // ── Regen scheduler ───────────────────────────────────────────────────────
@@ -2376,7 +2471,9 @@ workspace: test-ws
         // Set up enough events to trigger event-threshold regen.
         app.workspaces[0].regen.events_since_last_regen = 15;
         // Put workspace into insert mode.
-        let state = app.workspaces[0].edit_state.get_or_insert_with(Default::default);
+        let state = app.workspaces[0]
+            .edit_state
+            .get_or_insert_with(Default::default);
         state.mode = crate::tui::trajectory_edit::EditMode::Insert {
             focus: crate::tui::trajectory_edit::InsertFocus::Item,
         };
@@ -2480,7 +2577,9 @@ workspace: test-ws
             "last_regen_at should be set after regen"
         );
         // Verify the trajectory was actually replaced.
-        let goal_items = ws.trajectory.as_ref()
+        let goal_items = ws
+            .trajectory
+            .as_ref()
             .and_then(|d| d.section("Goal"))
             .map(|s| s.items.iter().map(|i| i.text.clone()).collect::<Vec<_>>())
             .unwrap_or_default();
@@ -2497,7 +2596,9 @@ workspace: test-ws
         let mut app = make_app(SAMPLE_WITH_SURFACE);
         app.workspaces[0].regen.regen_in_flight = true;
         // Enter insert mode.
-        let state = app.workspaces[0].edit_state.get_or_insert_with(Default::default);
+        let state = app.workspaces[0]
+            .edit_state
+            .get_or_insert_with(Default::default);
         state.mode = crate::tui::trajectory_edit::EditMode::Insert {
             focus: crate::tui::trajectory_edit::InsertFocus::Item,
         };
@@ -2512,7 +2613,9 @@ workspace: test-ws
             "in_flight flag cleared even when skipping due to insert mode"
         );
         // Trajectory should NOT be replaced.
-        let goal_items = app.workspaces[0].trajectory.as_ref()
+        let goal_items = app.workspaces[0]
+            .trajectory
+            .as_ref()
             .and_then(|d| d.section("Goal"))
             .map(|s| s.items.iter().map(|i| i.text.clone()).collect::<Vec<_>>())
             .unwrap_or_default();
@@ -2548,7 +2651,10 @@ workspace: test-ws
 
         app.handle_dismissal_request("ws-exec");
         let executed = app.handle_dismissal_request("ws-exec");
-        assert!(executed, "second D on same workspace should execute dismissal");
+        assert!(
+            executed,
+            "second D on same workspace should execute dismissal"
+        );
         assert!(
             app.pending_dismissal_workspace().is_none(),
             "pending_dismissal should be cleared after execution"

@@ -1,4 +1,4 @@
-use super::log::{log_call, CallTimer};
+use super::log::{CallTimer, log_call};
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};

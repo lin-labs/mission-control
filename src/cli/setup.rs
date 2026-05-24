@@ -21,8 +21,7 @@ pub fn run() -> Result<()> {
     // Histories symlinks: point each tool's history dir at the canonical
     // ~obsAgents/Sessions/ so all agents write to and read from the same place.
     let sessions_dir = crate::mc_data::prompts::obsagents_root().join("Sessions");
-    std::fs::create_dir_all(&sessions_dir)
-        .with_context(|| format!("create {sessions_dir:?}"))?;
+    std::fs::create_dir_all(&sessions_dir).with_context(|| format!("create {sessions_dir:?}"))?;
 
     let home = dirs::home_dir().expect("home dir");
     for tool_history in [
@@ -89,7 +88,9 @@ fi
 # <<< mc-trajectory <<<"#
     );
     println!();
-    println!("The shell block is guarded by MC_WORKSPACE_ID so it is silent outside cmux workspaces.");
+    println!(
+        "The shell block is guarded by MC_WORKSPACE_ID so it is silent outside cmux workspaces."
+    );
 }
 
 fn ensure_dir(p: &std::path::Path) -> Result<bool> {

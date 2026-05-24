@@ -96,10 +96,7 @@ fn do_save(
 
     if !actions.is_empty() {
         let events_path = paths::events_log(uuid);
-        let mut evs: Vec<Event> = actions
-            .iter()
-            .map(|a| action_to_event(a, n))
-            .collect();
+        let mut evs: Vec<Event> = actions.iter().map(|a| action_to_event(a, n)).collect();
         if let (Some(expl), Some(last)) = (user_why, evs.last_mut()) {
             last.user_explanation = Some(expl.to_string());
         }
@@ -111,38 +108,67 @@ fn do_save(
 }
 
 enum EditAction {
-    Check { section: String, before: String, after: String },
-    Uncheck { section: String, before: String, after: String },
-    Edit { section: String, before: String, after: String },
-    Add { section: String, after: String },
-    Delete { section: String, before: String },
+    Check {
+        section: String,
+        before: String,
+        after: String,
+    },
+    Uncheck {
+        section: String,
+        before: String,
+        after: String,
+    },
+    Edit {
+        section: String,
+        before: String,
+        after: String,
+    },
+    Add {
+        section: String,
+        after: String,
+    },
+    Delete {
+        section: String,
+        before: String,
+    },
 }
 
 fn action_to_event(action: &EditAction, snapshot: u32) -> Event {
     match action {
-        EditAction::Check { section, before, after } =>
-            Event::new_now(Source::User, Kind::Check, section.as_str())
-                .with_before(before.as_str())
-                .with_after(after.as_str())
-                .with_snapshot(snapshot),
-        EditAction::Uncheck { section, before, after } =>
-            Event::new_now(Source::User, Kind::Uncheck, section.as_str())
-                .with_before(before.as_str())
-                .with_after(after.as_str())
-                .with_snapshot(snapshot),
-        EditAction::Edit { section, before, after } =>
-            Event::new_now(Source::User, Kind::Edit, section.as_str())
-                .with_before(before.as_str())
-                .with_after(after.as_str())
-                .with_snapshot(snapshot),
-        EditAction::Add { section, after } =>
+        EditAction::Check {
+            section,
+            before,
+            after,
+        } => Event::new_now(Source::User, Kind::Check, section.as_str())
+            .with_before(before.as_str())
+            .with_after(after.as_str())
+            .with_snapshot(snapshot),
+        EditAction::Uncheck {
+            section,
+            before,
+            after,
+        } => Event::new_now(Source::User, Kind::Uncheck, section.as_str())
+            .with_before(before.as_str())
+            .with_after(after.as_str())
+            .with_snapshot(snapshot),
+        EditAction::Edit {
+            section,
+            before,
+            after,
+        } => Event::new_now(Source::User, Kind::Edit, section.as_str())
+            .with_before(before.as_str())
+            .with_after(after.as_str())
+            .with_snapshot(snapshot),
+        EditAction::Add { section, after } => {
             Event::new_now(Source::User, Kind::Add, section.as_str())
                 .with_after(after.as_str())
-                .with_snapshot(snapshot),
-        EditAction::Delete { section, before } =>
+                .with_snapshot(snapshot)
+        }
+        EditAction::Delete { section, before } => {
             Event::new_now(Source::User, Kind::Delete, section.as_str())
                 .with_before(before.as_str())
-                .with_snapshot(snapshot),
+                .with_snapshot(snapshot)
+        }
     }
 }
 
@@ -232,7 +258,10 @@ fn non_empty_input_ctx_attaches_user_explanation_to_last_event() {
         let loaded = events::load(&ev_path).unwrap();
         assert_eq!(loaded.len(), 2);
         // user_explanation should be on the LAST event only.
-        assert!(loaded[0].user_explanation.is_none(), "first event should not have explanation");
+        assert!(
+            loaded[0].user_explanation.is_none(),
+            "first event should not have explanation"
+        );
         assert_eq!(
             loaded[1].user_explanation.as_deref(),
             Some("refocusing the goal"),
@@ -275,12 +304,14 @@ fn add_new_item_emits_add_event() {
         let mut doc = make_doc();
         let new_text = "sprint-04: new milestone";
         let after = format!("- [ ] {new_text}");
-        doc.sections[2].items.push(mission_control::mc_data::trajectory::Item {
-            text: new_text.to_string(),
-            is_checkbox: true,
-            checked: Some(false),
-            surface_id: None,
-        });
+        doc.sections[2]
+            .items
+            .push(mission_control::mc_data::trajectory::Item {
+                text: new_text.to_string(),
+                is_checkbox: true,
+                checked: Some(false),
+                surface_id: None,
+            });
 
         let actions = vec![EditAction::Add {
             section: "Tasks & Progress".to_string(),

@@ -206,18 +206,16 @@ pub fn latest_session_file_for_workspace(
         let tier1: Vec<&Candidate> = candidates
             .iter()
             .filter(|c| {
-                let host_ok = c
-                    .fm
-                    .host
-                    .as_deref()
-                    .map(|h| normalize_host(h) == ctx_host_norm)
-                    .unwrap_or(false);
-                let cwd_ok = c
-                    .fm
-                    .cwd
-                    .as_deref()
-                    .map(|fc| is_descendant(fc, ctx_cwd))
-                    .unwrap_or(false);
+                let host_ok =
+                    c.fm.host
+                        .as_deref()
+                        .map(|h| normalize_host(h) == ctx_host_norm)
+                        .unwrap_or(false);
+                let cwd_ok =
+                    c.fm.cwd
+                        .as_deref()
+                        .map(|fc| is_descendant(fc, ctx_cwd))
+                        .unwrap_or(false);
                 host_ok && cwd_ok
             })
             .collect();

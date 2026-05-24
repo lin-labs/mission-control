@@ -9,8 +9,7 @@ fn with_tmp_obsagents<F: FnOnce(&std::path::Path)>(f: F) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let prior = std::env::var_os("OBS_AGENTS");
     unsafe { std::env::set_var("OBS_AGENTS", tmp.path()) };
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(tmp.path())));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(tmp.path())));
     match prior {
         Some(v) => unsafe { std::env::set_var("OBS_AGENTS", v) },
         None => unsafe { std::env::remove_var("OBS_AGENTS") },
@@ -56,7 +55,10 @@ Rules:
 
         // rules.md should now exist under the project
         let rules_path = prompts::rules_path("myproject");
-        assert!(rules_path.exists(), "rules.md should have been created at {rules_path:?}");
+        assert!(
+            rules_path.exists(),
+            "rules.md should have been created at {rules_path:?}"
+        );
 
         // Load and verify
         let rules = PromptRules::load("myproject").unwrap();
@@ -69,8 +71,13 @@ Rules:
             !proposal_path.exists(),
             "proposal file should have been moved to .archived/"
         );
-        let archived = proposals_dir.join(".archived").join("2026-05-23-myproject.md");
-        assert!(archived.exists(), "archived file should exist at {archived:?}");
+        let archived = proposals_dir
+            .join(".archived")
+            .join("2026-05-23-myproject.md");
+        assert!(
+            archived.exists(),
+            "archived file should exist at {archived:?}"
+        );
     });
 }
 
@@ -172,7 +179,11 @@ fn gc_moves_stale_rules_and_marks_old_ones() {
         let rules = PromptRules::load("gcproject").unwrap();
 
         // Only the fresh rule should remain active
-        assert_eq!(rules.active.len(), 1, "only fresh rule should remain active");
+        assert_eq!(
+            rules.active.len(),
+            1,
+            "only fresh rule should remain active"
+        );
         assert_eq!(rules.active[0].pattern, "fresh pattern");
 
         // Both old rules moved to stale

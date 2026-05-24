@@ -1,4 +1,4 @@
-use mission_control::mc_data::trajectory::{TrajectoryDoc, Section, Item, priority_of};
+use mission_control::mc_data::trajectory::{Item, Section, TrajectoryDoc, priority_of};
 
 const SAMPLE: &str = "---
 workspace: predinvest
@@ -42,7 +42,10 @@ fn goal_items_are_plain_bullets() {
     let doc = TrajectoryDoc::parse(SAMPLE).unwrap();
     let goal = &doc.sections[0];
     assert_eq!(goal.items.len(), 2);
-    assert_eq!(goal.items[0].text, "Build self-improvement-enabled investment agent");
+    assert_eq!(
+        goal.items[0].text,
+        "Build self-improvement-enabled investment agent"
+    );
     assert!(!goal.items[0].is_checkbox);
 }
 
@@ -65,8 +68,14 @@ fn tasks_section_parses_checkbox_state() {
     assert!(tasks.items[0].is_checkbox);
     assert_eq!(tasks.items[0].checked, Some(true));
     assert_eq!(tasks.items[1].checked, Some(false));
-    assert_eq!(tasks.items[0].text, "sprint-01 composable foundation shipped");
-    assert_eq!(tasks.items[1].text, "sprint-02: CalibratedPlanStrategy tests pass");
+    assert_eq!(
+        tasks.items[0].text,
+        "sprint-01 composable foundation shipped"
+    );
+    assert_eq!(
+        tasks.items[1].text,
+        "sprint-02: CalibratedPlanStrategy tests pass"
+    );
 }
 
 #[test]
@@ -111,7 +120,10 @@ fn malformed_surface_comment_yields_none_surface_id() {
     let src = "## Current surfaces\n- claude · mbp · working · stuff <!-- mc:surface:no-closer\n";
     let doc = TrajectoryDoc::parse(src).unwrap();
     let item = &doc.sections[0].items[0];
-    assert!(item.surface_id.is_none(), "missing --> must not produce a garbage surface id");
+    assert!(
+        item.surface_id.is_none(),
+        "missing --> must not produce a garbage surface id"
+    );
 }
 
 #[test]
@@ -122,7 +134,10 @@ fn write_then_parse_round_trips() {
 
     // Frontmatter survives round-trip.
     assert_eq!(reparsed.frontmatter.workspace, doc.frontmatter.workspace);
-    assert_eq!(reparsed.frontmatter.workspace_id, doc.frontmatter.workspace_id);
+    assert_eq!(
+        reparsed.frontmatter.workspace_id,
+        doc.frontmatter.workspace_id
+    );
     assert_eq!(reparsed.frontmatter.snapshot, doc.frontmatter.snapshot);
 
     assert_eq!(
@@ -206,7 +221,11 @@ fn replace_section_items_is_noop_for_unknown_section() {
     let mut doc = TrajectoryDoc::parse(SAMPLE).unwrap();
     let before_len = doc.sections.len();
     doc.replace_section_items("Nonexistent", vec![]);
-    assert_eq!(doc.sections.len(), before_len, "should not add a new section");
+    assert_eq!(
+        doc.sections.len(),
+        before_len,
+        "should not add a new section"
+    );
 }
 
 #[test]
@@ -236,9 +255,17 @@ fn sort_tasks_noop_when_section_has_10_or_fewer() {
             surface_id: None,
         });
     }
-    let before: Vec<String> = doc.sections[2].items.iter().map(|i| i.text.clone()).collect();
+    let before: Vec<String> = doc.sections[2]
+        .items
+        .iter()
+        .map(|i| i.text.clone())
+        .collect();
     doc.sort_tasks_if_long();
-    let after: Vec<String> = doc.sections[2].items.iter().map(|i| i.text.clone()).collect();
+    let after: Vec<String> = doc.sections[2]
+        .items
+        .iter()
+        .map(|i| i.text.clone())
+        .collect();
     assert_eq!(before, after, "must not sort when <= 10 items");
 }
 
@@ -293,7 +320,11 @@ fn sort_tasks_orders_todos_by_priority_high_to_low() {
         });
     }
     doc.sort_tasks_if_long();
-    let order: Vec<String> = doc.sections[2].items.iter().map(|i| i.text.clone()).collect();
+    let order: Vec<String> = doc.sections[2]
+        .items
+        .iter()
+        .map(|i| i.text.clone())
+        .collect();
     // First three should be P0 (in their original insertion order -- stable).
     assert!(order[0].starts_with("[P0] urgent"));
     assert!(order[1].starts_with("[P0] another urgent"));
@@ -328,7 +359,11 @@ fn sort_tasks_preserves_done_insertion_order() {
     doc.sort_tasks_if_long();
     // After sort: all 6 todos first (no priority, stable order = original order),
     // then 6 dones in original order.
-    let order: Vec<String> = doc.sections[2].items.iter().map(|i| i.text.clone()).collect();
+    let order: Vec<String> = doc.sections[2]
+        .items
+        .iter()
+        .map(|i| i.text.clone())
+        .collect();
     assert_eq!(&order[..6], &["t1", "t2", "t3", "t4", "t5", "t6"]);
     assert_eq!(&order[6..], &["d1", "d2", "d3", "d4", "d5", "d6"]);
 }

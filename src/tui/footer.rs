@@ -60,12 +60,13 @@ pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus) {
 /// Layout: `:<buffer><cursor><ghost-dim>    <status>`
 /// Status is appended after a 4-space gap when present.
 pub fn render_command_bar(f: &mut Frame, area: Rect, cl: &CommandLine) {
-    let prompt_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let prompt_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
     let buf_style = Style::default();
     let ghost_style = Style::default().fg(Color::DarkGray);
 
-    let (before, after): (&str, &str) =
-        cl.buffer.split_at(cl.cursor.min(cl.buffer.len()));
+    let (before, after): (&str, &str) = cl.buffer.split_at(cl.cursor.min(cl.buffer.len()));
 
     // Render the cursor as an inverted single char. If the cursor is at the
     // end, render a space so the user sees a block where they're about to type.

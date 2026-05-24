@@ -9,8 +9,7 @@ fn with_tmp_obsagents<F: FnOnce(&std::path::Path)>(f: F) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let prior = std::env::var_os("OBS_AGENTS");
     unsafe { std::env::set_var("OBS_AGENTS", tmp.path()) };
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(tmp.path())));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(tmp.path())));
     match prior {
         Some(v) => unsafe { std::env::set_var("OBS_AGENTS", v) },
         None => unsafe { std::env::remove_var("OBS_AGENTS") },
@@ -104,7 +103,10 @@ fn roundtrip_parse_to_markdown_to_parse() {
 fn obsagents_root_honors_env_var() {
     with_tmp_obsagents(|tmp| {
         let got = prompts::obsagents_root();
-        assert_eq!(got, tmp, "obsagents_root() should return the OBS_AGENTS env var value");
+        assert_eq!(
+            got, tmp,
+            "obsagents_root() should return the OBS_AGENTS env var value"
+        );
     });
 }
 
@@ -129,7 +131,12 @@ Rules:
 "#;
 
     let ticked = prompts::parse_proposal_file(proposal).unwrap();
-    assert_eq!(ticked.len(), 2, "only [x] rules should be returned, got: {:?}", ticked.iter().map(|r| &r.pattern).collect::<Vec<_>>());
+    assert_eq!(
+        ticked.len(),
+        2,
+        "only [x] rules should be returned, got: {:?}",
+        ticked.iter().map(|r| &r.pattern).collect::<Vec<_>>()
+    );
     assert_eq!(ticked[0].pattern, "ticked rule one");
     assert_eq!(ticked[0].expansion, "Do X when Y");
     assert!(matches!(ticked[0].confidence, Confidence::High));
@@ -153,17 +160,15 @@ fn save_and_load_roundtrip() {
     with_tmp_obsagents(|_| {
         let rules = PromptRules {
             project: "testproj".to_string(),
-            active: vec![
-                Rule {
-                    pattern: "test pattern".to_string(),
-                    expansion: "test expansion".to_string(),
-                    confidence: Confidence::High,
-                    added: "2026-05-23".to_string(),
-                    added_by: "myworkspace".to_string(),
-                    last_fired: Some("2026-05-23".to_string()),
-                    hits: 7,
-                },
-            ],
+            active: vec![Rule {
+                pattern: "test pattern".to_string(),
+                expansion: "test expansion".to_string(),
+                confidence: Confidence::High,
+                added: "2026-05-23".to_string(),
+                added_by: "myworkspace".to_string(),
+                last_fired: Some("2026-05-23".to_string()),
+                hits: 7,
+            }],
             stale: vec![],
         };
         rules.save().unwrap();

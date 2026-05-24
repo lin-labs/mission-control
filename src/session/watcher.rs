@@ -13,12 +13,9 @@ pub struct FileChanged {
 }
 
 impl SessionWatcher {
-    pub fn new(
-        dir: PathBuf,
-        tx: mpsc::UnboundedSender<FileChanged>,
-    ) -> Result<Self> {
-        let mut watcher = notify::recommended_watcher(
-            move |res: std::result::Result<Event, notify::Error>| {
+    pub fn new(dir: PathBuf, tx: mpsc::UnboundedSender<FileChanged>) -> Result<Self> {
+        let mut watcher =
+            notify::recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
                 if let Ok(event) = res {
                     match event.kind {
                         EventKind::Modify(_) | EventKind::Create(_) => {
@@ -31,8 +28,7 @@ impl SessionWatcher {
                         _ => {}
                     }
                 }
-            },
-        )?;
+            })?;
 
         watcher.watch(&dir, RecursiveMode::NonRecursive)?;
 

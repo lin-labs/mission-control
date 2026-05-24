@@ -1,7 +1,6 @@
 /// Tests for the LLM retry helper (T13).
 ///
 /// Uses tiny delays to keep the test suite fast.
-
 use mission_control::llm;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

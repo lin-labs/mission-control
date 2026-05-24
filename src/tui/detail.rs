@@ -1,10 +1,10 @@
 use crate::tui::app::WorkspaceState;
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
-    Frame,
 };
 
 pub fn render_detail(
@@ -14,11 +14,15 @@ pub fn render_detail(
     scroll: u16,
     focused: bool,
 ) {
-    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
+    let border_style = crate::sidebar_pure::workspace_panel_border_style(
+        ws.and_then(|workspace| workspace.workspace.custom_color.as_deref()),
+        focused,
+        Color::Cyan,
+    );
     let block = Block::default()
-        .title(" Detail ")
+        .title(Span::styled(" Detail ", border_style))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
+        .border_style(border_style);
 
     let ws = match ws {
         Some(ws) => ws,
@@ -40,6 +44,7 @@ pub fn render_detail(
             focused,
             ws.edit_state.as_ref(),
             ws.peek_state.as_ref(),
+            ws.workspace.custom_color.as_deref(),
         );
         return;
     }
@@ -110,11 +115,7 @@ pub fn render_detail(
         .summary
         .as_ref()
         .map(|s| s.trajectory.as_str())
-        .or_else(|| {
-            ws.session
-                .as_ref()
-                .and_then(|s| s.trajectory.as_deref())
-        });
+        .or_else(|| ws.session.as_ref().and_then(|s| s.trajectory.as_deref()));
     if let Some(traj) = trajectory {
         lines.push(Line::from(Span::styled(
             format!("  {}", traj),
@@ -177,7 +178,6 @@ pub fn render_detail(
             }
             lines.push(Line::raw(""));
         }
-
     }
 
     // Next Steps — prefer in-memory summary, fall back to session file
@@ -216,10 +216,7 @@ pub fn render_detail(
 
     // ── Screen preview (raw, least important) ───────────
     if let Some(ref preview) = ws.screen_preview {
-        let non_blank = preview
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .count();
+        let non_blank = preview.lines().filter(|l| !l.trim().is_empty()).count();
         if non_blank > 2 {
             lines.push(Line::from(Span::styled(
                 "─── Screen ────────────────────────────────────",
@@ -310,10 +307,7 @@ fn render_header_lines<'a>(lines: &mut Vec<Line<'a>>, ws: &'a WorkspaceState) {
             } else {
                 sub_spans.push(Span::styled("  ", Style::default()));
             }
-            sub_spans.push(Span::styled(
-                topic,
-                Style::default().fg(Color::DarkGray),
-            ));
+            sub_spans.push(Span::styled(topic, Style::default().fg(Color::DarkGray)));
         }
         lines.push(Line::from(sub_spans));
     }

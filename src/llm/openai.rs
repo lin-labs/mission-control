@@ -1,4 +1,4 @@
-use super::log::{log_call, CallTimer};
+use super::log::{CallTimer, log_call};
 use super::{Summarizer, Summary};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -160,7 +160,12 @@ impl Summarizer for OpenAISummarizer {
 
         match &result {
             Ok(text) => log_call("openai-regen", &log_prompt, Ok(text.as_str()), timer.ms()),
-            Err(e) => log_call("openai-regen", &log_prompt, Err(&format!("{:#}", e)), timer.ms()),
+            Err(e) => log_call(
+                "openai-regen",
+                &log_prompt,
+                Err(&format!("{:#}", e)),
+                timer.ms(),
+            ),
         }
 
         result

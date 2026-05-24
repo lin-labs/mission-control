@@ -1,4 +1,7 @@
-use mission_control::mc_data::{inputs::{self, InputContext}, paths};
+use mission_control::mc_data::{
+    inputs::{self, InputContext},
+    paths,
+};
 
 // Run with --test-threads=1 to avoid concurrent HOME mutations.
 
@@ -31,17 +34,44 @@ fn write_input_creates_file_with_formatted_sections() {
         let path = inputs::write_input(uuid, 7, &ctx).expect("write_input");
 
         assert!(path.exists(), "input file should exist at {path:?}");
-        assert!(path.ends_with("7.txt"), "filename should be 7.txt, got {path:?}");
+        assert!(
+            path.ends_with("7.txt"),
+            "filename should be 7.txt, got {path:?}"
+        );
 
         let contents = std::fs::read_to_string(&path).expect("read");
-        assert!(contents.contains("## User context"), "missing user context header");
-        assert!(contents.contains("why: codex finished sprint-01"), "missing why line");
-        assert!(contents.contains("## Auto context (captured at edit-start)"), "missing auto context header");
-        assert!(contents.contains("current-screen-tail:"), "missing screen tail");
-        assert!(contents.contains("  screen line 1"), "screen line should be indented");
-        assert!(contents.contains("last-user-prompt:"), "missing last user prompt");
-        assert!(contents.contains("last-agent-output-tail:"), "missing agent output tail");
-        assert!(contents.contains("edited-sections: [Tasks & Progress]"), "missing edited sections");
+        assert!(
+            contents.contains("## User context"),
+            "missing user context header"
+        );
+        assert!(
+            contents.contains("why: codex finished sprint-01"),
+            "missing why line"
+        );
+        assert!(
+            contents.contains("## Auto context (captured at edit-start)"),
+            "missing auto context header"
+        );
+        assert!(
+            contents.contains("current-screen-tail:"),
+            "missing screen tail"
+        );
+        assert!(
+            contents.contains("  screen line 1"),
+            "screen line should be indented"
+        );
+        assert!(
+            contents.contains("last-user-prompt:"),
+            "missing last user prompt"
+        );
+        assert!(
+            contents.contains("last-agent-output-tail:"),
+            "missing agent output tail"
+        );
+        assert!(
+            contents.contains("edited-sections: [Tasks & Progress]"),
+            "missing edited sections"
+        );
     });
 }
 
@@ -69,8 +99,14 @@ fn empty_user_why_produces_header_without_why_line() {
         let path = inputs::write_input(uuid, 1, &ctx).expect("write_input");
         let contents = std::fs::read_to_string(&path).expect("read");
 
-        assert!(contents.contains("## User context"), "user context header must exist");
-        assert!(!contents.contains("why:"), "no why: line when user_why is None, got: {contents}");
+        assert!(
+            contents.contains("## User context"),
+            "user context header must exist"
+        );
+        assert!(
+            !contents.contains("why:"),
+            "no why: line when user_why is None, got: {contents}"
+        );
     });
 }
 
@@ -114,11 +150,26 @@ fn to_text_empty_context_has_both_sections() {
     let ctx = InputContext::default();
     let text = ctx.to_text();
     assert!(text.contains("## User context"), "user context header");
-    assert!(text.contains("## Auto context (captured at edit-start)"), "auto context header");
+    assert!(
+        text.contains("## Auto context (captured at edit-start)"),
+        "auto context header"
+    );
     // No why line, no optional fields.
     assert!(!text.contains("why:"), "no why: for empty context");
-    assert!(!text.contains("current-screen-tail:"), "no screen tail for empty context");
-    assert!(!text.contains("last-user-prompt:"), "no user prompt for empty context");
-    assert!(!text.contains("last-agent-output-tail:"), "no agent output for empty context");
-    assert!(!text.contains("edited-sections:"), "no edited sections for empty context");
+    assert!(
+        !text.contains("current-screen-tail:"),
+        "no screen tail for empty context"
+    );
+    assert!(
+        !text.contains("last-user-prompt:"),
+        "no user prompt for empty context"
+    );
+    assert!(
+        !text.contains("last-agent-output-tail:"),
+        "no agent output for empty context"
+    );
+    assert!(
+        !text.contains("edited-sections:"),
+        "no edited sections for empty context"
+    );
 }

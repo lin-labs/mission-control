@@ -47,10 +47,7 @@ fn fallback_scan_histories(workspace_id: &str) -> Result<PathBuf> {
         .join("agents/histories");
 
     if !histories_dir.is_dir() {
-        anyhow::bail!(
-            "histories dir {} does not exist",
-            histories_dir.display()
-        );
+        anyhow::bail!("histories dir {} does not exist", histories_dir.display());
     }
 
     let mut best: Option<(SystemTime, PathBuf)> = None;

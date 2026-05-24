@@ -3,11 +3,10 @@
 /// These tests do NOT call a real LLM (that would cost money and require
 /// API keys). They exercise the `build_prompt` function and the mock
 /// Summarizer trait implementation.
-
 use anyhow::Result;
 use async_trait::async_trait;
-use mission_control::llm::{Summary, Summarizer};
-use mission_control::llm::trajectory_regen::{build_prompt, regenerate, RegenInputs};
+use mission_control::llm::trajectory_regen::{RegenInputs, build_prompt, regenerate};
+use mission_control::llm::{Summarizer, Summary};
 use mission_control::mc_data::events::{Event, Kind, Source};
 use std::sync::Arc;
 
@@ -84,8 +83,8 @@ fn build_prompt_contains_workspace_name() {
 
 #[test]
 fn build_prompt_includes_recent_events() {
-    let event = Event::new_now(Source::User, Kind::Check, "Tasks & Progress")
-        .with_after("deploy to prod");
+    let event =
+        Event::new_now(Source::User, Kind::Check, "Tasks & Progress").with_after("deploy to prod");
 
     let inputs = RegenInputs {
         workspace_name: "ws".to_string(),

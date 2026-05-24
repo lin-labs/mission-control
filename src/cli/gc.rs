@@ -23,9 +23,7 @@ pub fn run() -> Result<()> {
             rules.save()?;
             total_moved += moved;
             total_marked += marked;
-            println!(
-                "  {project}: moved {moved} to stale, marked {marked} for review"
-            );
+            println!("  {project}: moved {moved} to stale, marked {marked} for review");
         }
     }
     println!(

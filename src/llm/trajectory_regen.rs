@@ -32,7 +32,9 @@ pub async fn regenerate(
     inputs: &RegenInputs,
 ) -> Result<TrajectoryDoc> {
     let prompt = build_prompt(inputs);
-    let response = summarizer.regenerate_trajectory(&prompt.system, &prompt.user).await?;
+    let response = summarizer
+        .regenerate_trajectory(&prompt.system, &prompt.user)
+        .await?;
     let doc = TrajectoryDoc::parse(&response)
         .with_context(|| "LLM returned invalid markdown for trajectory regeneration")?;
     Ok(doc)
@@ -45,7 +47,8 @@ pub fn build_prompt(inputs: &RegenInputs) -> RegenPrompt {
         "You maintain a 3-section trajectory doc for workspace '{}'.\n",
         inputs.workspace_name
     ));
-    system.push_str("Sections (exact order): ## Goal, ## Current surfaces, ## Tasks & Progress.\n\n");
+    system
+        .push_str("Sections (exact order): ## Goal, ## Current surfaces, ## Tasks & Progress.\n\n");
     system.push_str("Rules:\n");
     system.push_str("- User edits are TYPED ACTIONS. Interpret intent:\n");
     system.push_str("  check -> user marked done; don't re-open the item\n");
@@ -84,7 +87,15 @@ pub fn build_prompt(inputs: &RegenInputs) -> RegenPrompt {
     // Recent events (last 20)
     if !inputs.recent_events.is_empty() {
         user.push_str("Recent user actions (events.jsonl tail, last 20):\n");
-        for event in inputs.recent_events.iter().rev().take(20).collect::<Vec<_>>().iter().rev() {
+        for event in inputs
+            .recent_events
+            .iter()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+        {
             if let Ok(json) = serde_json::to_string(event) {
                 user.push_str(&json);
                 user.push('\n');
@@ -96,7 +107,15 @@ pub fn build_prompt(inputs: &RegenInputs) -> RegenPrompt {
     // User explanations (last 3)
     if !inputs.recent_user_explanations.is_empty() {
         user.push_str("User explanations (inputs/N.txt tails, last 3):\n");
-        for explanation in inputs.recent_user_explanations.iter().rev().take(3).collect::<Vec<_>>().iter().rev() {
+        for explanation in inputs
+            .recent_user_explanations
+            .iter()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+        {
             user.push_str("---\n");
             user.push_str(explanation);
             user.push('\n');
@@ -118,7 +137,10 @@ pub fn build_prompt(inputs: &RegenInputs) -> RegenPrompt {
             user.push_str(&format!("  [{sid}] {summary}\n"));
         }
     }
-    user.push_str(&format!("- Tool calls executed: {}\n", inputs.tool_call_count));
+    user.push_str(&format!(
+        "- Tool calls executed: {}\n",
+        inputs.tool_call_count
+    ));
 
     if !inputs.cmux_surface_order.is_empty() {
         let order = inputs.cmux_surface_order.join(", ");

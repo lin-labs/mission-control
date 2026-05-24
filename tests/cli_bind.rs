@@ -83,10 +83,7 @@ fn bind_writes_pointer_file_with_explicit_session_file() {
     let pointer = tmp
         .path()
         .join("data/mission-control/.data/uuid-1/surfaces/sid-1.session-path");
-    assert!(
-        pointer.exists(),
-        "pointer file should exist at {pointer:?}"
-    );
+    assert!(pointer.exists(), "pointer file should exist at {pointer:?}");
 
     let contents = std::fs::read_to_string(&pointer).unwrap();
     assert_eq!(
@@ -107,7 +104,7 @@ fn bind_reads_surface_id_from_env_var() {
     let output = Command::new(mc_bin())
         .env("HOME", tmp.path())
         .env("MC_WORKSPACE_ID", "uuid-env")
-        .env("MC_SURFACE_ID", "sid-env")  // surface_id provided via env
+        .env("MC_SURFACE_ID", "sid-env") // surface_id provided via env
         .env_remove("CLAUDE_SESSION_FILE")
         // Note: no positional surface_id arg here — clap reads it from MC_SURFACE_ID
         .args(["bind", "sid-env", "--session-file", session_path])
@@ -140,7 +137,7 @@ fn bind_uses_claude_session_file_env_var() {
         .env("MC_WORKSPACE_ID", "uuid-csf")
         .env("CLAUDE_SESSION_FILE", session_path)
         .env_remove("MC_SURFACE_ID")
-        .args(["bind", "sid-csf"])  // no --session-file
+        .args(["bind", "sid-csf"]) // no --session-file
         .output()
         .expect("run mc bind with CLAUDE_SESSION_FILE");
 
@@ -189,7 +186,7 @@ fn bind_fallback_scan_picks_matching_file() {
         .env("MC_WORKSPACE_ID", "ws-scan-2")
         .env_remove("CLAUDE_SESSION_FILE")
         .env_remove("MC_SURFACE_ID")
-        .args(["bind", "sid-scan2"])  // no --session-file, no $CLAUDE_SESSION_FILE
+        .args(["bind", "sid-scan2"]) // no --session-file, no $CLAUDE_SESSION_FILE
         .output()
         .expect("run mc bind fallback scan");
 

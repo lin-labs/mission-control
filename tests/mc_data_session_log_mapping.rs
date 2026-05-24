@@ -1,4 +1,4 @@
-use mission_control::mc_data::session_log::{latest_session_file_for_workspace, WorkspaceContext};
+use mission_control::mc_data::session_log::{WorkspaceContext, latest_session_file_for_workspace};
 use std::fs;
 
 fn with_tmp_obs<F: FnOnce(&std::path::Path)>(f: F) {
@@ -53,7 +53,10 @@ fn picks_log_with_matching_cwd_prefix_over_more_recent_without() {
         };
         let picked = latest_session_file_for_workspace("TARGET-UUID", &ctx).unwrap();
         let p = picked.unwrap();
-        assert!(p.ends_with("a.md"), "should pick by cwd ancestry, got {p:?}");
+        assert!(
+            p.ends_with("a.md"),
+            "should pick by cwd ancestry, got {p:?}"
+        );
     });
 }
 
@@ -63,7 +66,13 @@ fn excludes_logs_with_different_host_even_if_uuid_matches() {
         // Only uuid-match candidate is on wrong host.
         write_session(obs, "a.md", "labs", "/home/blin/x", "TARGET-UUID");
         // Tier 1 candidate on matching host with matching cwd.
-        write_session(obs, "b.md", "mbp", "/Users/blin/Projects/agents", "OTHER-UUID");
+        write_session(
+            obs,
+            "b.md",
+            "mbp",
+            "/Users/blin/Projects/agents",
+            "OTHER-UUID",
+        );
         let ctx = WorkspaceContext {
             host: Some("mbp".into()),
             cwd: Some("/Users/blin/Projects/agents".into()),
@@ -99,7 +108,13 @@ fn picks_most_specific_cwd_when_multiple_match() {
         write_session(obs, "shallow.md", "mbp", "/Users/blin", "X");
         std::thread::sleep(std::time::Duration::from_millis(20));
         // deep.md: cwd=/Users/blin/Projects/agents/skills -- IS a descendant
-        write_session(obs, "deep.md", "mbp", "/Users/blin/Projects/agents/skills", "X");
+        write_session(
+            obs,
+            "deep.md",
+            "mbp",
+            "/Users/blin/Projects/agents/skills",
+            "X",
+        );
         let ctx = WorkspaceContext {
             host: Some("mbp".into()),
             cwd: Some("/Users/blin/Projects/agents".into()),

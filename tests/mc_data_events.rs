@@ -54,7 +54,10 @@ fn multiple_appends_accumulate() {
         let loaded = events::load(&path).expect("load");
         assert_eq!(loaded.len(), 3);
         for (i, ev) in loaded.iter().enumerate() {
-            assert_eq!(ev.after.as_deref(), Some(format!("- [ ] task-{i}").as_str()));
+            assert_eq!(
+                ev.after.as_deref(),
+                Some(format!("- [ ] task-{i}").as_str())
+            );
         }
     });
 }
@@ -72,12 +75,14 @@ fn oversized_event_returns_err() {
         let path = tmp.join("events.jsonl");
         // Create a before string that will push the serialized line over 4096 bytes.
         let big = "x".repeat(4097);
-        let ev = Event::new_now(Source::User, Kind::Edit, "Tasks & Progress")
-            .with_before(big);
+        let ev = Event::new_now(Source::User, Kind::Edit, "Tasks & Progress").with_before(big);
         let result = events::append(&path, &ev);
         assert!(result.is_err(), "expected Err for oversized event");
         let msg = format!("{:?}", result.unwrap_err());
-        assert!(msg.contains("byte cap") || msg.contains("bytes exceeds"), "error message: {msg}");
+        assert!(
+            msg.contains("byte cap") || msg.contains("bytes exceeds"),
+            "error message: {msg}"
+        );
     });
 }
 
@@ -119,7 +124,10 @@ fn source_user_undo_serializes_correctly() {
 
         // Check the raw file for the correct source value.
         let raw = std::fs::read_to_string(&path).expect("read");
-        assert!(raw.contains("\"user-undo\""), "source should serialize as 'user-undo', got: {raw}");
+        assert!(
+            raw.contains("\"user-undo\""),
+            "source should serialize as 'user-undo', got: {raw}"
+        );
 
         let loaded = events::load(&path).expect("load");
         assert!(matches!(loaded[0].source, Source::UserUndo));

@@ -104,11 +104,8 @@ fn finalize_writes_obsidian_record() -> Result<()> {
     with_tmp_home_and_obs(|obs| {
         let uuid = create_test_workspace("obs-ws")?;
 
-        let artifacts = mission_control::mc_data::dismissal::finalize(
-            &uuid,
-            "# My learning record\n",
-            None,
-        )?;
+        let artifacts =
+            mission_control::mc_data::dismissal::finalize(&uuid, "# My learning record\n", None)?;
 
         assert!(
             artifacts.obsidian_record.exists(),
@@ -135,7 +132,8 @@ fn finalize_with_proposals_writes_proposals_file() -> Result<()> {
     with_tmp_home_and_obs(|obs| {
         let uuid = create_test_workspace("proposal-ws")?;
 
-        let proposals_content = "- [ ] PATTERN: \"do the thing\"\n  EXPANSION: \"Detailed instructions\"\n";
+        let proposals_content =
+            "- [ ] PATTERN: \"do the thing\"\n  EXPANSION: \"Detailed instructions\"\n";
         let artifacts = mission_control::mc_data::dismissal::finalize(
             &uuid,
             "# Record\n",
@@ -182,11 +180,7 @@ fn finalize_leaves_data_intact_when_obsidian_write_fails() -> Result<()> {
         let prior_obs = std::env::var_os("OBS_AGENTS");
         unsafe { std::env::set_var("OBS_AGENTS", &bad_obs) };
 
-        let result = mission_control::mc_data::dismissal::finalize(
-            &uuid,
-            "# Record\n",
-            None,
-        );
+        let result = mission_control::mc_data::dismissal::finalize(&uuid, "# Record\n", None);
 
         // Restore OBS_AGENTS
         unsafe {
@@ -197,7 +191,10 @@ fn finalize_leaves_data_intact_when_obsidian_write_fails() -> Result<()> {
         }
 
         // finalize should have failed (obsidian dir creation failed)
-        assert!(result.is_err(), "finalize should fail when obsidian dir cannot be created");
+        assert!(
+            result.is_err(),
+            "finalize should fail when obsidian dir cannot be created"
+        );
         // Data dir should still be intact — the rename never happened
         assert!(
             data_dir.exists(),
@@ -213,13 +210,12 @@ fn finalize_removes_display_symlink() -> Result<()> {
     with_tmp_home_and_obs(|_obs| {
         let uuid = create_test_workspace("link-ws")?;
         let link = mission_control::mc_data::paths::display_symlink("link-ws");
-        assert!(link.exists() || link.is_symlink(), "symlink should exist before finalize at {link:?}");
+        assert!(
+            link.exists() || link.is_symlink(),
+            "symlink should exist before finalize at {link:?}"
+        );
 
-        mission_control::mc_data::dismissal::finalize(
-            &uuid,
-            "# Record\n",
-            None,
-        )?;
+        mission_control::mc_data::dismissal::finalize(&uuid, "# Record\n", None)?;
 
         // Symlink should be gone after finalize
         assert!(

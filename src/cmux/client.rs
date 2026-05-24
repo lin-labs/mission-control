@@ -36,9 +36,9 @@ struct WorkspaceJson {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Workspace {
-    pub ref_id: String,      // e.g. "workspace:2"
-    pub uuid: String,        // e.g. "32E47B1E-..."
-    pub name: String,        // e.g. "gmail-labs"
+    pub ref_id: String, // e.g. "workspace:2"
+    pub uuid: String,   // e.g. "32E47B1E-..."
+    pub name: String,   // e.g. "gmail-labs"
     pub selected: bool,
     /// The cmux workspace description (from `cmux workspace-action set-description`).
     /// Non-empty description is used to seed the Goal section of the trajectory doc.
@@ -83,7 +83,8 @@ impl CmuxClient {
     /// `--id-format both` is required — without it the JSON omits the `id`
     /// (UUID) field entirely, which we need to key per-workspace data dirs.
     pub async fn list_workspaces(&self) -> Result<Vec<Workspace>> {
-        let output = self.cmd()
+        let output = self
+            .cmd()
             .args(["list-workspaces", "--json", "--id-format", "both"])
             .output()
             .await
@@ -155,12 +156,9 @@ impl CmuxClient {
     }
 
     /// Read the last N lines of a surface's screen.
-    pub async fn read_screen(
-        &self,
-        workspace_ref: &str,
-        lines: u32,
-    ) -> Result<String> {
-        let output = self.cmd()
+    pub async fn read_screen(&self, workspace_ref: &str, lines: u32) -> Result<String> {
+        let output = self
+            .cmd()
             .args([
                 "read-screen",
                 "--workspace",
@@ -187,7 +185,8 @@ impl CmuxClient {
 
     /// Parse `cmux tree --all` to get surface titles per workspace ref.
     pub async fn get_surfaces(&self) -> Result<HashMap<String, Vec<SurfaceInfo>>> {
-        let output = self.cmd()
+        let output = self
+            .cmd()
             .args(["tree", "--all"])
             .output()
             .await

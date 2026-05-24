@@ -9,9 +9,7 @@ use crate::mc_data::events::{Event, Kind, Source};
 use crate::mc_data::inputs::{InputContext, write_input};
 use crate::mc_data::paths;
 use crate::mc_data::snapshots::{highest_snapshot, write_snapshot};
-use crate::mc_data::trajectory::{
-    Item, SECTION_CURRENT_SURFACES, SECTION_TASKS, TrajectoryDoc,
-};
+use crate::mc_data::trajectory::{Item, SECTION_CURRENT_SURFACES, SECTION_TASKS, TrajectoryDoc};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -41,15 +39,27 @@ pub enum EditMode {
 #[derive(Debug, Clone)]
 pub enum EditAction {
     /// Text of an existing item was changed.
-    Edit { section: String, before: String, after: String },
+    Edit {
+        section: String,
+        before: String,
+        after: String,
+    },
     /// A new item was inserted.
     Add { section: String, after: String },
     /// An item was deleted.
     Delete { section: String, before: String },
     /// A checkbox was toggled on.
-    Check { section: String, before: String, after: String },
+    Check {
+        section: String,
+        before: String,
+        after: String,
+    },
     /// A checkbox was toggled off.
-    Uncheck { section: String, before: String, after: String },
+    Uncheck {
+        section: String,
+        before: String,
+        after: String,
+    },
     /// An item was reordered within its section.
     Move { section: String, before: String },
 }
@@ -320,8 +330,8 @@ fn handle_insert_key(
                 }
             }
         }
-        KeyCode::Char(c) if key.modifiers == KeyModifiers::NONE
-            || key.modifiers == KeyModifiers::SHIFT =>
+        KeyCode::Char(c)
+            if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT =>
         {
             if focus == InsertFocus::Item {
                 insert_char_at(&mut state.edit_buffer, state.cursor_col, c);
@@ -337,7 +347,11 @@ fn handle_insert_key(
 
 /// Insert a character at the given char-indexed position in `s`.
 fn insert_char_at(s: &mut String, char_col: usize, c: char) {
-    let byte_pos = s.char_indices().nth(char_col).map(|(b, _)| b).unwrap_or(s.len());
+    let byte_pos = s
+        .char_indices()
+        .nth(char_col)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len());
     s.insert(byte_pos, c);
 }
 
@@ -364,7 +378,10 @@ fn commit_insert(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> Ve
 
     if let Some(section) = doc.sections.get_mut(state.cursor_section) {
         if let Some(item) = section.items.get_mut(state.cursor_item) {
-            let old_text = state.edit_start_text.clone().unwrap_or_else(|| item.text.clone());
+            let old_text = state
+                .edit_start_text
+                .clone()
+                .unwrap_or_else(|| item.text.clone());
             if new_text != old_text {
                 // Text genuinely changed — record an Edit action.
                 let before = item_display_text(item, &old_text);
@@ -423,10 +440,7 @@ pub fn save(
         let user_explanation = ctx.user_why.clone();
 
         // Build all events first, then attach user_explanation to the last one.
-        let mut events: Vec<Event> = edit_actions
-            .iter()
-            .map(|a| action_to_event(a, n))
-            .collect();
+        let mut events: Vec<Event> = edit_actions.iter().map(|a| action_to_event(a, n)).collect();
 
         // Attach user explanation to most-recent event if non-empty.
         if let Some(ref expl) = user_explanation {
@@ -445,12 +459,14 @@ pub fn save(
 
 fn action_to_event(action: &EditAction, snapshot: u32) -> Event {
     match action {
-        EditAction::Edit { section, before, after } => {
-            Event::new_now(Source::User, Kind::Edit, section.as_str())
-                .with_before(before.as_str())
-                .with_after(after.as_str())
-                .with_snapshot(snapshot)
-        }
+        EditAction::Edit {
+            section,
+            before,
+            after,
+        } => Event::new_now(Source::User, Kind::Edit, section.as_str())
+            .with_before(before.as_str())
+            .with_after(after.as_str())
+            .with_snapshot(snapshot),
         EditAction::Add { section, after } => {
             Event::new_now(Source::User, Kind::Add, section.as_str())
                 .with_after(after.as_str())
@@ -461,18 +477,22 @@ fn action_to_event(action: &EditAction, snapshot: u32) -> Event {
                 .with_before(before.as_str())
                 .with_snapshot(snapshot)
         }
-        EditAction::Check { section, before, after } => {
-            Event::new_now(Source::User, Kind::Check, section.as_str())
-                .with_before(before.as_str())
-                .with_after(after.as_str())
-                .with_snapshot(snapshot)
-        }
-        EditAction::Uncheck { section, before, after } => {
-            Event::new_now(Source::User, Kind::Uncheck, section.as_str())
-                .with_before(before.as_str())
-                .with_after(after.as_str())
-                .with_snapshot(snapshot)
-        }
+        EditAction::Check {
+            section,
+            before,
+            after,
+        } => Event::new_now(Source::User, Kind::Check, section.as_str())
+            .with_before(before.as_str())
+            .with_after(after.as_str())
+            .with_snapshot(snapshot),
+        EditAction::Uncheck {
+            section,
+            before,
+            after,
+        } => Event::new_now(Source::User, Kind::Uncheck, section.as_str())
+            .with_before(before.as_str())
+            .with_after(after.as_str())
+            .with_snapshot(snapshot),
         EditAction::Move { section, before } => {
             Event::new_now(Source::User, Kind::Move, section.as_str())
                 .with_before(before.as_str())
@@ -624,7 +644,9 @@ fn insert_item_below(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
         },
     );
     state.cursor_item = insert_pos;
-    state.mode = EditMode::Insert { focus: InsertFocus::Item };
+    state.mode = EditMode::Insert {
+        focus: InsertFocus::Item,
+    };
     state.edit_buffer = String::new();
     state.cursor_col = 0;
     state.input_ctx_buffer = String::new();
@@ -636,7 +658,11 @@ fn insert_item_above(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
         Some(s) => s,
         None => return,
     };
-    let insert_pos = if section.items.is_empty() { 0 } else { state.cursor_item };
+    let insert_pos = if section.items.is_empty() {
+        0
+    } else {
+        state.cursor_item
+    };
     let is_checkbox = section.name == SECTION_TASKS || section.name == SECTION_CURRENT_SURFACES;
     section.items.insert(
         insert_pos,
@@ -648,7 +674,9 @@ fn insert_item_above(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
         },
     );
     state.cursor_item = insert_pos;
-    state.mode = EditMode::Insert { focus: InsertFocus::Item };
+    state.mode = EditMode::Insert {
+        focus: InsertFocus::Item,
+    };
     state.edit_buffer = String::new();
     state.cursor_col = 0;
     state.input_ctx_buffer = String::new();
@@ -679,7 +707,9 @@ fn enter_insert_mode(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
     }
 
     let item = &section.items[state.cursor_item];
-    state.mode = EditMode::Insert { focus: InsertFocus::Item };
+    state.mode = EditMode::Insert {
+        focus: InsertFocus::Item,
+    };
     state.edit_buffer = item.text.clone();
     state.cursor_col = state.edit_buffer.chars().count();
     state.input_ctx_buffer = String::new();
@@ -725,7 +755,11 @@ fn move_item_up(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> Opt
 /// before/after with different text.
 pub fn item_display_text(item: &Item, text: &str) -> String {
     if item.is_checkbox {
-        let mark = if item.checked.unwrap_or(false) { "[x]" } else { "[ ]" };
+        let mark = if item.checked.unwrap_or(false) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
         format!("- {mark} {text}")
     } else {
         format!("- {text}")
@@ -878,7 +912,10 @@ workspace: test-ws
         handle_key(&mut state, &mut doc.clone(), key(KeyCode::Char('i')));
         assert!(matches!(state.mode, EditMode::Insert { .. }));
         assert_eq!(state.edit_buffer, "Build investment agent");
-        assert_eq!(state.edit_start_text.as_deref(), Some("Build investment agent"));
+        assert_eq!(
+            state.edit_start_text.as_deref(),
+            Some("Build investment agent")
+        );
     }
 
     #[test]
@@ -928,13 +965,28 @@ workspace: test-ws
         let mut state = TrajectoryEditState::default();
         let mut doc_mut = doc.clone();
         handle_key(&mut state, &mut doc_mut, key(KeyCode::Char('i')));
-        assert!(matches!(state.mode, EditMode::Insert { focus: InsertFocus::Item }));
+        assert!(matches!(
+            state.mode,
+            EditMode::Insert {
+                focus: InsertFocus::Item
+            }
+        ));
 
         handle_key(&mut state, &mut doc_mut, key(KeyCode::Tab));
-        assert!(matches!(state.mode, EditMode::Insert { focus: InsertFocus::InputCtx }));
+        assert!(matches!(
+            state.mode,
+            EditMode::Insert {
+                focus: InsertFocus::InputCtx
+            }
+        ));
 
         handle_key(&mut state, &mut doc_mut, key(KeyCode::Tab));
-        assert!(matches!(state.mode, EditMode::Insert { focus: InsertFocus::Item }));
+        assert!(matches!(
+            state.mode,
+            EditMode::Insert {
+                focus: InsertFocus::Item
+            }
+        ));
     }
 
     #[test]
@@ -1345,7 +1397,10 @@ workspace: test-ws
         let mut state = TrajectoryEditState::default();
         handle_key(&mut state, &mut doc, key(KeyCode::Char('d')));
         handle_key(&mut state, &mut doc, key(KeyCode::Char('j'))); // any other key
-        assert!(state.pending_d_at.is_none(), "d-pending should clear on non-d");
+        assert!(
+            state.pending_d_at.is_none(),
+            "d-pending should clear on non-d"
+        );
     }
 
     #[test]
@@ -1486,7 +1541,10 @@ workspace: test-ws
         state.cursor_section = 1;
         state.cursor_item = 0;
         handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
-        assert_eq!(state.cursor_item, 1, "j must still move cursor on Current surfaces");
+        assert_eq!(
+            state.cursor_item, 1,
+            "j must still move cursor on Current surfaces"
+        );
     }
 
     // ── T-phase3: empty-section cursor navigation ────────────────────────────
@@ -1512,9 +1570,11 @@ workspace: test-ws
 
     #[test]
     fn k_traverses_empty_sections_backward() {
-        let mut doc = TrajectoryDoc::default(); doc.ensure_sections();
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
         let mut state = TrajectoryEditState::default();
-        state.cursor_section = 2; state.cursor_item = 0;
+        state.cursor_section = 2;
+        state.cursor_item = 0;
         handle_key(&mut state, &mut doc, key(KeyCode::Char('k')));
         assert_eq!(state.cursor_section, 1);
         handle_key(&mut state, &mut doc, key(KeyCode::Char('k')));
@@ -1526,12 +1586,17 @@ workspace: test-ws
 
     #[test]
     fn j_from_last_item_of_goal_lands_on_empty_current_surfaces_header() {
-        let mut doc = TrajectoryDoc::default(); doc.ensure_sections();
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
         doc.sections[0].items.push(Item {
-            text: "g1".to_string(), is_checkbox: false, checked: None, surface_id: None
+            text: "g1".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
         });
         let mut state = TrajectoryEditState::default();
-        state.cursor_section = 0; state.cursor_item = 0;
+        state.cursor_section = 0;
+        state.cursor_item = 0;
         handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
         // Current surfaces is empty → cursor lands there with item=0
         assert_eq!(state.cursor_section, 1);
@@ -1540,12 +1605,17 @@ workspace: test-ws
 
     #[test]
     fn k_from_first_item_of_tasks_lands_on_empty_current_surfaces_header() {
-        let mut doc = TrajectoryDoc::default(); doc.ensure_sections();
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
         doc.sections[2].items.push(Item {
-            text: "t1".to_string(), is_checkbox: true, checked: Some(false), surface_id: None
+            text: "t1".to_string(),
+            is_checkbox: true,
+            checked: Some(false),
+            surface_id: None,
         });
         let mut state = TrajectoryEditState::default();
-        state.cursor_section = 2; state.cursor_item = 0;
+        state.cursor_section = 2;
+        state.cursor_item = 0;
         handle_key(&mut state, &mut doc, key(KeyCode::Char('k')));
         assert_eq!(state.cursor_section, 1);
         assert_eq!(state.cursor_item, 0);
@@ -1554,23 +1624,39 @@ workspace: test-ws
     #[test]
     fn i_on_empty_goal_header_after_j_navigation_still_creates_first_item() {
         // Verify the existing T3 logic still kicks in.
-        let mut doc = TrajectoryDoc::default(); doc.ensure_sections();
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
         let mut state = TrajectoryEditState::default();
-        state.cursor_section = 0; state.cursor_item = 0;
+        state.cursor_section = 0;
+        state.cursor_item = 0;
         handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
         assert!(matches!(state.mode, EditMode::Insert { .. }));
         assert_eq!(doc.sections[0].items.len(), 1);
     }
 
-        // ── Part 2 helpers: description ↔ Goal round-trip ────────────────────────
+    // ── Part 2 helpers: description ↔ Goal round-trip ────────────────────────
 
     #[test]
     fn goal_items_render_to_multi_line_description() {
         let items = vec![
-            Item { text: "first goal".to_string(), is_checkbox: false, checked: None, surface_id: None },
-            Item { text: "second refinement".to_string(), is_checkbox: false, checked: None, surface_id: None },
+            Item {
+                text: "first goal".to_string(),
+                is_checkbox: false,
+                checked: None,
+                surface_id: None,
+            },
+            Item {
+                text: "second refinement".to_string(),
+                is_checkbox: false,
+                checked: None,
+                surface_id: None,
+            },
         ];
-        let desc = items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>().join("\n");
+        let desc = items
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert_eq!(desc, "first goal\nsecond refinement");
     }
 

@@ -108,9 +108,7 @@ fn default_histories_dir() -> PathBuf {
 }
 
 fn default_device_file() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join("agents/.device")
+    dirs::home_dir().unwrap_or_default().join("agents/.device")
 }
 
 fn default_socket_path() -> PathBuf {

@@ -13,8 +13,7 @@ pub fn ensure_workspace(uuid: &str, unique_name: &str, project: &str) -> Result<
     let wp = paths::workspace_dir(uuid);
 
     // Create the tree.
-    fs::create_dir_all(&wp)
-        .with_context(|| format!("create workspace dir {wp:?}"))?;
+    fs::create_dir_all(&wp).with_context(|| format!("create workspace dir {wp:?}"))?;
     fs::create_dir_all(paths::histories_dir(uuid))?;
     fs::create_dir_all(paths::inputs_dir(uuid))?;
     fs::create_dir_all(paths::surfaces_dir(uuid))?;
@@ -45,12 +44,9 @@ pub fn ensure_workspace(uuid: &str, unique_name: &str, project: &str) -> Result<
         let _ = fs::remove_file(&link);
     } else if link.exists() {
         // exists but isn't a symlink — leave it alone, surface a clear error.
-        anyhow::bail!(
-            "{link:?} exists and is not a symlink; refusing to overwrite"
-        );
+        anyhow::bail!("{link:?} exists and is not a symlink; refusing to overwrite");
     }
-    symlink(&target, &link)
-        .with_context(|| format!("symlink {link:?} -> {target:?}"))?;
+    symlink(&target, &link).with_context(|| format!("symlink {link:?} -> {target:?}"))?;
     Ok(())
 }
 

@@ -6,7 +6,7 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
@@ -233,17 +233,24 @@ pub fn rebuild_agent_buffer(state: &mut PeekState, session_path: &Path) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Render the peek-mode pane.
-pub fn render(f: &mut Frame, area: Rect, peek: &PeekState, focused: bool) {
-    let border_color = if focused { Color::Magenta } else { Color::DarkGray };
+pub fn render(
+    f: &mut Frame,
+    area: Rect,
+    peek: &PeekState,
+    focused: bool,
+    workspace_color: Option<&str>,
+) {
+    let border_style =
+        crate::sidebar_pure::workspace_panel_border_style(workspace_color, focused, Color::Magenta);
 
     let title = format!(
         " Peek: {} (j/k slow · Space/- page · g/G top/bot · Esc back · Enter yield) ",
         peek.surface_label,
     );
     let block = Block::default()
-        .title(Span::styled(title, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(title, border_style))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
+        .border_style(border_style);
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -283,7 +290,11 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     fn make_state() -> PeekState {
-        PeekState::new("workspace:3".to_string(), "workspace:3".to_string(), PeekSource::Shell)
+        PeekState::new(
+            "workspace:3".to_string(),
+            "workspace:3".to_string(),
+            PeekSource::Shell,
+        )
     }
 
     // ── scroll_down / scroll_up ───────────────────────────────────────────────
@@ -385,7 +396,8 @@ mod tests {
             .map(|y| {
                 (0..buf.area.width)
                     .filter_map(|x| {
-                        buf.cell((x, y)).map(|c| c.symbol().chars().next().unwrap_or(' '))
+                        buf.cell((x, y))
+                            .map(|c| c.symbol().chars().next().unwrap_or(' '))
                     })
                     .collect::<String>()
             })
@@ -399,7 +411,7 @@ mod tests {
         let backend = TestBackend::new(80, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, Rect::new(0, 0, 80, 10), &ps, true))
+            .draw(|f| render(f, Rect::new(0, 0, 80, 10), &ps, true, None))
             .unwrap();
         let dump = buf_dump(&terminal);
         assert!(
@@ -410,12 +422,16 @@ mod tests {
 
     #[test]
     fn render_shows_surface_id_in_title() {
-        let mut ps = PeekState::new("workspace:5".to_string(), "my-surface".to_string(), PeekSource::Shell);
+        let mut ps = PeekState::new(
+            "workspace:5".to_string(),
+            "my-surface".to_string(),
+            PeekSource::Shell,
+        );
         ps.ingest_screen("hello world\n");
         let backend = TestBackend::new(80, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, Rect::new(0, 0, 80, 10), &ps, true))
+            .draw(|f| render(f, Rect::new(0, 0, 80, 10), &ps, true, None))
             .unwrap();
         let dump = buf_dump(&terminal);
         assert!(
@@ -436,7 +452,7 @@ mod tests {
         let backend = TestBackend::new(80, 15);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, Rect::new(0, 0, 80, 15), &ps, true))
+            .draw(|f| render(f, Rect::new(0, 0, 80, 15), &ps, true, None))
             .unwrap();
         let dump = buf_dump(&terminal);
         assert!(
@@ -453,7 +469,7 @@ mod tests {
         let backend = TestBackend::new(80, 5);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, Rect::new(0, 0, 80, 5), &ps, true))
+            .draw(|f| render(f, Rect::new(0, 0, 80, 5), &ps, true, None))
             .unwrap();
         let dump = buf_dump(&terminal);
         // With a 5-row pane (3 inner rows) and 2 lines of content scrolled to
@@ -466,7 +482,10 @@ mod tests {
     #[test]
     fn auto_follow_initially_true() {
         let ps = make_state();
-        assert!(ps.auto_follow, "auto_follow should default to true on new()");
+        assert!(
+            ps.auto_follow,
+            "auto_follow should default to true on new()"
+        );
     }
 
     #[test]
@@ -481,7 +500,10 @@ mod tests {
         ps.ingest_screen("new-line-a\nnew-line-b\n");
         // After ingest, scroll_offset should be at the buffer's max (bottom).
         assert_eq!(ps.scroll_offset, ps.max_scroll());
-        assert!(ps.auto_follow, "ingest must not disable auto_follow on its own");
+        assert!(
+            ps.auto_follow,
+            "ingest must not disable auto_follow on its own"
+        );
     }
 
     #[test]
@@ -600,7 +622,10 @@ mod tests {
     #[test]
     fn rebuild_agent_buffer_assembles_turns_with_truncation() {
         // Build a session log where the assistant turn has > 100 words.
-        let long_response: String = (0..120).map(|i| format!("word{i}")).collect::<Vec<_>>().join(" ");
+        let long_response: String = (0..120)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let log = format!(
             "---\nworkspace_id: test\n---\n\n## 09:00 PT \u{2014} boyan\nhello there\n\n---\n\n## 09:01 PT \u{2014} claude\n{long_response}\n"
         );
@@ -610,7 +635,9 @@ mod tests {
         let mut ps = PeekState::new(
             "workspace:1".to_string(),
             "test".to_string(),
-            PeekSource::Agent { session_path: tmp.path().to_path_buf() },
+            PeekSource::Agent {
+                session_path: tmp.path().to_path_buf(),
+            },
         );
         rebuild_agent_buffer(&mut ps, tmp.path());
 
@@ -618,37 +645,59 @@ mod tests {
         assert!(!ps.screen_buffer.is_empty());
 
         // Find the line that starts with "## 09:01" — that's the assistant header.
-        let assistant_header = ps.screen_buffer.iter().find(|l| l.contains("09:01")).unwrap();
-        assert!(assistant_header.contains("claude"), "expected claude in header: {assistant_header}");
+        let assistant_header = ps
+            .screen_buffer
+            .iter()
+            .find(|l| l.contains("09:01"))
+            .unwrap();
+        assert!(
+            assistant_header.contains("claude"),
+            "expected claude in header: {assistant_header}"
+        );
 
         // The content line after the assistant header should contain "…" (truncated).
-        let assistant_header_idx = ps.screen_buffer.iter().position(|l| l.contains("09:01")).unwrap();
-        let content_after = ps.screen_buffer[assistant_header_idx + 1..].iter()
+        let assistant_header_idx = ps
+            .screen_buffer
+            .iter()
+            .position(|l| l.contains("09:01"))
+            .unwrap();
+        let content_after = ps.screen_buffer[assistant_header_idx + 1..]
+            .iter()
             .find(|l| !l.is_empty())
             .unwrap();
-        assert!(content_after.contains('…'), "expected ellipsis in truncated turn: {content_after}");
+        assert!(
+            content_after.contains('…'),
+            "expected ellipsis in truncated turn: {content_after}"
+        );
     }
 
     #[test]
     fn rebuild_agent_buffer_preserves_user_turns_verbatim() {
         let user_text = "please do the thing exactly as I described";
-        let log = format!(
-            "---\nworkspace_id: test\n---\n\n## 10:00 PT \u{2014} boyan\n{user_text}\n"
-        );
+        let log =
+            format!("---\nworkspace_id: test\n---\n\n## 10:00 PT \u{2014} boyan\n{user_text}\n");
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &log).unwrap();
 
         let mut ps = PeekState::new(
             "workspace:1".to_string(),
             "test".to_string(),
-            PeekSource::Agent { session_path: tmp.path().to_path_buf() },
+            PeekSource::Agent {
+                session_path: tmp.path().to_path_buf(),
+            },
         );
         rebuild_agent_buffer(&mut ps, tmp.path());
 
         // The buffer should contain the user's text verbatim.
         let joined = ps.screen_buffer.join("\n");
-        assert!(joined.contains(user_text), "user text not verbatim in buffer: {joined}");
+        assert!(
+            joined.contains(user_text),
+            "user text not verbatim in buffer: {joined}"
+        );
         // No ellipsis — user turn is short.
-        assert!(!joined.contains('…'), "user turn should not be truncated: {joined}");
+        assert!(
+            !joined.contains('…'),
+            "user turn should not be truncated: {joined}"
+        );
     }
 }

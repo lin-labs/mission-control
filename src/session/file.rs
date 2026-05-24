@@ -34,8 +34,8 @@ pub struct SessionFile {
 
 impl SessionFile {
     pub fn parse(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         Self::parse_str(&content, path.to_path_buf())
     }
 
@@ -62,7 +62,10 @@ impl SessionFile {
             match section {
                 None => {
                     let trimmed = line.trim();
-                    if trimmed.starts_with("- ") && !trimmed.starts_with("- [ ]") && !trimmed.starts_with("- [x]") {
+                    if trimmed.starts_with("- ")
+                        && !trimmed.starts_with("- [ ]")
+                        && !trimmed.starts_with("- [x]")
+                    {
                         bullets.push(trimmed.trim_start_matches("- ").to_string());
                     } else if !trimmed.is_empty() {
                         other_body.push_str(line);
@@ -148,8 +151,7 @@ fn split_frontmatter(content: &str) -> Result<(Frontmatter, String)> {
     let yaml_str = &after_first[..end];
     let body = &after_first[end + 4..];
 
-    let frontmatter: Frontmatter = serde_yaml::from_str(yaml_str.trim())
-        .unwrap_or_default();
+    let frontmatter: Frontmatter = serde_yaml::from_str(yaml_str.trim()).unwrap_or_default();
 
     Ok((frontmatter, body.trim_start_matches('\n').to_string()))
 }

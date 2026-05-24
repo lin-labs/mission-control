@@ -27,11 +27,7 @@ pub fn collect_digests(app: &App) -> Vec<WorkspaceDigest> {
         .map(|ws| WorkspaceDigest {
             name: ws.workspace.name.clone(),
             status_label: derive_status_label(ws),
-            turn_count: ws
-                .session
-                .as_ref()
-                .map(|s| s.bullets.len())
-                .unwrap_or(0),
+            turn_count: ws.session.as_ref().map(|s| s.bullets.len()).unwrap_or(0),
             last_summary: ws.summary.as_ref().map(|s| s.trajectory.clone()),
             next_steps: ws
                 .summary
@@ -61,7 +57,9 @@ fn derive_status_label(ws: &crate::tui::app::WorkspaceState) -> String {
 /// Always under the iCloud-synced Obsidian Agents vault.
 pub fn output_dir() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_default();
-    home.join("Library/Mobile Documents/iCloud~md~obsidian/Documents/Agents/mc-workspaces-summaries")
+    home.join(
+        "Library/Mobile Documents/iCloud~md~obsidian/Documents/Agents/mc-workspaces-summaries",
+    )
 }
 
 /// Compute the report path for `now`, falling back to minute-/second-suffixed
@@ -157,14 +155,8 @@ pub fn build_document(
 ) -> String {
     let mut s = String::new();
     s.push_str("---\n");
-    s.push_str(&format!(
-        "generated_at: {}\n",
-        generated_at.to_rfc3339()
-    ));
-    s.push_str(&format!(
-        "mc_version: {}\n",
-        env!("CARGO_PKG_VERSION")
-    ));
+    s.push_str(&format!("generated_at: {}\n", generated_at.to_rfc3339()));
+    s.push_str(&format!("mc_version: {}\n", env!("CARGO_PKG_VERSION")));
     if digests.is_empty() {
         s.push_str("workspaces: []\n");
     } else {
@@ -206,8 +198,7 @@ pub fn atomic_write(path: &Path, contents: &str) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("mkdir -p {}", parent.display()))?;
     }
-    std::fs::write(&tmp, contents)
-        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
@@ -368,11 +359,7 @@ mod tests {
             })
         }
 
-        async fn regenerate_trajectory(
-            &self,
-            _sys: &str,
-            _user: &str,
-        ) -> anyhow::Result<String> {
+        async fn regenerate_trajectory(&self, _sys: &str, _user: &str) -> anyhow::Result<String> {
             Ok(self.body.clone())
         }
     }

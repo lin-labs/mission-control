@@ -69,7 +69,10 @@ pub fn obsagents_root() -> PathBuf {
 }
 
 pub fn project_prompts_dir(project: &str) -> PathBuf {
-    obsagents_root().join("Projects").join(project).join("prompts")
+    obsagents_root()
+        .join("Projects")
+        .join(project)
+        .join("prompts")
 }
 
 pub fn rules_path(project: &str) -> PathBuf {
@@ -104,10 +107,7 @@ pub fn rule_id(pattern: &str) -> String {
 impl Rule {
     /// Render to the compact 3-line block format used inside rules.md.
     pub fn to_markdown_block(&self) -> String {
-        let last_fired = self
-            .last_fired
-            .as_deref()
-            .unwrap_or("never");
+        let last_fired = self.last_fired.as_deref().unwrap_or("never");
         format!(
             "- PATTERN: \"{}\"\n  EXPANSION: \"{}\"\n  confidence: {}  added: {} by {}  last-fired: {}  hits: {}",
             self.pattern,
@@ -184,8 +184,7 @@ impl PromptRules {
                 stale: vec![],
             });
         }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {path:?}"))?;
+        let text = std::fs::read_to_string(&path).with_context(|| format!("read {path:?}"))?;
         Self::parse(&text, project)
     }
 
@@ -193,14 +192,11 @@ impl PromptRules {
     pub fn save(&self) -> Result<()> {
         let path = rules_path(&self.project);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create dir {parent:?}"))?;
+            std::fs::create_dir_all(parent).with_context(|| format!("create dir {parent:?}"))?;
         }
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, self.to_markdown())
-            .with_context(|| format!("write {tmp:?}"))?;
-        std::fs::rename(&tmp, &path)
-            .with_context(|| format!("rename {tmp:?} -> {path:?}"))?;
+        std::fs::write(&tmp, self.to_markdown()).with_context(|| format!("write {tmp:?}"))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("rename {tmp:?} -> {path:?}"))?;
         Ok(())
     }
 }
@@ -217,9 +213,7 @@ pub fn parse_proposal_file(text: &str) -> Result<Vec<Rule>> {
     while i < lines.len() {
         let line = lines[i].trim();
         // Match ticked checkbox followed by PATTERN
-        if (line.starts_with("- [x]") || line.starts_with("- [X]"))
-            && line.contains("PATTERN:")
-        {
+        if (line.starts_with("- [x]") || line.starts_with("- [X]")) && line.contains("PATTERN:") {
             if let Some(rule) = parse_proposal_rule_block(&lines, i) {
                 rules.push(rule);
                 // Skip forward past this block
@@ -300,7 +294,10 @@ fn parse_rule_blocks(section: &str) -> Vec<Rule> {
 fn parse_rule_block_from_lines(lines: &[&str], start: usize) -> Option<Rule> {
     let pattern_line = lines.get(start)?.trim();
     // Strip the `- ` bullet prefix before PATTERN:
-    let pattern_part = pattern_line.trim_start_matches("- ").trim_start_matches('-').trim();
+    let pattern_part = pattern_line
+        .trim_start_matches("- ")
+        .trim_start_matches('-')
+        .trim();
     let pattern = extract_quoted(pattern_part, "PATTERN:")?;
 
     let expansion_line = lines.get(start + 1)?.trim();
@@ -389,20 +386,33 @@ fn parse_meta_line(line: &str) -> Option<(Confidence, String, String, Option<Str
     let added = extract_field(line, "added:")?;
     // added field looks like "2026-05-23 by predinvest"
     let (added_date, added_by) = if let Some(idx) = added.find(" by ") {
-        (added[..idx].trim().to_string(), added[idx + 4..].trim().to_string())
+        (
+            added[..idx].trim().to_string(),
+            added[idx + 4..].trim().to_string(),
+        )
     } else {
-        (added.split_whitespace().next().unwrap_or("").to_string(), String::new())
+        (
+            added.split_whitespace().next().unwrap_or("").to_string(),
+            String::new(),
+        )
     };
 
     // last-fired: YYYY-MM-DD  (or "never")
-    let last_fired = extract_field(line, "last-fired:").map(|v| {
-        let v = v.trim().split_whitespace().next().unwrap_or("").to_string();
-        if v == "never" { None } else { Some(v) }
-    }).unwrap_or(None);
+    let last_fired = extract_field(line, "last-fired:")
+        .map(|v| {
+            let v = v.trim().split_whitespace().next().unwrap_or("").to_string();
+            if v == "never" { None } else { Some(v) }
+        })
+        .unwrap_or(None);
 
     // hits: N
     let hits: u32 = extract_field(line, "hits:")
-        .and_then(|v| v.trim().split_whitespace().next().map(|s| s.parse().unwrap_or(0)))
+        .and_then(|v| {
+            v.trim()
+                .split_whitespace()
+                .next()
+                .map(|s| s.parse().unwrap_or(0))
+        })
         .unwrap_or(0);
 
     Some((confidence, added_date, added_by, last_fired, hits))

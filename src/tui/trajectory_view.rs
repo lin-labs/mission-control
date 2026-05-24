@@ -22,21 +22,23 @@ pub fn render(
     focused: bool,
     edit_state: Option<&TrajectoryEditState>,
     peek_state: Option<&PeekState>,
+    workspace_color: Option<&str>,
 ) {
     // If in peek mode, delegate entirely to peek_view.
     if let Some(peek) = peek_state {
-        crate::tui::peek_view::render(f, area, peek, focused);
+        crate::tui::peek_view::render(f, area, peek, focused, workspace_color);
         return;
     }
     let in_insert = edit_state
         .map(|s| matches!(s.mode, EditMode::Insert { .. }))
         .unwrap_or(false);
 
-    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
+    let border_style =
+        crate::sidebar_pure::workspace_panel_border_style(workspace_color, focused, Color::Cyan);
     let block = Block::default()
-        .title(" Detail ")
+        .title(Span::styled(" Detail ", border_style))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
+        .border_style(border_style);
 
     let doc = match doc {
         Some(d) => d,
@@ -63,9 +65,9 @@ pub fn render(
 
     // ── Body block ───────────────────────────────────────────────────────────
     let body_block = Block::default()
-        .title(" Detail ")
+        .title(Span::styled(" Detail ", border_style))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
+        .border_style(border_style);
     let body_inner = body_block.inner(body_area);
     f.render_widget(body_block, body_area);
 
@@ -113,7 +115,9 @@ pub fn render(
 
                 // When this item is the one being edited, use the buffer text.
                 let display_text: &str = if is_insert_cursor {
-                    edit_state.map(|s| s.edit_buffer.as_str()).unwrap_or(&item.text)
+                    edit_state
+                        .map(|s| s.edit_buffer.as_str())
+                        .unwrap_or(&item.text)
                 } else {
                     &item.text
                 };
@@ -137,9 +141,7 @@ pub fn render(
                     // Nav mode cursor: highlight with Cyan background.
                     Line::from(Span::styled(
                         format!("{prefix}{display_text}"),
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Cyan),
+                        Style::default().fg(Color::Black).bg(Color::Cyan),
                     ))
                 } else if is_insert_cursor {
                     // Insert mode cursor: render with a block cursor at cursor_col.
@@ -166,9 +168,7 @@ pub fn render(
                         ),
                         Span::styled(
                             cursor_char,
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Yellow),
+                            Style::default().fg(Color::Black).bg(Color::Yellow),
                         ),
                         Span::styled(
                             after,
@@ -202,9 +202,18 @@ pub fn render(
         let ctx_inner = ctx_block.inner(ctx_area);
         f.render_widget(ctx_block, ctx_area);
 
-        let ctx_buf = edit_state.map(|s| s.input_ctx_buffer.as_str()).unwrap_or("");
+        let ctx_buf = edit_state
+            .map(|s| s.input_ctx_buffer.as_str())
+            .unwrap_or("");
         let focus_on_ctx = edit_state
-            .map(|s| matches!(s.mode, EditMode::Insert { focus: InsertFocus::InputCtx }))
+            .map(|s| {
+                matches!(
+                    s.mode,
+                    EditMode::Insert {
+                        focus: InsertFocus::InputCtx
+                    }
+                )
+            })
             .unwrap_or(false);
 
         let separator_style = Style::default().fg(Color::DarkGray);
@@ -277,16 +286,33 @@ workspace: predinvest
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, Rect::new(0, 0, 80, 20), Some(&doc), 0, false, None, None))
+            .draw(|f| {
+                render(
+                    f,
+                    Rect::new(0, 0, 80, 20),
+                    Some(&doc),
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+            })
             .unwrap();
         let dump = buf_dump(&terminal);
         assert!(dump.contains("Goal"), "missing Goal header: {dump}");
-        assert!(dump.contains("Current surfaces"), "missing Current surfaces header");
+        assert!(
+            dump.contains("Current surfaces"),
+            "missing Current surfaces header"
+        );
         assert!(dump.contains("Tasks & Progress"), "missing Tasks header");
         assert!(dump.contains("Build self-improvement"), "missing Goal item");
         assert!(dump.contains("writing tests"), "missing surface text");
         assert!(dump.contains("sprint-01 done"), "missing task text");
-        assert!(!dump.contains("mc:surface:"), "leaked surface comment into UI");
+        assert!(
+            !dump.contains("mc:surface:"),
+            "leaked surface comment into UI"
+        );
     }
 
     #[test]
@@ -294,7 +320,7 @@ workspace: predinvest
         let backend = TestBackend::new(80, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, Rect::new(0, 0, 80, 10), None, 0, false, None, None))
+            .draw(|f| render(f, Rect::new(0, 0, 80, 10), None, 0, false, None, None, None))
             .unwrap();
         let dump = buf_dump(&terminal);
         assert!(dump.contains("No trajectory") || dump.contains("no trajectory"));
@@ -313,7 +339,18 @@ workspace: predinvest
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, Rect::new(0, 0, 80, 24), Some(&doc), 0, true, Some(&state), None))
+            .draw(|f| {
+                render(
+                    f,
+                    Rect::new(0, 0, 80, 24),
+                    Some(&doc),
+                    0,
+                    true,
+                    Some(&state),
+                    None,
+                    None,
+                )
+            })
             .unwrap();
         let buf = terminal.backend().buffer();
         // The cursor cell (first item in Goal) should have a Cyan background.
@@ -321,7 +358,10 @@ workspace: predinvest
         let mut found = false;
         'outer: for y in 0..buf.area.height {
             let row: String = (0..buf.area.width)
-                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().chars().next().unwrap_or(' ')))
+                .filter_map(|x| {
+                    buf.cell((x, y))
+                        .map(|c| c.symbol().chars().next().unwrap_or(' '))
+                })
                 .collect();
             if row.contains("Build self-improvement") {
                 // Check the background color of one of those cells.
@@ -350,17 +390,33 @@ workspace: predinvest
         let state = TrajectoryEditState {
             cursor_section: 0,
             cursor_item: 0,
-            mode: EditMode::Insert { focus: InsertFocus::Item },
+            mode: EditMode::Insert {
+                focus: InsertFocus::Item,
+            },
             edit_buffer: "Edited goal".to_string(),
             ..Default::default()
         };
         let backend = TestBackend::new(80, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, Rect::new(0, 0, 80, 30), Some(&doc), 0, true, Some(&state), None))
+            .draw(|f| {
+                render(
+                    f,
+                    Rect::new(0, 0, 80, 30),
+                    Some(&doc),
+                    0,
+                    true,
+                    Some(&state),
+                    None,
+                    None,
+                )
+            })
             .unwrap();
         let dump = buf_dump(&terminal);
-        assert!(dump.contains("input context"), "missing input context strip");
+        assert!(
+            dump.contains("input context"),
+            "missing input context strip"
+        );
         assert!(dump.contains("Edited goal"), "buffer text not shown");
     }
 
@@ -379,14 +435,28 @@ workspace: predinvest
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, Rect::new(0, 0, 80, 20), Some(&doc), 0, true, Some(&state), None))
+            .draw(|f| {
+                render(
+                    f,
+                    Rect::new(0, 0, 80, 20),
+                    Some(&doc),
+                    0,
+                    true,
+                    Some(&state),
+                    None,
+                    None,
+                )
+            })
             .unwrap();
         let buf = terminal.backend().buffer();
         // Find the row containing "Current surfaces" and verify Cyan background.
         let mut found = false;
         'outer: for y in 0..buf.area.height {
             let row: String = (0..buf.area.width)
-                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().chars().next().unwrap_or(' ')))
+                .filter_map(|x| {
+                    buf.cell((x, y))
+                        .map(|c| c.symbol().chars().next().unwrap_or(' '))
+                })
                 .collect();
             if row.contains("Current surfaces") {
                 for x in 0..buf.area.width {
@@ -407,26 +477,68 @@ workspace: predinvest
         assert!(found, "did not find highlighted empty-section header");
     }
 
-        #[test]
+    #[test]
     fn render_insert_mode_shows_edit_buffer_text() {
         let mut doc = TrajectoryDoc::parse(SAMPLE).unwrap();
         doc.ensure_sections();
         let state = TrajectoryEditState {
             cursor_section: 2, // Tasks
             cursor_item: 1,    // sprint-02
-            mode: EditMode::Insert { focus: InsertFocus::Item },
+            mode: EditMode::Insert {
+                focus: InsertFocus::Item,
+            },
             edit_buffer: "sprint-02 in progress".to_string(),
             ..Default::default()
         };
         let backend = TestBackend::new(80, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| render(f, Rect::new(0, 0, 80, 30), Some(&doc), 0, true, Some(&state), None))
+            .draw(|f| {
+                render(
+                    f,
+                    Rect::new(0, 0, 80, 30),
+                    Some(&doc),
+                    0,
+                    true,
+                    Some(&state),
+                    None,
+                    None,
+                )
+            })
             .unwrap();
         let dump = buf_dump(&terminal);
         assert!(
             dump.contains("sprint-02 in progress"),
             "edit buffer text not shown: {dump}"
         );
+    }
+
+    #[test]
+    fn render_uses_workspace_accent_for_detail_border() {
+        let doc = TrajectoryDoc::parse(SAMPLE).unwrap();
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    Rect::new(0, 0, 80, 20),
+                    Some(&doc),
+                    0,
+                    false,
+                    None,
+                    None,
+                    Some("#C0392B"),
+                )
+            })
+            .unwrap();
+
+        let border_cell = terminal
+            .backend()
+            .buffer()
+            .cell((0, 0))
+            .expect("top-left border cell should exist");
+        assert_eq!(border_cell.style().fg, Some(Color::Rgb(0xC0, 0x39, 0x2B)));
     }
 }

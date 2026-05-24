@@ -6,14 +6,14 @@ pub struct LearningInputs {
     pub workspace_uuid: String,
     pub workspace_name: String,
     pub project: String,
-    pub duration: String,               // e.g. "3h 42m"
-    pub surfaces_summary: Vec<String>,  // ["claude", "codex", "shell"]
-    pub final_trajectory: String,       // markdown
-    pub history_snapshots: Vec<String>, // markdown each
-    pub inputs: Vec<String>,            // contents of inputs/*.txt
-    pub events_jsonl: String,           // full events log
+    pub duration: String,                   // e.g. "3h 42m"
+    pub surfaces_summary: Vec<String>,      // ["claude", "codex", "shell"]
+    pub final_trajectory: String,           // markdown
+    pub history_snapshots: Vec<String>,     // markdown each
+    pub inputs: Vec<String>,                // contents of inputs/*.txt
+    pub events_jsonl: String,               // full events log
     pub session_history_files: Vec<String>, // for each agent surface, the content
-    pub shell_logs: Vec<String>,        // for each shell surface, the content
+    pub shell_logs: Vec<String>,            // for each shell surface, the content
     pub surface_summaries: Vec<String>,
 }
 
@@ -28,7 +28,9 @@ pub async fn produce_learning(
     inputs: &LearningInputs,
 ) -> Result<LearningOutputs> {
     let (system_prompt, user_prompt) = build_split_prompt(inputs);
-    let response = summarizer.regenerate_trajectory(&system_prompt, &user_prompt).await?;
+    let response = summarizer
+        .regenerate_trajectory(&system_prompt, &user_prompt)
+        .await?;
     // For Phase 5 v1: assume the LLM returns the full 9-section record.
     // Split off the "Prompt-optimization candidates" section into a separate proposals file.
     let candidates = extract_candidates_section(&response);
@@ -71,20 +73,26 @@ pub fn build_prompt(inputs: &LearningInputs) -> String {
     prompt.push_str("Produce exactly 9 sections in this order:\n");
     prompt.push_str("1. ## Goal arc — 3-7 bullets citing snapshot numbers (e.g. [snap-3])\n");
     prompt.push_str("2. ## Final trajectory — verbatim content of the final trajectory.md\n");
-    prompt.push_str("3. ## Key turns — 5-15 bullets citing event IDs/snapshots (most significant decisions)\n");
+    prompt.push_str(
+        "3. ## Key turns — 5-15 bullets citing event IDs/snapshots (most significant decisions)\n",
+    );
     prompt.push_str("4. ## Surfaces — per-surface narrative paragraph (what each surface did)\n");
     prompt.push_str("5. ## Outputs — concrete artifacts: files, commits, tests, docs\n");
     prompt.push_str("6. ## Tooling & infra improvements — friction points and suggestions\n");
     prompt.push_str("7. ## Skill recommendations — new or improved skills that would help\n");
-    prompt.push_str("8. ## User prompt improvements — how the user could prompt more effectively\n");
-    prompt.push_str("9. ## Prompt-optimization candidates — PATTERN/EXPANSION pairs in this format:\n");
+    prompt
+        .push_str("8. ## User prompt improvements — how the user could prompt more effectively\n");
+    prompt.push_str(
+        "9. ## Prompt-optimization candidates — PATTERN/EXPANSION pairs in this format:\n",
+    );
     prompt.push_str("   - [ ] PATTERN: \"<trigger text>\"\n");
     prompt.push_str("         EXPANSION: \"<full instruction>\"\n");
     prompt.push_str("         confidence: high|med|low\n");
     prompt.push_str("         evidence: <which events/turns support this>\n\n");
     prompt.push_str("Rules:\n");
     prompt.push_str("- Be specific and actionable, not vague.\n");
-    prompt.push_str("- Every claim should cite evidence (event ID, snapshot number, or surface).\n");
+    prompt
+        .push_str("- Every claim should cite evidence (event ID, snapshot number, or surface).\n");
     prompt.push_str("- Section 9 candidates should have PATTERN strings that are realistic\n");
     prompt.push_str("  trigger phrases a user would actually type.\n");
     prompt.push_str("- Output nothing outside the 9 sections.\n\n");
@@ -142,8 +150,20 @@ pub fn build_prompt(inputs: &LearningInputs) -> String {
     if !inputs.shell_logs.is_empty() {
         prompt.push_str("## Shell command logs\n");
         for (i, log) in inputs.shell_logs.iter().enumerate() {
-            let preview: String = log.lines().rev().take(50).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-            prompt.push_str(&format!("### Shell surface {}\n{}\n\n", i + 1, preview.trim()));
+            let preview: String = log
+                .lines()
+                .rev()
+                .take(50)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            prompt.push_str(&format!(
+                "### Shell surface {}\n{}\n\n",
+                i + 1,
+                preview.trim()
+            ));
         }
     }
 
@@ -167,7 +187,10 @@ pub fn extract_candidates_section(response: &str) -> Option<String> {
     let start_pos = response.find(heading)?;
     // Start after the heading line (skip to next newline)
     let after_heading = &response[start_pos..];
-    let content_start = after_heading.find('\n').map(|p| p + 1).unwrap_or(after_heading.len());
+    let content_start = after_heading
+        .find('\n')
+        .map(|p| p + 1)
+        .unwrap_or(after_heading.len());
     let content = &after_heading[content_start..];
 
     // Find the next `## ` heading after this one, or take the rest.
@@ -201,9 +224,7 @@ pub fn format_as_proposals_file(candidates: &str, workspace_name: &str) -> Strin
         "# Prompt-optimization candidates — {workspace_name} {date}\n\n"
     ));
     out.push_str("Tick the rules you want to promote to `rules.md`.\n");
-    out.push_str(
-        "Run `mc promote-rules <this-file>` to apply checked rules.\n\n"
-    );
+    out.push_str("Run `mc promote-rules <this-file>` to apply checked rules.\n\n");
     out.push_str("Rules:\n\n");
     out.push_str(candidates);
     out.push('\n');
@@ -234,7 +255,10 @@ mod tests {
     fn extract_candidates_stops_at_next_heading() {
         let resp = "## Prompt-optimization candidates\n- [ ] PATTERN: \"foo\"\n\n## Other section\n- not this\n";
         let content = extract_candidates_section(resp).unwrap();
-        assert!(!content.contains("not this"), "should not include content past next heading");
+        assert!(
+            !content.contains("not this"),
+            "should not include content past next heading"
+        );
         assert!(content.contains("foo"));
     }
 
@@ -265,7 +289,13 @@ mod tests {
             surface_summaries: vec![],
         };
         let prompt = build_prompt(&inputs);
-        assert!(prompt.contains("Build a thing"), "prompt should contain trajectory content");
-        assert!(prompt.contains("test-ws"), "prompt should contain workspace name");
+        assert!(
+            prompt.contains("Build a thing"),
+            "prompt should contain trajectory content"
+        );
+        assert!(
+            prompt.contains("test-ws"),
+            "prompt should contain workspace name"
+        );
     }
 }
