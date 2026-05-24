@@ -15,6 +15,9 @@ struct WorkspacesJson {
 struct WorkspaceJson {
     #[serde(rename = "ref")]
     ref_id: String,
+    /// cmux emits the UUID as `id`, and only when `--id-format both` (or `uuids`)
+    /// is passed. We always pass `--id-format both` so this is reliable.
+    #[serde(rename = "id")]
     uuid: String,
     /// Display name of the workspace (the `title` field in cmux JSON output).
     title: String,
@@ -58,15 +61,18 @@ impl CmuxClient {
         cmd
     }
 
-    /// Parse `cmux list-workspaces --json` output.
-    /// JSON shape: `{ "workspaces": [{ "ref": "workspace:N", "uuid": "...",
+    /// Parse `cmux list-workspaces --json --id-format both` output.
+    /// JSON shape: `{ "workspaces": [{ "ref": "workspace:N", "id": "<uuid>",
     ///               "title": "name", "description": null, "selected": false, ... }] }`
+    ///
+    /// `--id-format both` is required — without it the JSON omits the `id`
+    /// (UUID) field entirely, which we need to key per-workspace data dirs.
     pub async fn list_workspaces(&self) -> Result<Vec<Workspace>> {
         let output = self.cmd()
-            .args(["list-workspaces", "--json"])
+            .args(["list-workspaces", "--json", "--id-format", "both"])
             .output()
             .await
-            .context("failed to run cmux list-workspaces --json")?;
+            .context("failed to run cmux list-workspaces --json --id-format both")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
