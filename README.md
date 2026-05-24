@@ -86,6 +86,47 @@ Workspace renames in cmux atomically `mv` the display symlink — the UUID-keyed
 data dir never moves. If you want to bootstrap the data root explicitly,
 run `mc setup` once.
 
+## Session logs
+
+Cross-agent session logs live at `~obsAgents/Sessions/<date>-<hour>-<slug>.md`,
+one file per session, with each turn appended (verbatim user prompts + focused
+assistant summaries). mc-tui reads the last user turn from this file as the
+canonical "what the user asked" signal for trajectory regeneration — no screen
+scraping.
+
+Run `mc setup` once to install the histories symlinks that point each agent's
+history directory at this canonical location, so Claude, Codex, and Cursor all
+write to (and read from) the same file.
+
+Format:
+
+```text
+---
+date: 2026-05-23
+start: 17:30
+topic: <slug>
+agent: claude | codex | cursor
+host: <hostname>
+workspace_id: <cmux workspace uuid>
+status: working | waiting | done
+---
+
+## HH:MM PT — boyan
+<verbatim user prompt>
+
+---
+
+## HH:MM PT — claude
+<focused summary of what was done>
+
+---
+```
+
+If the conversation pivots, the slug can be renamed in place — agents are
+expected to rename the file (and update any diary wikilinks) when the topic
+shifts. The file survives in-memory context compaction: it IS the durable
+conversation record.
+
 ## Trajectory doc (experimental)
 
 If a workspace has a `trajectory.md` file in its data dir, mc-tui renders
