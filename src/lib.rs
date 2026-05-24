@@ -5,3 +5,5 @@
 pub mod mc_data;
 pub mod cli;
 pub mod llm;
+/// Pure sidebar helpers (no binary-only deps); exposed for integration tests.
+pub mod sidebar_pure;

@@ -14,6 +14,9 @@ pub fn render_sidebar(
     selected: usize,
     focused: bool,
 ) {
+    // Inner width = area width minus 2 border columns.
+    let inner_width = area.width.saturating_sub(2);
+
     let items: Vec<ListItem> = workspaces
         .iter()
         .map(|ws| {
@@ -32,7 +35,7 @@ pub fn render_sidebar(
                 .map(|h| format!(" [{}]", h))
                 .unwrap_or_default();
 
-            let line = Line::from(vec![
+            let name_line = Line::from(vec![
                 Span::styled(format!("{} ", leader), Style::default().fg(leader_color)),
                 Span::styled(
                     ws.workspace.name.clone(),
@@ -40,7 +43,15 @@ pub fn render_sidebar(
                 ),
                 Span::styled(host_badge, Style::default().fg(Color::DarkGray)),
             ]);
-            ListItem::new(line)
+
+            // Optionally render a dim description subtitle line.
+            if let Some(sub) =
+                description_subtitle_line(ws.workspace.description.as_deref(), inner_width)
+            {
+                ListItem::new(vec![name_line, sub])
+            } else {
+                ListItem::new(name_line)
+            }
         })
         .collect();
 
@@ -62,6 +73,53 @@ pub fn render_sidebar(
     state.select(Some(selected));
 
     f.render_stateful_widget(list, area, &mut state);
+}
+
+/// Build the dim subtitle `Line` for a workspace description, or `None` if there is nothing to
+/// show.
+///
+/// Rules:
+/// - Only the first line of `description` is used (split on `\n`).
+/// - Leading/trailing whitespace is trimmed.
+/// - The result is indented by 2 spaces.
+/// - If the text (after indent) would exceed `sidebar_inner_width`, it is truncated with `…`.
+/// - Returns `None` when `description` is `None` or blank after trimming.
+///
+/// The same function is exposed from the library crate at
+/// `mission_control::sidebar_pure::description_subtitle_line` for integration tests.
+pub fn description_subtitle_line(
+    description: Option<&str>,
+    sidebar_inner_width: u16,
+) -> Option<Line<'static>> {
+    let raw = description?;
+    let first = raw.lines().next().unwrap_or("").trim();
+    if first.is_empty() {
+        return None;
+    }
+
+    // Available columns: inner_width minus 2-space indent, minus 1 for the possible ellipsis.
+    // We need at least 1 column for content.
+    let indent = "  ";
+    let indent_len = 2u16;
+    let max_text_cols = sidebar_inner_width.saturating_sub(indent_len).saturating_sub(1);
+    if max_text_cols == 0 {
+        return None;
+    }
+
+    // Count Unicode scalar values (chars) as a proxy for display columns (ASCII-safe).
+    let char_count = first.chars().count();
+    let text: String = if char_count > max_text_cols as usize {
+        let truncated: String = first.chars().take(max_text_cols as usize).collect();
+        format!("{}…", truncated)
+    } else {
+        first.to_owned()
+    };
+
+    let line = Line::from(vec![
+        Span::raw(indent),
+        Span::styled(text, Style::default().fg(Color::DarkGray)),
+    ]);
+    Some(line)
 }
 
 fn status_indicator(ws: &WorkspaceState) -> (&str, Color) {
