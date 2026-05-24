@@ -14,7 +14,8 @@ pub async fn summarize(
     inputs: &SurfaceSummaryInputs,
 ) -> Result<String> {
     let prompt = build_prompt(inputs);
-    let response = summarizer.regenerate_trajectory(&prompt).await?;
+    // surface_summary is a short, stateless call — pass empty system and full prompt as user.
+    let response = summarizer.regenerate_trajectory("", &prompt).await?;
     // Trim to one line, max 80 chars
     let summary = response
         .lines()

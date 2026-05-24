@@ -26,7 +26,7 @@ impl Summarizer for MockSummarizer {
         })
     }
 
-    async fn regenerate_trajectory(&self, _prompt: &str) -> Result<String> {
+    async fn regenerate_trajectory(&self, _system: &str, _user: &str) -> Result<String> {
         Ok(self.response.clone())
     }
 }
@@ -47,14 +47,15 @@ fn build_prompt_contains_trajectory_text() {
         user_ask: None,
     };
 
-    let prompt = build_prompt(&inputs);
+    let p = build_prompt(&inputs);
+    let combined = format!("{}\n\n{}", p.system, p.user);
 
     assert!(
-        prompt.contains("## Goal"),
+        combined.contains("## Goal"),
         "prompt should contain the trajectory heading"
     );
     assert!(
-        prompt.contains("Build a thing"),
+        combined.contains("Build a thing"),
         "prompt should contain the trajectory content"
     );
 }
@@ -73,9 +74,10 @@ fn build_prompt_contains_workspace_name() {
         user_ask: None,
     };
 
-    let prompt = build_prompt(&inputs);
+    let p = build_prompt(&inputs);
+    let combined = format!("{}\n\n{}", p.system, p.user);
     assert!(
-        prompt.contains("my-workspace"),
+        combined.contains("my-workspace"),
         "prompt should include the workspace name"
     );
 }
@@ -97,13 +99,14 @@ fn build_prompt_includes_recent_events() {
         user_ask: None,
     };
 
-    let prompt = build_prompt(&inputs);
+    let p = build_prompt(&inputs);
+    let combined = format!("{}\n\n{}", p.system, p.user);
     assert!(
-        prompt.contains("deploy to prod"),
+        combined.contains("deploy to prod"),
         "prompt should contain event after-text"
     );
     assert!(
-        prompt.contains("5"),
+        combined.contains("5"),
         "prompt should contain tool call count"
     );
 }
@@ -122,13 +125,14 @@ fn build_prompt_includes_surface_summaries() {
         user_ask: None,
     };
 
-    let prompt = build_prompt(&inputs);
+    let p = build_prompt(&inputs);
+    let combined = format!("{}\n\n{}", p.system, p.user);
     assert!(
-        prompt.contains("sid-123"),
+        combined.contains("sid-123"),
         "prompt should contain surface id"
     );
     assert!(
-        prompt.contains("running tests"),
+        combined.contains("running tests"),
         "prompt should contain surface summary"
     );
 }
@@ -147,10 +151,42 @@ fn build_prompt_includes_session_bullets() {
         user_ask: None,
     };
 
-    let prompt = build_prompt(&inputs);
+    let p = build_prompt(&inputs);
     assert!(
-        prompt.contains("Fixed the auth bug"),
-        "prompt should contain session bullets"
+        p.user.contains("Fixed the auth bug"),
+        "user part should contain session bullets"
+    );
+}
+
+#[test]
+fn build_prompt_splits_into_system_and_user() {
+    let inputs = RegenInputs {
+        workspace_name: "split-ws".to_string(),
+        current_trajectory: "## Goal\n- Test split\n".to_string(),
+        recent_events: vec![],
+        recent_user_explanations: vec![],
+        session_bullets: vec![],
+        surface_summaries: vec![],
+        tool_call_count: 0,
+        cmux_surface_order: vec![],
+        user_ask: None,
+    };
+
+    let p = build_prompt(&inputs);
+    assert!(!p.system.is_empty(), "system part should not be empty");
+    assert!(!p.user.is_empty(), "user part should not be empty");
+    assert!(
+        p.system.contains("3-section trajectory doc"),
+        "system part should contain stable instructions"
+    );
+    assert!(
+        p.user.contains("Test split"),
+        "user part should contain the current trajectory"
+    );
+    // System should NOT contain the trajectory content (that's fresh data).
+    assert!(
+        !p.system.contains("Test split"),
+        "system part should not contain the fresh trajectory content"
     );
 }
 

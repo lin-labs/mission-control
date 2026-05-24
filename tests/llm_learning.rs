@@ -28,7 +28,7 @@ impl Summarizer for MockSummarizer {
         })
     }
 
-    async fn regenerate_trajectory(&self, _prompt: &str) -> Result<String> {
+    async fn regenerate_trajectory(&self, _system: &str, _user: &str) -> Result<String> {
         Ok(self.response.clone())
     }
 }
@@ -248,7 +248,7 @@ async fn produce_learning_llm_error_propagates() {
         async fn summarize(&self, _: &str) -> Result<Summary> {
             anyhow::bail!("llm down")
         }
-        async fn regenerate_trajectory(&self, _: &str) -> Result<String> {
+        async fn regenerate_trajectory(&self, _: &str, _: &str) -> Result<String> {
             anyhow::bail!("llm down")
         }
     }
