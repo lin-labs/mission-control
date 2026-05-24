@@ -517,15 +517,30 @@ fn insert_item_above(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
     state.edit_start_text = Some(String::new());
 }
 
-fn enter_insert_mode(state: &mut TrajectoryEditState, doc: &TrajectoryDoc) {
-    let section = match doc.sections.get(state.cursor_section) {
+fn enter_insert_mode(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
+    let section = match doc.sections.get_mut(state.cursor_section) {
         Some(s) => s,
         None => return,
     };
-    let item = match section.items.get(state.cursor_item) {
-        Some(i) => i,
-        None => return,
-    };
+
+    // Auto-create the first item if section is empty.
+    if section.items.is_empty() {
+        let is_tasks = section.name == SECTION_TASKS;
+        section.items.push(Item {
+            text: String::new(),
+            is_checkbox: is_tasks,
+            checked: if is_tasks { Some(false) } else { None },
+            surface_id: None,
+        });
+        state.cursor_item = 0;
+    }
+
+    // Clamp cursor to a valid index if it drifted (e.g. after a deletion).
+    if state.cursor_item >= section.items.len() {
+        state.cursor_item = section.items.len() - 1;
+    }
+
+    let item = &section.items[state.cursor_item];
     state.mode = EditMode::Insert { focus: InsertFocus::Item };
     state.edit_buffer = item.text.clone();
     state.input_ctx_buffer = String::new();
@@ -909,5 +924,83 @@ workspace: test-ws
         let mut doc_mut = doc.clone();
         let actions = handle_key(&mut state, &mut doc_mut, key(KeyCode::Char(' ')));
         assert!(actions.is_empty());
+    }
+
+    // ── Empty-section auto-create (i / o / O) ────────────────────────────────
+
+    #[test]
+    fn pressing_i_on_empty_goal_section_creates_first_item_and_enters_insert() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections(); // all 3 sections empty
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0; // Goal
+        state.cursor_item = 0;
+        let actions = handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        assert!(matches!(state.mode, EditMode::Insert { .. }));
+        let goal = doc.section("Goal").unwrap();
+        assert_eq!(goal.items.len(), 1);
+        assert_eq!(goal.items[0].text, "");
+        assert!(!goal.items[0].is_checkbox);
+        // No action yet — actions fire on Esc-commit.
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn pressing_i_on_empty_tasks_section_creates_a_checkbox_item() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        let mut state = TrajectoryEditState::default();
+        // section index for "Tasks & Progress" is 2 in canonical order
+        state.cursor_section = 2;
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        let tasks = doc.section("Tasks & Progress").unwrap();
+        assert_eq!(tasks.items.len(), 1);
+        assert!(tasks.items[0].is_checkbox);
+        assert_eq!(tasks.items[0].checked, Some(false));
+    }
+
+    #[test]
+    fn pressing_o_on_empty_section_creates_first_item() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0;
+        state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('o')));
+        let goal = doc.section("Goal").unwrap();
+        assert_eq!(goal.items.len(), 1);
+        assert!(matches!(state.mode, EditMode::Insert { .. }));
+    }
+
+    #[test]
+    fn cursor_clamps_to_last_item_when_out_of_bounds() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        // Manually populate Goal with 2 items.
+        let goal = &mut doc.sections[0];
+        goal.items.push(Item {
+            text: "first".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        goal.items.push(Item {
+            text: "second".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0;
+        state.cursor_item = 99; // out of bounds
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        // Should have clamped to index 1 (last item, "second").
+        assert_eq!(state.cursor_item, 1);
+        if let EditMode::Insert { .. } = state.mode {
+        } else {
+            panic!("not in insert mode");
+        }
+        assert_eq!(state.edit_buffer, "second");
     }
 }
