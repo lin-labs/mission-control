@@ -4,6 +4,7 @@ mod config;
 mod llm;
 mod mc_data;
 mod session;
+mod sidebar_pure;
 mod tui;
 
 use crate::cmux::client::CmuxClient;
