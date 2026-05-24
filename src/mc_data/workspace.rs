@@ -24,6 +24,15 @@ pub fn ensure_workspace(uuid: &str, unique_name: &str, project: &str) -> Result<
     write_if_changed(&paths::name_path(uuid), unique_name)?;
     write_if_changed(&paths::project_path(uuid), project)?;
 
+    // Seed trajectory.md for the detail pane if it doesn't exist yet.
+    // Idempotent: the `if !exists` guard ensures user edits are never clobbered.
+    let traj_path = paths::trajectory_path(uuid);
+    if !traj_path.exists() {
+        let skel = crate::mc_data::trajectory::TrajectoryDoc::skeleton(uuid, unique_name, project);
+        skel.save_to_file(&traj_path)
+            .with_context(|| format!("seed trajectory.md at {traj_path:?}"))?;
+    }
+
     // Display symlink at the data root. Relative target so the symlink
     // resolves correctly inside the data dir regardless of cwd.
     let link = paths::display_symlink(unique_name);

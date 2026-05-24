@@ -165,3 +165,14 @@ fn load_from_missing_file_returns_default_doc() {
         assert!(s.items.is_empty());
     }
 }
+
+#[test]
+fn skeleton_has_all_three_canonical_sections_with_frontmatter() {
+    let doc = TrajectoryDoc::skeleton("uuid-abc", "predinvest", "predinvest");
+    assert_eq!(doc.frontmatter.workspace.as_deref(), Some("predinvest"));
+    assert_eq!(doc.frontmatter.workspace_id.as_deref(), Some("uuid-abc"));
+    assert_eq!(doc.frontmatter.snapshot, Some(0));
+    assert!(doc.section("Goal").is_some());
+    assert!(doc.section("Current surfaces").is_some());
+    assert!(doc.section("Tasks & Progress").is_some());
+}

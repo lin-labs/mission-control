@@ -44,6 +44,19 @@ pub struct TrajectoryDoc {
 }
 
 impl TrajectoryDoc {
+    /// Canonical empty 3-section skeleton with frontmatter for a fresh workspace.
+    pub fn skeleton(uuid: &str, name: &str, _project: &str) -> Self {
+        let frontmatter = Frontmatter {
+            workspace: Some(name.to_string()),
+            workspace_id: Some(uuid.to_string()),
+            updated: Some(chrono::Utc::now().to_rfc3339()),
+            snapshot: Some(0),
+        };
+        let mut doc = TrajectoryDoc { frontmatter, sections: Vec::new() };
+        doc.ensure_sections();
+        doc
+    }
+
     pub fn parse(text: &str) -> Result<Self> {
         let (fm_str, body) = split_frontmatter(text);
         let frontmatter: Frontmatter = if fm_str.is_empty() {
