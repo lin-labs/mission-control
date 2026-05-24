@@ -23,9 +23,8 @@ pub fn render_sidebar(
         .enumerate()
         .map(|(idx, ws)| {
             let is_selected = idx == selected;
-            let (badge_text, badge_color) = agent_badge(ws);
             // Spinner when an async refresh is in flight, otherwise status dot
-            let (state_dot, state_color) = if ws.loading {
+            let (leader, leader_color) = if ws.loading {
                 (spinner_frame().to_string(), Color::Cyan)
             } else {
                 let (dot, c) = status_indicator(ws);
@@ -41,22 +40,17 @@ pub fn render_sidebar(
 
             let accent_color =
                 crate::sidebar_pure::workspace_accent_color(ws.workspace.custom_color.as_deref());
-            // "[XX] ● " = 4 (badge) + 1 (space) + 1 (dot) + 1 (space) = 7 cells, all single-width.
-            let prefix_cols: u16 = 7;
+            let leader_text = format!("{} ", leader);
             let display_name = truncate_for_width(
                 &ws.workspace.name,
                 content_width
-                    .saturating_sub(prefix_cols)
+                    .saturating_sub(leader_text.chars().count() as u16)
                     .saturating_sub(host_badge.chars().count() as u16),
             );
 
             let name_line = decorate_sidebar_line(
                 Line::from(vec![
-                    Span::styled(
-                        format!("{} ", badge_text),
-                        Style::default().fg(badge_color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(format!("{} ", state_dot), Style::default().fg(state_color)),
+                    Span::styled(leader_text, Style::default().fg(leader_color)),
                     Span::styled(
                         display_name,
                         Style::default()
@@ -150,17 +144,6 @@ pub fn description_subtitle_line(
         Span::styled(text, Style::default().fg(Color::DarkGray)),
     ]);
     Some(line)
-}
-
-/// Per-agent badge shown at the start of each sidebar row.
-/// Two-letter code in brand color, plus a fallback for non-agent shells.
-fn agent_badge(ws: &WorkspaceState) -> (&'static str, Color) {
-    match ws.agent_name() {
-        "claude" => ("[CC]", Color::Rgb(0xCC, 0x78, 0x5C)),    // Anthropic orange
-        "codex" => ("[CD]", Color::Rgb(0x10, 0xA3, 0x7C)),     // OpenAI green
-        "opencode" => ("[OC]", Color::Rgb(0xA8, 0x7B, 0xCC)),  // purple
-        _ => ("[SH]", Color::DarkGray),                        // shell / non-agent
-    }
 }
 
 fn status_indicator(ws: &WorkspaceState) -> (&str, Color) {
