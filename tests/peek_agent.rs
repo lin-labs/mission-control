@@ -7,7 +7,7 @@
 ///
 /// The peek_view rendering helpers (rebuild_agent_buffer, truncate_words,
 /// is_user_role) are tested in unit tests inside peek_view.rs.
-use mission_control::mc_data::session_log;
+use mission_control::mc_data::session_log::{self, WorkspaceContext};
 use std::fs;
 
 /// Build a minimal session log with the given workspace_id in frontmatter.
@@ -40,7 +40,9 @@ fn resolve_falls_back_to_workspace_log_when_no_pointer() {
     let result = std::panic::catch_unwind(|| {
         // No pointer file will exist for this UUID (it's a made-up UUID).
         // The resolver should fall through to workspace-level lookup.
-        let resolved = session_log::resolve_session_log_for_surface(uuid, "sid-no-pointer")
+        // Empty ctx → tier 1 skipped → tier 2 (uuid match) applies.
+        let ctx = WorkspaceContext::default();
+        let resolved = session_log::resolve_session_log_for_surface(uuid, "sid-no-pointer", &ctx)
             .expect("resolve should not error");
         assert!(resolved.is_some(), "expected Some from workspace-level fallback");
         let text = fs::read_to_string(resolved.unwrap()).unwrap();
@@ -68,9 +70,11 @@ fn resolve_returns_none_when_no_log_exists() {
     unsafe { std::env::set_var("OBS_AGENTS", &obs); }
 
     let result = std::panic::catch_unwind(|| {
+        let ctx = WorkspaceContext::default();
         let resolved = session_log::resolve_session_log_for_surface(
             "peek-agent-test-no-log-uuid",
             "sid-none",
+            &ctx,
         )
         .expect("resolve should not error");
         assert!(resolved.is_none(), "expected None → Shell source when no session log");
@@ -132,7 +136,8 @@ fn resolve_returns_most_recent_session_log() {
     unsafe { std::env::set_var("OBS_AGENTS", &obs); }
 
     let result = std::panic::catch_unwind(|| {
-        let resolved = session_log::resolve_session_log_for_surface(uuid, "sid-mr")
+        let ctx = WorkspaceContext::default();
+        let resolved = session_log::resolve_session_log_for_surface(uuid, "sid-mr", &ctx)
             .expect("resolve should not error")
             .expect("expected Some from workspace-level fallback");
         let text = fs::read_to_string(&resolved).unwrap();

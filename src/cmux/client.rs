@@ -25,6 +25,9 @@ struct WorkspaceJson {
     description: Option<String>,
     #[serde(default)]
     selected: bool,
+    /// Current working directory of the workspace's active pane, if reported by cmux.
+    #[serde(default)]
+    current_directory: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -37,6 +40,10 @@ pub struct Workspace {
     /// Non-empty description is used to seed the Goal section of the trajectory doc.
     #[serde(default)]
     pub description: Option<String>,
+    /// Current working directory of the workspace's active pane (from cmux JSON).
+    /// Used to disambiguate session logs via host+cwd matching.
+    #[serde(default)]
+    pub current_directory: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +99,7 @@ impl CmuxClient {
                 name: w.title,
                 selected: w.selected,
                 description: w.description,
+                current_directory: w.current_directory,
             })
             .collect();
 
