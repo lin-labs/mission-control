@@ -28,6 +28,10 @@ struct WorkspaceJson {
     /// Current working directory of the workspace's active pane, if reported by cmux.
     #[serde(default)]
     current_directory: Option<String>,
+    /// User-set workspace color from cmux (`#RRGGBB`), if any. Null when no
+    /// color has been assigned via `cmux workspace-action set-color`.
+    #[serde(default)]
+    custom_color: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,6 +48,10 @@ pub struct Workspace {
     /// Used to disambiguate session logs via host+cwd matching.
     #[serde(default)]
     pub current_directory: Option<String>,
+    /// User-set workspace color from cmux, as `#RRGGBB`. The sidebar tints the
+    /// workspace's row with this color so mc-tui mirrors cmux's visual.
+    #[serde(default)]
+    pub custom_color: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +108,7 @@ impl CmuxClient {
                 selected: w.selected,
                 description: w.description,
                 current_directory: w.current_directory,
+                custom_color: w.custom_color,
             })
             .collect();
 

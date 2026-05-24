@@ -35,11 +35,22 @@ pub fn render_sidebar(
                 .map(|h| format!(" [{}]", h))
                 .unwrap_or_default();
 
+            // Tint the workspace name with cmux's user-set color when present.
+            // Falls back to white so workspaces without a color render unchanged.
+            let name_color = ws
+                .workspace
+                .custom_color
+                .as_deref()
+                .and_then(crate::sidebar_pure::parse_hex_color)
+                .unwrap_or(Color::White);
+
             let name_line = Line::from(vec![
                 Span::styled(format!("{} ", leader), Style::default().fg(leader_color)),
                 Span::styled(
                     ws.workspace.name.clone(),
-                    Style::default().fg(Color::White),
+                    Style::default()
+                        .fg(name_color)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(host_badge, Style::default().fg(Color::DarkGray)),
             ]);

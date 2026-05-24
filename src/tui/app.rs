@@ -2144,6 +2144,7 @@ workspace: test-ws
                 selected: false,
                 description: None,
                 current_directory: None,
+                custom_color: None,
             },
             session: None,
             surfaces: Vec::new(),

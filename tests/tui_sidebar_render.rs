@@ -5,7 +5,8 @@
 /// dim subtitle line below each workspace name.
 ///
 /// Run with: cargo test --test tui_sidebar_render -- --test-threads=1
-use mission_control::sidebar_pure::description_subtitle_line;
+use mission_control::sidebar_pure::{description_subtitle_line, parse_hex_color};
+use ratatui::style::Color;
 use ratatui::text::Line;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -125,4 +126,23 @@ fn description_uses_only_first_line() {
         "expected second line to be absent, got: {:?}",
         text
     );
+}
+
+// ── custom_color (cmux workspace tint) ───────────────────────────────────────
+
+#[test]
+fn parse_hex_color_handles_real_cmux_values() {
+    // Sampled live from `cmux list-workspaces --json --id-format both`:
+    assert_eq!(parse_hex_color("#C0392B"), Some(Color::Rgb(192, 57, 43)));
+    assert_eq!(parse_hex_color("#006B6B"), Some(Color::Rgb(0, 107, 107)));
+    assert_eq!(parse_hex_color("#4A5C18"), Some(Color::Rgb(74, 92, 24)));
+}
+
+#[test]
+fn parse_hex_color_returns_none_for_invalid() {
+    assert_eq!(parse_hex_color(""), None);
+    assert_eq!(parse_hex_color("not a color"), None);
+    assert_eq!(parse_hex_color("#XYZ"), None);
+    assert_eq!(parse_hex_color("#12345"), None);    // too short
+    assert_eq!(parse_hex_color("#1234567"), None);  // too long
 }

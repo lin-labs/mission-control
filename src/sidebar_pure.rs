@@ -51,12 +51,64 @@ pub fn description_subtitle_line(
     Some(line)
 }
 
+/// Parse a `#RRGGBB` hex color string (as emitted by `cmux list-workspaces --json`'s
+/// `custom_color` field) into a ratatui `Color::Rgb`. Returns `None` if the string is
+/// not a well-formed 6-digit hex with a leading `#`.
+///
+/// Accepts upper- or lower-case hex digits. Strips surrounding whitespace.
+/// Examples: `#C0392B`, `#006B6B`, `#4a5c18`.
+pub fn parse_hex_color(s: &str) -> Option<Color> {
+    let trimmed = s.trim();
+    let hex = trimmed.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Color::Rgb(r, g, b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn parse_hex_color_accepts_well_formed_uppercase() {
+        assert_eq!(parse_hex_color("#C0392B"), Some(Color::Rgb(0xC0, 0x39, 0x2B)));
+    }
+
+    #[test]
+    fn parse_hex_color_accepts_well_formed_lowercase() {
+        assert_eq!(parse_hex_color("#4a5c18"), Some(Color::Rgb(0x4a, 0x5c, 0x18)));
+    }
+
+    #[test]
+    fn parse_hex_color_trims_whitespace() {
+        assert_eq!(
+            parse_hex_color("  #006B6B  "),
+            Some(Color::Rgb(0x00, 0x6B, 0x6B))
+        );
+    }
+
+    #[test]
+    fn parse_hex_color_rejects_missing_hash() {
+        assert_eq!(parse_hex_color("C0392B"), None);
+    }
+
+    #[test]
+    fn parse_hex_color_rejects_wrong_length() {
+        assert_eq!(parse_hex_color("#C0392"), None);
+        assert_eq!(parse_hex_color("#C0392BB"), None);
+    }
+
+    #[test]
+    fn parse_hex_color_rejects_non_hex_chars() {
+        assert_eq!(parse_hex_color("#ZZZZZZ"), None);
     }
 
     #[test]
