@@ -162,6 +162,31 @@ pub fn latest_session_file_for_workspace(workspace_id: &str) -> Result<Option<Pa
     Ok(best.map(|(_, p)| p))
 }
 
+/// Resolve the session-log file for a given workspace + surface.
+///
+/// Two-step lookup:
+/// 1. Per-surface pointer file: `<surfaces_dir>/<surface_id>.session-path`.
+///    If it exists and its content points to an existing file, return that path.
+/// 2. Workspace-level fallback: `latest_session_file_for_workspace`.
+///
+/// Returns `Ok(None)` when neither lookup finds a file (Shell source).
+pub fn resolve_session_log_for_surface(
+    workspace_uuid: &str,
+    surface_id: &str,
+) -> Result<Option<PathBuf>> {
+    // Step 1: per-surface pointer file.
+    let pointer = crate::mc_data::paths::surfaces_dir(workspace_uuid)
+        .join(format!("{surface_id}.session-path"));
+    if let Ok(content) = std::fs::read_to_string(&pointer) {
+        let p = PathBuf::from(content.trim());
+        if p.exists() {
+            return Ok(Some(p));
+        }
+    }
+    // Step 2: workspace-level fallback.
+    latest_session_file_for_workspace(workspace_uuid)
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------

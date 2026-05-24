@@ -1306,6 +1306,8 @@ impl App {
                 match key.code {
                     KeyCode::Char('j') | KeyCode::Down => { peek.scroll_down(); }
                     KeyCode::Char('k') | KeyCode::Up   => { peek.scroll_up(); }
+                    KeyCode::Char(' ')                  => { peek.page_down(); }
+                    KeyCode::Char('-')                  => { peek.page_up(); }
                     KeyCode::Char('g')                  => { peek.go_top(); }
                     KeyCode::Char('G')                  => { peek.go_bottom(); }
                     KeyCode::Esc => {
@@ -1364,9 +1366,21 @@ impl App {
                             }
                         })
                         .unwrap_or_else(|| ws.workspace.ref_id.clone());
+                    // Detect Agent vs Shell source using the two-step resolver.
+                    let surface_id_for_lookup = item
+                        .and_then(|i| i.surface_id.as_deref())
+                        .unwrap_or("");
+                    let source = match crate::mc_data::session_log::resolve_session_log_for_surface(
+                        &ws.workspace.uuid,
+                        surface_id_for_lookup,
+                    ) {
+                        Ok(Some(path)) => crate::tui::peek_view::PeekSource::Agent { session_path: path },
+                        _ => crate::tui::peek_view::PeekSource::Shell,
+                    };
                     ws.peek_state = Some(crate::tui::peek_view::PeekState::new(
                         surface_ref,
                         surface_label,
+                        source,
                     ));
                     return vec![];
                 }
@@ -1425,6 +1439,17 @@ impl App {
                 peek.polling = true;
             }
         }
+    }
+
+    /// For Agent-source peek states, re-read the session log and rebuild the
+    /// display buffer. Called from the main loop instead of the cmux read-screen
+    /// path when `peek.uses_cmux_screen()` is false.
+    pub fn refresh_agent_peek_buffer(&mut self, uuid: &str) {
+        let Some(&idx) = self.workspace_index.get(uuid) else { return };
+        let Some(peek) = self.workspaces[idx].peek_state.as_mut() else { return };
+        let crate::tui::peek_view::PeekSource::Agent { session_path } = &peek.source else { return };
+        let session_path = session_path.clone();
+        crate::tui::peek_view::rebuild_agent_buffer(peek, &session_path);
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -2016,7 +2041,7 @@ workspace: test-ws
         let mut app = make_app(SAMPLE_WITH_SURFACE);
         // Put app into peek mode manually.
         app.workspaces[0].peek_state = Some(
-            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string())
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string(), crate::tui::peek_view::PeekSource::Shell)
         );
 
         app.handle_trajectory_key(key(KeyCode::Esc));
@@ -2033,7 +2058,7 @@ workspace: test-ws
     fn j_in_peek_mode_scrolls_down() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
         let mut ps =
-            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string());
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string(), crate::tui::peek_view::PeekSource::Shell);
         // Fill buffer so scrolling has room.
         for i in 0..50 {
             ps.screen_buffer.push(format!("line {i}"));
@@ -2050,7 +2075,7 @@ workspace: test-ws
     fn k_in_peek_mode_scrolls_up() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
         let mut ps =
-            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string());
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string(), crate::tui::peek_view::PeekSource::Shell);
         for i in 0..50 {
             ps.screen_buffer.push(format!("line {i}"));
         }
@@ -2069,7 +2094,7 @@ workspace: test-ws
     fn g_in_peek_mode_goes_to_top() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
         let mut ps =
-            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string());
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string(), crate::tui::peek_view::PeekSource::Shell);
         for i in 0..50 {
             ps.screen_buffer.push(format!("line {i}"));
         }
@@ -2086,7 +2111,7 @@ workspace: test-ws
     fn big_g_in_peek_mode_goes_to_bottom() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
         let mut ps =
-            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string());
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string(), crate::tui::peek_view::PeekSource::Shell);
         for i in 0..30 {
             ps.screen_buffer.push(format!("line {i}"));
         }
@@ -2108,7 +2133,7 @@ workspace: test-ws
     fn enter_in_peek_mode_sets_yield_pending() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
         app.workspaces[0].peek_state = Some(
-            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string())
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string(), crate::tui::peek_view::PeekSource::Shell)
         );
 
         app.handle_trajectory_key(key(KeyCode::Enter));
@@ -2125,7 +2150,7 @@ workspace: test-ws
     fn take_peek_yield_returns_ref_id_and_clears_peek() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
         app.workspaces[0].peek_state = Some(
-            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string())
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string(), crate::tui::peek_view::PeekSource::Shell)
         );
         app.workspaces[0].peek_yield_pending = true;
 
@@ -2140,7 +2165,7 @@ workspace: test-ws
     fn take_peek_yield_returns_none_when_not_pending() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
         app.workspaces[0].peek_state = Some(
-            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string())
+            crate::tui::peek_view::PeekState::new("workspace:3".to_string(), "test".to_string(), crate::tui::peek_view::PeekSource::Shell)
         );
         // peek_yield_pending is false (default)
 
