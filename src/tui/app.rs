@@ -763,6 +763,60 @@ impl App {
             self.workspace_index.insert(ws.workspace.uuid.clone(), i);
         }
 
+        // Project cmux surfaces into the trajectory's ## Current surfaces section.
+        // We do this in a second pass (after the map/collect above) so we have
+        // access to both the built WorkspaceState and can mutate it.
+        for ws_state in self.workspaces.iter_mut() {
+            let Some(ref mut doc) = ws_state.trajectory else { continue };
+
+            // Build the new item list from the surfaces vec.
+            // Each surface item uses the workspace ref_id as surface_id because
+            // `cmux read-screen` takes a workspace ref — peek mode passes
+            // surface_id directly to read_screen, so this is the correct identifier.
+            let surface_items: Vec<crate::mc_data::trajectory::Item> = ws_state
+                .surfaces
+                .iter()
+                .map(|s| {
+                    crate::mc_data::trajectory::Item {
+                        text: s.title.clone(),
+                        is_checkbox: false,
+                        checked: None,
+                        // Use the workspace ref_id so peek mode can call
+                        // `cmux read-screen --workspace <ref_id>`.
+                        surface_id: Some(ws_state.workspace.ref_id.clone()),
+                    }
+                })
+                .collect();
+
+            // Skip save if the projected surface list is identical to what's
+            // already in the doc — avoids redundant iCloud file-watcher churn.
+            let existing_items = doc
+                .section(crate::mc_data::trajectory::SECTION_CURRENT_SURFACES)
+                .map(|s| s.items.as_slice())
+                .unwrap_or(&[]);
+            let unchanged = existing_items.len() == surface_items.len()
+                && existing_items
+                    .iter()
+                    .zip(surface_items.iter())
+                    .all(|(a, b)| a.text == b.text && a.surface_id == b.surface_id);
+            if unchanged {
+                continue;
+            }
+
+            doc.replace_section_items(
+                crate::mc_data::trajectory::SECTION_CURRENT_SURFACES,
+                surface_items,
+            );
+
+            let traj_path = crate::mc_data::paths::trajectory_path(&ws_state.workspace.uuid);
+            if let Err(e) = doc.save_to_file(&traj_path) {
+                eprintln!(
+                    "save trajectory after surface refresh ({}): {e:?}",
+                    ws_state.workspace.uuid
+                );
+            }
+        }
+
         Ok(())
     }
 

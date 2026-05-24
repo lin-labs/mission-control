@@ -176,3 +176,35 @@ fn skeleton_has_all_three_canonical_sections_with_frontmatter() {
     assert!(doc.section("Current surfaces").is_some());
     assert!(doc.section("Tasks & Progress").is_some());
 }
+
+#[test]
+fn replace_section_items_swaps_in_new_items() {
+    let mut doc = TrajectoryDoc::parse(SAMPLE).unwrap();
+    let new_items = vec![
+        Item {
+            text: "claude · mbp · working · writing tests".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: Some("sid-1".to_string()),
+        },
+        Item {
+            text: "shell · mbp · idle · $ ls".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: Some("sid-2".to_string()),
+        },
+    ];
+    doc.replace_section_items("Current surfaces", new_items);
+    let sec = doc.section("Current surfaces").unwrap();
+    assert_eq!(sec.items.len(), 2);
+    assert_eq!(sec.items[0].surface_id.as_deref(), Some("sid-1"));
+    assert_eq!(sec.items[1].surface_id.as_deref(), Some("sid-2"));
+}
+
+#[test]
+fn replace_section_items_is_noop_for_unknown_section() {
+    let mut doc = TrajectoryDoc::parse(SAMPLE).unwrap();
+    let before_len = doc.sections.len();
+    doc.replace_section_items("Nonexistent", vec![]);
+    assert_eq!(doc.sections.len(), before_len, "should not add a new section");
+}

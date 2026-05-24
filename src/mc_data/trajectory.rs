@@ -149,6 +149,18 @@ impl TrajectoryDoc {
         out
     }
 
+    /// Swap in a new item list for a named section. No-op if the section
+    /// doesn't exist (in Phase 1a/1b, ensure_sections() always backfills, so
+    /// this should never silently drop work — but be defensive).
+    pub fn replace_section_items(&mut self, name: &str, items: Vec<Item>) {
+        for s in self.sections.iter_mut() {
+            if s.name == name {
+                s.items = items;
+                return;
+            }
+        }
+    }
+
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
