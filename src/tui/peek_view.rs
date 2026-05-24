@@ -10,6 +10,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -22,6 +23,18 @@ pub const BUFFER_MAX_LINES: usize = 500;
 /// Interval between screen polls while in peek mode.
 pub const PEEK_POLL_INTERVAL_SECS: u64 = 1;
 
+/// Distinguishes between an agent surface (session-log based) and a shell
+/// surface (live cmux read-screen based).
+#[derive(Debug, Clone)]
+pub enum PeekSource {
+    /// Agent surface — buffer is rendered from the workspace's session log.
+    /// On each poll tick we re-read the file, parse turns, and format them
+    /// with the truncation rule applied to non-user turns.
+    Agent { session_path: PathBuf },
+    /// Generic terminal — buffer is rendered from cmux read-screen polling.
+    Shell,
+}
+
 /// State for peek mode (reading a surface's screen).
 #[derive(Debug, Clone)]
 pub struct PeekState {
@@ -31,6 +44,8 @@ pub struct PeekState {
     pub surface_ref: String,
     /// Human-readable label shown in the peek title bar.
     pub surface_label: String,
+    /// Whether this peek reads a session log (Agent) or live cmux screen (Shell).
+    pub source: PeekSource,
     /// How many lines from the top of the buffer to display.
     pub scroll_offset: u16,
     /// Rolling buffer of recent screen content (~500 lines max).
@@ -52,16 +67,23 @@ pub struct PeekState {
 pub const PAGE_SIZE: u16 = 10;
 
 impl PeekState {
-    pub fn new(surface_ref: String, surface_label: String) -> Self {
+    pub fn new(surface_ref: String, surface_label: String, source: PeekSource) -> Self {
         Self {
             surface_ref,
             surface_label,
+            source,
             scroll_offset: 0,
             screen_buffer: Vec::new(),
             last_poll: None,
             polling: false,
             auto_follow: true,
         }
+    }
+
+    /// Whether this peek source actually needs the cmux read-screen call.
+    /// Agent surfaces don't — they read the session log directly.
+    pub fn uses_cmux_screen(&self) -> bool {
+        matches!(self.source, PeekSource::Shell)
     }
 
     /// Check whether enough time has passed to trigger another poll.
@@ -148,6 +170,65 @@ impl PeekState {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Agent rendering helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Returns `true` for roles that represent the human side of a conversation
+/// (user turns are displayed verbatim; assistant turns are truncated).
+pub fn is_user_role(role: &str) -> bool {
+    matches!(role.to_ascii_lowercase().as_str(), "boyan" | "user")
+}
+
+/// Truncate `s` to at most `n` words (split by whitespace).
+/// If truncated, appends `…` (single-character ellipsis).
+pub fn truncate_words(s: &str, n: usize) -> String {
+    let words: Vec<&str> = s.split_whitespace().collect();
+    if words.len() <= n {
+        return s.to_string();
+    }
+    let head = words[..n].join(" ");
+    format!("{head}…")
+}
+
+/// Re-read `session_path`, parse turns, and rebuild the peek buffer with the
+/// truncation rule: user turns verbatim, assistant turns capped at 100 words.
+///
+/// This is a full replacement of `state.screen_buffer` (not an append).
+pub fn rebuild_agent_buffer(state: &mut PeekState, session_path: &Path) {
+    let text = match std::fs::read_to_string(session_path) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let turns = crate::mc_data::session_log::parse(&text);
+    let mut buffer: Vec<String> = Vec::new();
+    for turn in turns {
+        let header = format!("## {} \u{2014} {}", turn.time, turn.role);
+        buffer.push(header);
+        let content = if is_user_role(&turn.role) {
+            turn.content.clone()
+        } else {
+            truncate_words(&turn.content, 100)
+        };
+        for line in content.lines() {
+            buffer.push(line.to_string());
+        }
+        buffer.push(String::new()); // blank separator between turns
+    }
+    // Replace existing buffer entirely.
+    state.screen_buffer = buffer;
+    state.last_poll = Some(Instant::now());
+    state.polling = false;
+    if state.auto_follow {
+        state.scroll_offset = state.max_scroll();
+    } else {
+        let max = state.max_scroll();
+        if state.scroll_offset > max {
+            state.scroll_offset = max;
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Rendering
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -202,7 +283,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     fn make_state() -> PeekState {
-        PeekState::new("workspace:3".to_string(), "workspace:3".to_string())
+        PeekState::new("workspace:3".to_string(), "workspace:3".to_string(), PeekSource::Shell)
     }
 
     // ── scroll_down / scroll_up ───────────────────────────────────────────────
@@ -329,7 +410,7 @@ mod tests {
 
     #[test]
     fn render_shows_surface_id_in_title() {
-        let mut ps = PeekState::new("workspace:5".to_string(), "my-surface".to_string());
+        let mut ps = PeekState::new("workspace:5".to_string(), "my-surface".to_string(), PeekSource::Shell);
         ps.ingest_screen("hello world\n");
         let backend = TestBackend::new(80, 10);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -485,5 +566,89 @@ mod tests {
         ps.go_bottom();
         assert!(ps.auto_follow, "G must re-enable auto_follow");
         assert_eq!(ps.scroll_offset, ps.max_scroll());
+    }
+
+    // ── Agent rendering helpers ───────────────────────────────────────────────
+
+    #[test]
+    fn truncate_words_truncates_after_n_words() {
+        let s = "one two three four five six seven eight nine ten eleven";
+        let result = truncate_words(s, 5);
+        assert_eq!(result, "one two three four five…");
+    }
+
+    #[test]
+    fn truncate_words_passes_through_short_content() {
+        let s = "hello world";
+        let result = truncate_words(s, 100);
+        // Fewer than 100 words — returned verbatim (same string value).
+        assert_eq!(result, s);
+    }
+
+    #[test]
+    fn is_user_role_matches_boyan_and_user_case_insensitive() {
+        assert!(is_user_role("boyan"));
+        assert!(is_user_role("Boyan"));
+        assert!(is_user_role("BOYAN"));
+        assert!(is_user_role("user"));
+        assert!(is_user_role("User"));
+        assert!(!is_user_role("claude"));
+        assert!(!is_user_role("assistant"));
+        assert!(!is_user_role("codex"));
+    }
+
+    #[test]
+    fn rebuild_agent_buffer_assembles_turns_with_truncation() {
+        // Build a session log where the assistant turn has > 100 words.
+        let long_response: String = (0..120).map(|i| format!("word{i}")).collect::<Vec<_>>().join(" ");
+        let log = format!(
+            "---\nworkspace_id: test\n---\n\n## 09:00 PT \u{2014} boyan\nhello there\n\n---\n\n## 09:01 PT \u{2014} claude\n{long_response}\n"
+        );
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &log).unwrap();
+
+        let mut ps = PeekState::new(
+            "workspace:1".to_string(),
+            "test".to_string(),
+            PeekSource::Agent { session_path: tmp.path().to_path_buf() },
+        );
+        rebuild_agent_buffer(&mut ps, tmp.path());
+
+        // Buffer should not be empty.
+        assert!(!ps.screen_buffer.is_empty());
+
+        // Find the line that starts with "## 09:01" — that's the assistant header.
+        let assistant_header = ps.screen_buffer.iter().find(|l| l.contains("09:01")).unwrap();
+        assert!(assistant_header.contains("claude"), "expected claude in header: {assistant_header}");
+
+        // The content line after the assistant header should contain "…" (truncated).
+        let assistant_header_idx = ps.screen_buffer.iter().position(|l| l.contains("09:01")).unwrap();
+        let content_after = ps.screen_buffer[assistant_header_idx + 1..].iter()
+            .find(|l| !l.is_empty())
+            .unwrap();
+        assert!(content_after.contains('…'), "expected ellipsis in truncated turn: {content_after}");
+    }
+
+    #[test]
+    fn rebuild_agent_buffer_preserves_user_turns_verbatim() {
+        let user_text = "please do the thing exactly as I described";
+        let log = format!(
+            "---\nworkspace_id: test\n---\n\n## 10:00 PT \u{2014} boyan\n{user_text}\n"
+        );
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &log).unwrap();
+
+        let mut ps = PeekState::new(
+            "workspace:1".to_string(),
+            "test".to_string(),
+            PeekSource::Agent { session_path: tmp.path().to_path_buf() },
+        );
+        rebuild_agent_buffer(&mut ps, tmp.path());
+
+        // The buffer should contain the user's text verbatim.
+        let joined = ps.screen_buffer.join("\n");
+        assert!(joined.contains(user_text), "user text not verbatim in buffer: {joined}");
+        // No ellipsis — user turn is short.
+        assert!(!joined.contains('…'), "user turn should not be truncated: {joined}");
     }
 }

@@ -695,20 +695,32 @@ async fn run_app(
                     // Owned copies for the spawned task.
                     let uuid = uuid.to_string();
                     let surface_ref = surface_ref.to_string();
+                    // Check whether this is an agent-log source or a shell source.
+                    let uses_cmux = app.workspaces.iter()
+                        .find(|ws| ws.workspace.uuid == uuid)
+                        .and_then(|ws| ws.peek_state.as_ref())
+                        .map_or(false, |p| p.uses_cmux_screen());
                     app.mark_peek_polling();
-                    let client = cmux_client.clone();
-                    let tx = peek_tx.clone();
-                    tokio::spawn(async move {
-                        let result = tokio::time::timeout(
-                            Duration::from_secs(5),
-                            client.read_screen(&surface_ref, 100),
-                        )
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok())
-                        .unwrap_or_default();
-                        let _ = tx.send((uuid, result)).await;
-                    });
+                    if uses_cmux {
+                        // Shell source: poll cmux read-screen in a background task.
+                        let client = cmux_client.clone();
+                        let tx = peek_tx.clone();
+                        tokio::spawn(async move {
+                            let result = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                client.read_screen(&surface_ref, 100),
+                            )
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .unwrap_or_default();
+                            let _ = tx.send((uuid, result)).await;
+                        });
+                    } else {
+                        // Agent source: read the session log synchronously and
+                        // rebuild the buffer directly. No cmux call needed.
+                        app.refresh_agent_peek_buffer(&uuid);
+                    }
                 }
             }
 
