@@ -64,7 +64,7 @@ pub struct TuiConfig {
     pub device_file: PathBuf,
 
     /// OpenAI API key (or set OPENAI_API_KEY env var)
-    #[arg(long, env = "OPENAI_API_KEY")]
+    #[arg(long, env = "OPENAI_API_KEY", hide_env_values = true)]
     pub openai_api_key: Option<String>,
 
     /// OpenAI model to use for summarization
@@ -84,7 +84,7 @@ pub struct TuiConfig {
     pub cmux_socket: PathBuf,
 
     /// TypeSafe AI API key for screen classification (or set TYPESAFE_API_KEY env var)
-    #[arg(long, env = "TYPESAFE_API_KEY")]
+    #[arg(long, env = "TYPESAFE_API_KEY", hide_env_values = true)]
     pub typesafe_api_key: Option<String>,
 
     /// Codex CLI binary path (used for summarization via `codex exec`).
