@@ -333,7 +333,14 @@ async fn run_app(
                 app.detail_scroll,
                 !sidebar_focused,
             );
-            tui::footer::render_footer(f, vchunks[1], app.focus);
+            match &app.input_mode {
+                crate::tui::command::InputMode::Command(cl) => {
+                    tui::footer::render_command_bar(f, vchunks[1], cl);
+                }
+                crate::tui::command::InputMode::Normal => {
+                    tui::footer::render_footer(f, vchunks[1], app.focus);
+                }
+            }
         })?;
 
         tokio::select! {
