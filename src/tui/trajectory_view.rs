@@ -71,12 +71,34 @@ pub fn render(
 
     let mut lines: Vec<Line> = Vec::new();
     for (sec_idx, section) in doc.sections.iter().enumerate() {
-        lines.push(Line::from(Span::styled(
-            format!("## {}", section.name),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )));
+        // Determine whether the cursor is "on" this section's header, which
+        // happens when the section is empty and cursor_section == sec_idx.
+        let is_header_cursor = edit_state
+            .map(|s| {
+                s.cursor_section == sec_idx
+                    && s.cursor_item == 0
+                    && section.items.is_empty()
+                    && matches!(s.mode, EditMode::Nav)
+            })
+            .unwrap_or(false);
+
+        let header_line = if is_header_cursor {
+            Line::from(Span::styled(
+                format!("## {}", section.name),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Line::from(Span::styled(
+                format!("## {}", section.name),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        };
+        lines.push(header_line);
         if section.items.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  (empty)",
@@ -343,6 +365,49 @@ workspace: predinvest
     }
 
     #[test]
+    fn render_highlights_empty_section_header_when_cursor_on_it() {
+        use crate::mc_data::trajectory::TrajectoryDoc;
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections(); // all sections empty
+        // Cursor on section 1 (Current surfaces), which is empty.
+        let state = TrajectoryEditState {
+            cursor_section: 1,
+            cursor_item: 0,
+            mode: EditMode::Nav,
+            ..Default::default()
+        };
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, Rect::new(0, 0, 80, 20), Some(&doc), 0, true, Some(&state), None))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // Find the row containing "Current surfaces" and verify Cyan background.
+        let mut found = false;
+        'outer: for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().chars().next().unwrap_or(' ')))
+                .collect();
+            if row.contains("Current surfaces") {
+                for x in 0..buf.area.width {
+                    if let Some(cell) = buf.cell((x, y)) {
+                        if cell.symbol() == "C" {
+                            assert_eq!(
+                                cell.style().bg,
+                                Some(Color::Cyan),
+                                "empty-section header should have Cyan bg when cursor is on it"
+                            );
+                            found = true;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found, "did not find highlighted empty-section header");
+    }
+
+        #[test]
     fn render_insert_mode_shows_edit_buffer_text() {
         let mut doc = TrajectoryDoc::parse(SAMPLE).unwrap();
         doc.ensure_sections();

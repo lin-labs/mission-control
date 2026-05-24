@@ -1209,7 +1209,12 @@ impl App {
         let cmux_surface_order = ws.surfaces.iter().map(|s| s.title.clone()).collect();
 
         // Canonical user ask from ~obsAgents/Sessions/<file>.md (last `## boyan` block).
-        let user_ask = crate::mc_data::session_log::latest_session_file_for_workspace(uuid)
+        // Build WorkspaceContext for host+cwd disambiguation (tier-1 session log matching).
+        let ctx = crate::mc_data::session_log::WorkspaceContext {
+            host: Some(hostname_short()),
+            cwd: ws.workspace.current_directory.clone(),
+        };
+        let user_ask = crate::mc_data::session_log::latest_session_file_for_workspace(uuid, &ctx)
             .ok()
             .flatten()
             .and_then(|p| std::fs::read_to_string(p).ok())
@@ -1255,6 +1260,16 @@ impl App {
 
         // Ensure canonical sections exist.
         doc.ensure_sections();
+
+        // Sort Tasks & Progress if >10 items.
+        doc.sort_tasks_if_long();
+
+        // Before persist: apply human stickiness so agent regen cannot
+        // un-check what the user checked, re-check what they unchecked,
+        // or re-add what they deleted.
+        let intent = crate::mc_data::user_intent::load_for_workspace(uuid)
+            .unwrap_or_default();
+        crate::mc_data::user_intent::apply_to_tasks(&mut doc, &intent);
 
         // Persist to disk — non-fatal on error.
         let traj_path = crate::mc_data::paths::trajectory_path(uuid);
@@ -1420,9 +1435,14 @@ impl App {
                     let surface_id_for_lookup = item
                         .and_then(|i| i.surface_id.as_deref())
                         .unwrap_or("");
+                    let peek_ctx = crate::mc_data::session_log::WorkspaceContext {
+                        host: Some(hostname_short()),
+                        cwd: ws.workspace.current_directory.clone(),
+                    };
                     let source = match crate::mc_data::session_log::resolve_session_log_for_surface(
                         &ws.workspace.uuid,
                         surface_id_for_lookup,
+                        &peek_ctx,
                     ) {
                         Ok(Some(path)) => crate::tui::peek_view::PeekSource::Agent { session_path: path },
                         _ => crate::tui::peek_view::PeekSource::Shell,
@@ -1797,6 +1817,7 @@ impl App {
             None => return Ok(None),
         };
         let uuid = ws.workspace.uuid.clone();
+        doc.sort_tasks_if_long();
         let n = crate::tui::trajectory_edit::save(&uuid, doc, state, actions)?;
         Ok(Some(n))
     }
@@ -1970,6 +1991,21 @@ fn load_surface_summaries(surfaces_dir: &PathBuf) -> Vec<(String, String)> {
     result
 }
 
+/// Return the short hostname of the local machine (e.g. "mbp"), normalised to
+/// lowercase.  Used to populate `WorkspaceContext::host` so that session-log
+/// tier-1 matching can exclude logs written on a different machine.
+///
+/// Falls back to "localhost" if `hostname -s` is unavailable.
+fn hostname_short() -> String {
+    std::process::Command::new("hostname")
+        .arg("-s")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "localhost".to_string())
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2041,6 +2077,7 @@ workspace: test-ws
                 name: "test-ws".to_string(),
                 selected: false,
                 description: None,
+                current_directory: None,
             },
             session: None,
             surfaces: Vec::new(),

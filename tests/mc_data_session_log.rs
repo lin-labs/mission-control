@@ -1,4 +1,4 @@
-use mission_control::mc_data::session_log;
+use mission_control::mc_data::session_log::{self, WorkspaceContext};
 use std::fs;
 
 const SAMPLE: &str = "---
@@ -82,7 +82,9 @@ fn latest_session_file_picks_most_recent_match() {
             "---\nworkspace_id: other\n---\n\n## 19:00 PT — boyan\nunrelated\n",
         ).unwrap();
 
-        let picked = session_log::latest_session_file_for_workspace("target")
+        // Use empty ctx → tier 1 skipped, falls back to tier 2 (uuid match).
+        let ctx = WorkspaceContext::default();
+        let picked = session_log::latest_session_file_for_workspace("target", &ctx)
             .unwrap()
             .expect("expected a matching file");
         assert!(picked.ends_with("2026-05-23-18-b.md"), "got {picked:?}");
@@ -103,7 +105,8 @@ fn latest_session_file_returns_none_when_dir_missing() {
     let prior = std::env::var_os("OBS_AGENTS");
     unsafe { std::env::set_var("OBS_AGENTS", tmp.path().join("does-not-exist")); }
     let result = std::panic::catch_unwind(|| {
-        let r = session_log::latest_session_file_for_workspace("any-uuid").unwrap();
+        let ctx = WorkspaceContext::default();
+        let r = session_log::latest_session_file_for_workspace("any-uuid", &ctx).unwrap();
         assert!(r.is_none());
     });
     match prior {
