@@ -602,6 +602,9 @@ pub struct App {
     session_to_workspace: HashMap<String, String>,
     workspace_index: HashMap<String, usize>,
     bullet_hashes: HashMap<PathBuf, u64>,
+    /// Workspace UUID awaiting the second `D` confirmation for dismissal.
+    /// Set on first `D`; cleared on second `D` (executes dismissal) or any other key.
+    pub pending_dismissal: Option<String>,
 }
 
 impl App {
@@ -615,6 +618,7 @@ impl App {
             session_to_workspace: HashMap::new(),
             workspace_index: HashMap::new(),
             bullet_hashes: HashMap::new(),
+            pending_dismissal: None,
         }
     }
 
@@ -1634,6 +1638,70 @@ impl App {
         }
     }
 
+    // ──────────────────────────────────────────────────────────────────────
+    // D dismissal confirmation
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Trigger immediate dismissal for a workspace by setting its grace timer
+    /// far enough in the past that the next dismiss_tick fires right away.
+    pub fn start_immediate_dismissal(&mut self, workspace_id: &str) {
+        if let Some(&idx) = self.workspace_index.get(workspace_id) {
+            let ws = &mut self.workspaces[idx];
+            if !ws.dismissal.dismissing {
+                ws.dismissal.grace_started_at =
+                    Some(Instant::now() - std::time::Duration::from_secs(600));
+            }
+        }
+    }
+
+    /// First `D` — record the pending dismissal; returns `false` (not yet acted).
+    /// Second `D` on the same workspace — execute the dismissal; returns `true`.
+    /// Switching to a different workspace on the first `D` replaces the pending entry.
+    pub fn handle_dismissal_request(&mut self, workspace_id: &str) -> bool {
+        match &self.pending_dismissal {
+            Some(prior) if prior == workspace_id => {
+                // Second D — execute.
+                self.pending_dismissal = None;
+                self.start_immediate_dismissal(workspace_id);
+                true
+            }
+            _ => {
+                // First D or different workspace — record pending.
+                self.pending_dismissal = Some(workspace_id.to_string());
+                false
+            }
+        }
+    }
+
+    /// Clear the pending dismissal (call on any non-D keypress).
+    pub fn clear_pending_dismissal(&mut self) {
+        self.pending_dismissal = None;
+    }
+
+    /// Return the UUID of the workspace currently pending dismissal confirmation.
+    pub fn pending_dismissal_workspace(&self) -> Option<&str> {
+        self.pending_dismissal.as_deref()
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Force-regen (Shift+R)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Mark the currently-selected workspace as due for regen on the next tick,
+    /// bypassing the event-count and time thresholds.
+    pub fn force_regen_selected_workspace(&mut self) {
+        let uuid = match self.selected_workspace() {
+            Some(ws) => ws.workspace.uuid.clone(),
+            None => return,
+        };
+        if let Some(&idx) = self.workspace_index.get(&uuid) {
+            // Set events_since_last_regen high enough to trigger the next tick.
+            self.workspaces[idx].regen.events_since_last_regen = u32::MAX;
+            // Also reset last_regen_at so the time-threshold is also satisfied.
+            self.workspaces[idx].regen.last_regen_at = None;
+        }
+    }
+
     /// Save the current edit session for the selected workspace to disk.
     /// Returns the snapshot number N on success.
     pub fn save_trajectory_edits(
@@ -2233,5 +2301,96 @@ workspace: test-ws
             !goal_items.iter().any(|t| t.contains("Should not appear")),
             "trajectory should NOT be replaced while in insert mode"
         );
+    }
+
+    // ── T10: D dismissal confirmation ─────────────────────────────────────────
+
+    #[test]
+    fn first_d_records_pending_returns_false() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let executed = app.handle_dismissal_request("ws-1");
+        assert!(!executed, "first D should not execute dismissal");
+        assert_eq!(
+            app.pending_dismissal_workspace(),
+            Some("ws-1"),
+            "first D should set pending_dismissal to the workspace id"
+        );
+    }
+
+    #[test]
+    fn second_d_on_same_workspace_executes() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        // Add a workspace with uuid "ws-exec" so start_immediate_dismissal can look it up.
+        let ws2 = make_ws(SAMPLE_WITH_SURFACE);
+        let mut ws2 = ws2;
+        ws2.workspace.uuid = "ws-exec".to_string();
+        app.workspaces.push(ws2);
+        app.workspace_index.insert("ws-exec".to_string(), 1);
+
+        app.handle_dismissal_request("ws-exec");
+        let executed = app.handle_dismissal_request("ws-exec");
+        assert!(executed, "second D on same workspace should execute dismissal");
+        assert!(
+            app.pending_dismissal_workspace().is_none(),
+            "pending_dismissal should be cleared after execution"
+        );
+    }
+
+    #[test]
+    fn d_on_different_workspace_replaces_pending() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.handle_dismissal_request("ws-1");
+        app.handle_dismissal_request("ws-2");
+        assert_eq!(
+            app.pending_dismissal_workspace(),
+            Some("ws-2"),
+            "second D on a different workspace should replace the pending entry"
+        );
+    }
+
+    #[test]
+    fn clear_pending_dismissal_resets() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.handle_dismissal_request("ws-1");
+        app.clear_pending_dismissal();
+        assert!(
+            app.pending_dismissal_workspace().is_none(),
+            "clear_pending_dismissal should set pending_dismissal to None"
+        );
+    }
+
+    // ── T11: Force-regen via Shift+R ──────────────────────────────────────────
+
+    #[test]
+    fn force_regen_marks_workspace_due() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        // Start in a state that would NOT normally be due for regen.
+        app.workspaces[0].regen.events_since_last_regen = 0;
+        app.workspaces[0].regen.last_regen_at = Some(Instant::now());
+
+        app.force_regen_selected_workspace();
+
+        assert_eq!(
+            app.workspaces[0].regen.events_since_last_regen,
+            u32::MAX,
+            "force_regen should set events_since_last_regen to u32::MAX"
+        );
+        assert!(
+            app.workspaces[0].regen.last_regen_at.is_none(),
+            "force_regen should clear last_regen_at"
+        );
+        // The workspace should now appear in workspaces_due_for_regen.
+        let due = app.workspaces_due_for_regen();
+        assert!(
+            due.contains(&"test-uuid-1".to_string()),
+            "workspace should be due for regen after force_regen"
+        );
+    }
+
+    #[test]
+    fn force_regen_with_no_selection_is_noop() {
+        let mut app = App::new();
+        // No workspaces — should not panic.
+        app.force_regen_selected_workspace();
     }
 }

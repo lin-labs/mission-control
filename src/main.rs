@@ -374,6 +374,14 @@ async fn run_app(
                         }
                         // ─────────────────────────────────────────────────────
 
+                        // If a dismissal confirmation was pending and the user
+                        // pressed anything other than D, cancel the pending state.
+                        if app.pending_dismissal_workspace().is_some()
+                            && !matches!(key.code, KeyCode::Char('D'))
+                        {
+                            app.clear_pending_dismissal();
+                        }
+
                         match (key.code, key.modifiers) {
                             (KeyCode::Char('q'), _)
                             | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
@@ -492,18 +500,22 @@ async fn run_app(
                                 }
                             }
                             (KeyCode::Char('D'), _) => {
-                                // Manual immediate dismissal: capital D in sidebar focus.
-                                // For v1 we skip confirmation and set grace to already-elapsed
-                                // so the next dismiss_tick fires the dismissal.
+                                // Manual dismissal with D-D confirmation: first D sets
+                                // pending state; second D on the same workspace executes.
                                 if app.focus == crate::tui::app::Focus::Sidebar {
-                                    if let Some(ws) = app.workspaces.get_mut(app.selected) {
-                                        if !ws.dismissal.dismissing {
-                                            // Set grace_started_at far enough in the past
-                                            // that it is immediately past the 5-min threshold.
-                                            ws.dismissal.grace_started_at =
-                                                Some(Instant::now() - Duration::from_secs(600));
-                                        }
+                                    if let Some(ws) = app.selected_workspace() {
+                                        let uuid = ws.workspace.uuid.clone();
+                                        app.handle_dismissal_request(&uuid);
+                                        // If executed (true), dismissal is now in flight.
+                                        // If pending (false), user must press D again to confirm.
                                     }
+                                }
+                            }
+                            (KeyCode::Char('R'), _) => {
+                                // Shift+R in detail focus: force a trajectory regen on the
+                                // next scheduler tick, bypassing event/time thresholds.
+                                if app.focus == crate::tui::app::Focus::Detail {
+                                    app.force_regen_selected_workspace();
                                 }
                             }
                             (KeyCode::Char('r'), _) => {
