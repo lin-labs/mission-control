@@ -13,6 +13,9 @@ pub struct RegenInputs {
     pub surface_summaries: Vec<(String, String)>, // (surface_id, one-liner)
     pub tool_call_count: u32,
     pub cmux_surface_order: Vec<String>, // ordered surface IDs
+    /// Canonical user ask from ~obsAgents/Sessions/.../<file>.md (last `## boyan` block).
+    /// Takes precedence over any screen-scraped user_prompt.
+    pub user_ask: Option<String>,
 }
 
 pub async fn regenerate(
@@ -50,6 +53,22 @@ pub fn build_prompt(inputs: &RegenInputs) -> String {
 
     // User message section
     prompt.push_str("[USER MESSAGE]\n");
+
+    // Include canonical user ask when available (takes precedence over screen-scraped prompt).
+    if let Some(ref ask) = inputs.user_ask {
+        let trimmed = ask.trim();
+        if !trimmed.is_empty() {
+            let truncated = if trimmed.len() > 500 {
+                &trimmed[..500]
+            } else {
+                trimmed
+            };
+            prompt.push_str("The user's latest ask (from session log):\n");
+            prompt.push_str(truncated);
+            prompt.push_str("\n\n");
+        }
+    }
+
     prompt.push_str("Last saved trajectory.md:\n");
     prompt.push_str("```\n");
     prompt.push_str(&inputs.current_trajectory);

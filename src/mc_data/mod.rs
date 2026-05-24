@@ -6,3 +6,4 @@ pub mod snapshots;
 pub mod inputs;
 pub mod prompts;
 pub mod dismissal;
+pub mod session_log;

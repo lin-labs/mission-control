@@ -44,6 +44,7 @@ fn build_prompt_contains_trajectory_text() {
         surface_summaries: vec![],
         tool_call_count: 0,
         cmux_surface_order: vec![],
+        user_ask: None,
     };
 
     let prompt = build_prompt(&inputs);
@@ -69,6 +70,7 @@ fn build_prompt_contains_workspace_name() {
         surface_summaries: vec![],
         tool_call_count: 0,
         cmux_surface_order: vec![],
+        user_ask: None,
     };
 
     let prompt = build_prompt(&inputs);
@@ -92,6 +94,7 @@ fn build_prompt_includes_recent_events() {
         surface_summaries: vec![],
         tool_call_count: 5,
         cmux_surface_order: vec![],
+        user_ask: None,
     };
 
     let prompt = build_prompt(&inputs);
@@ -116,6 +119,7 @@ fn build_prompt_includes_surface_summaries() {
         surface_summaries: vec![("sid-123".to_string(), "$ running tests".to_string())],
         tool_call_count: 0,
         cmux_surface_order: vec!["sid-123".to_string()],
+        user_ask: None,
     };
 
     let prompt = build_prompt(&inputs);
@@ -140,6 +144,7 @@ fn build_prompt_includes_session_bullets() {
         surface_summaries: vec![],
         tool_call_count: 0,
         cmux_surface_order: vec![],
+        user_ask: None,
     };
 
     let prompt = build_prompt(&inputs);
@@ -166,6 +171,7 @@ async fn regenerate_parses_valid_trajectory_response() {
         surface_summaries: vec![],
         tool_call_count: 0,
         cmux_surface_order: vec![],
+        user_ask: None,
     };
 
     let result = regenerate(&summarizer, &inputs).await;
@@ -200,6 +206,7 @@ async fn regenerate_returns_err_on_invalid_response() {
         surface_summaries: vec![],
         tool_call_count: 0,
         cmux_surface_order: vec![],
+        user_ask: None,
     };
 
     // Should not panic; result may be Ok or Err depending on parse.

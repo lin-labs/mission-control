@@ -1154,6 +1154,13 @@ impl App {
         // Cmux surface order from workspace surfaces list (use titles as identifiers)
         let cmux_surface_order = ws.surfaces.iter().map(|s| s.title.clone()).collect();
 
+        // Canonical user ask from ~obsAgents/Sessions/<file>.md (last `## boyan` block).
+        let user_ask = crate::mc_data::session_log::latest_session_file_for_workspace(uuid)
+            .ok()
+            .flatten()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| crate::mc_data::session_log::last_user_turn(&s));
+
         Some(RegenInputs {
             workspace_name: ws.workspace.name.clone(),
             current_trajectory: trajectory.to_markdown(),
@@ -1163,6 +1170,7 @@ impl App {
             surface_summaries,
             tool_call_count: ws.tool_call_count,
             cmux_surface_order,
+            user_ask,
         })
     }
 
