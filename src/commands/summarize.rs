@@ -255,7 +255,10 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::{Summarizer, Summary};
+    use async_trait::async_trait;
     use chrono::TimeZone;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     fn fixed_time() -> DateTime<Local> {
@@ -350,5 +353,66 @@ mod tests {
         assert_eq!(yaml_inline("foo"), "foo");
         assert_eq!(yaml_inline("foo: bar"), "\"foo: bar\"");
         assert_eq!(yaml_inline("a#b"), "\"a#b\"");
+    }
+
+    struct StubSummarizer {
+        body: String,
+    }
+
+    #[async_trait]
+    impl Summarizer for StubSummarizer {
+        async fn summarize(&self, _ctx: &str) -> anyhow::Result<Summary> {
+            Ok(Summary {
+                trajectory: self.body.clone(),
+                next_steps: vec![],
+            })
+        }
+
+        async fn regenerate_trajectory(
+            &self,
+            _sys: &str,
+            _user: &str,
+        ) -> anyhow::Result<String> {
+            Ok(self.body.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn end_to_end_pipeline_with_stub_summarizer() {
+        // Exercises the full Summarizer→prompt→document→atomic_write chain.
+        // We hand-roll the chain (rather than calling `run`) because `run` writes
+        // to the real iCloud output_dir(); the test redirects to a tempdir.
+        let dir = tempdir().unwrap();
+        let now = chrono::Local::now();
+        let path = resolve_report_path(dir.path(), now);
+
+        let digests = vec![WorkspaceDigest {
+            name: "alpha".to_string(),
+            status_label: "working".to_string(),
+            turn_count: 7,
+            last_summary: Some("did A and B".to_string()),
+            next_steps: vec!["do C".to_string()],
+        }];
+
+        let stub: Arc<dyn Summarizer> = Arc::new(StubSummarizer {
+            body: "## Overview\nshipped.\n".to_string(),
+        });
+        let user_prompt = build_user_prompt(&digests);
+        let body = stub
+            .regenerate_trajectory(SUMMARIZE_INSTRUCTIONS, &user_prompt)
+            .await
+            .unwrap();
+        let doc = build_document(now, &digests, &body);
+        atomic_write(&path, &doc).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.starts_with("---\n"));
+        assert!(written.contains("- name: alpha"));
+        assert!(written.contains("    turns: 7"));
+        assert!(written.contains("## Overview\nshipped."));
+
+        // Frontmatter-strip on the final doc should yield body alone.
+        let stripped = strip_leading_frontmatter(&written);
+        assert!(!stripped.contains("generated_at"));
     }
 }
