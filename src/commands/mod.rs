@@ -43,6 +43,15 @@ pub fn longest_common_prefix(names: &[&'static str]) -> String {
     first[..end].to_string()
 }
 
+/// Result posted back to the UI from a background command handler.
+#[derive(Debug, Clone)]
+pub enum CommandResult {
+    /// `summarize` finished successfully. Holds the absolute path written.
+    SummarizeDone(std::path::PathBuf),
+    /// The command failed. Holds a short human-readable reason.
+    Err(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -605,6 +605,8 @@ pub struct App {
     /// Workspace UUID awaiting the second `D` confirmation for dismissal.
     /// Set on first `D`; cleared on second `D` (executes dismissal) or any other key.
     pub pending_dismissal: Option<String>,
+    /// vim-like input mode for the `:command` bar.
+    pub input_mode: crate::tui::command::InputMode,
 }
 
 impl App {
@@ -619,6 +621,7 @@ impl App {
             workspace_index: HashMap::new(),
             bullet_hashes: HashMap::new(),
             pending_dismissal: None,
+            input_mode: crate::tui::command::InputMode::Normal,
         }
     }
 
