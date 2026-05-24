@@ -687,6 +687,16 @@ impl App {
             .iter()
             .map(|ws| (ws.workspace.uuid.clone(), ws.dismissal.clone()))
             .collect();
+        // Preserve the in-memory trajectory across refreshes so we can REUSE
+        // it (instead of reloading from disk) when the user is actively
+        // editing or peeking. Reloading mid-edit would clobber the
+        // in-flight item that `enter_insert_mode` auto-created in memory
+        // but never persisted to disk.
+        let old_trajectories: HashMap<String, Option<crate::mc_data::trajectory::TrajectoryDoc>> = self
+            .workspaces
+            .iter()
+            .map(|ws| (ws.workspace.uuid.clone(), ws.trajectory.clone()))
+            .collect();
 
         self.workspaces = workspaces
             .into_iter()
@@ -714,7 +724,33 @@ impl App {
                 // would wrongly show an empty trajectory panel; the .exists()
                 // guard keeps None as the "no trajectory yet" signal that
                 // detail.rs uses to fall back to the legacy rendering.
-                let trajectory = {
+                //
+                // CRITICAL: when the workspace is being actively edited or
+                // peeked, REUSE the previous in-memory trajectory rather
+                // than reloading from disk. `enter_insert_mode` auto-
+                // creates an empty item in memory but doesn't persist; a
+                // disk reload mid-edit would silently revert that item
+                // (and then the description-seed pass below would
+                // re-populate Goal from the cmux description, clobbering
+                // the user's in-flight typing target).
+                let is_actively_user_owned = {
+                    let in_insert = old_edit_states
+                        .get(&ws.uuid)
+                        .and_then(|s| s.as_ref())
+                        .map(|s| matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. }))
+                        .unwrap_or(false);
+                    let in_peek = old_peek_states
+                        .get(&ws.uuid)
+                        .and_then(|s| s.as_ref())
+                        .is_some();
+                    in_insert || in_peek
+                };
+                let trajectory = if is_actively_user_owned {
+                    old_trajectories
+                        .get(&ws.uuid)
+                        .cloned()
+                        .flatten()
+                } else {
                     let traj_path = crate::mc_data::paths::trajectory_path(&ws.uuid);
                     if traj_path.exists() {
                         crate::mc_data::trajectory::TrajectoryDoc::load_from_file(&traj_path).ok()
@@ -771,7 +807,21 @@ impl App {
         // We only seed when the Goal section is currently empty so we never
         // clobber user-authored content. Each non-empty description line becomes
         // one Goal bullet.
+        //
+        // SKIP this pass entirely for workspaces being actively edited or
+        // peeked — the user's in-flight typing target (an empty item created
+        // by enter_insert_mode in memory) would look like "empty Goal" to
+        // this loop and trigger a destructive seed.
         for ws_state in self.workspaces.iter_mut() {
+            if ws_state
+                .edit_state
+                .as_ref()
+                .map(|s| matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. }))
+                .unwrap_or(false)
+                || ws_state.peek_state.is_some()
+            {
+                continue;
+            }
             let desc = match ws_state.workspace.description.as_ref() {
                 Some(d) if !d.trim().is_empty() => d.clone(),
                 _ => continue,
@@ -820,7 +870,23 @@ impl App {
         // Project cmux surfaces into the trajectory's ## Current surfaces section.
         // We do this in a second pass (after the map/collect above) so we have
         // access to both the built WorkspaceState and can mutate it.
+        //
+        // SKIP this pass for workspaces being actively edited or peeked — even
+        // though Current surfaces is a different section than Goal/Tasks, the
+        // save_to_file at the end of the loop would mutate the on-disk file
+        // while the user is in the middle of an unsaved edit. The peek case
+        // matters because peek's screen-poll already mutates state at 1Hz and
+        // we don't want to also rewrite trajectory.md under it.
         for ws_state in self.workspaces.iter_mut() {
+            if ws_state
+                .edit_state
+                .as_ref()
+                .map(|s| matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. }))
+                .unwrap_or(false)
+                || ws_state.peek_state.is_some()
+            {
+                continue;
+            }
             let Some(ref mut doc) = ws_state.trajectory else { continue };
 
             // Build the new item list from the surfaces vec.
