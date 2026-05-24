@@ -1264,6 +1264,13 @@ impl App {
         // Sort Tasks & Progress if >10 items.
         doc.sort_tasks_if_long();
 
+        // Before persist: apply human stickiness so agent regen cannot
+        // un-check what the user checked, re-check what they unchecked,
+        // or re-add what they deleted.
+        let intent = crate::mc_data::user_intent::load_for_workspace(uuid)
+            .unwrap_or_default();
+        crate::mc_data::user_intent::apply_to_tasks(&mut doc, &intent);
+
         // Persist to disk — non-fatal on error.
         let traj_path = crate::mc_data::paths::trajectory_path(uuid);
         if let Err(e) = doc.save_to_file(&traj_path) {
