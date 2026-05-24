@@ -511,43 +511,45 @@ fn move_cursor_down(state: &mut TrajectoryEditState, doc: &TrajectoryDoc) {
         return;
     }
     let cur_sec = &doc.sections[state.cursor_section];
-    if state.cursor_item + 1 < cur_sec.items.len() {
+
+    // If current section is non-empty and there is a next item within it, move there.
+    if !cur_sec.items.is_empty() && state.cursor_item + 1 < cur_sec.items.len() {
         state.cursor_item += 1;
         return;
     }
-    // Try to advance to the next non-empty section.
-    let mut sec = state.cursor_section + 1;
-    while sec < n_sections {
-        if !doc.sections[sec].items.is_empty() {
-            state.cursor_section = sec;
-            state.cursor_item = 0;
-            return;
-        }
-        sec += 1;
+
+    // We are at (or past) the last item of the current section — advance to the
+    // next section.  Land on it even if it is empty (cursor_item = 0 means
+    // "cursor on this section's header").
+    let sec = state.cursor_section + 1;
+    if sec < n_sections {
+        state.cursor_section = sec;
+        state.cursor_item = 0;
     }
-    // Already at end — stay put.
+    // Already at the end — stay put.
 }
 
 fn move_cursor_up(state: &mut TrajectoryEditState, doc: &TrajectoryDoc) {
+    // If inside a non-empty section and not at its first item, move up within it.
     if state.cursor_item > 0 {
         state.cursor_item -= 1;
         return;
     }
-    // Try to retreat to the last item of the previous non-empty section.
+    // We are at position 0 of the current section (either on its first item or
+    // on an empty section's header). Retreat to the previous section.
     if state.cursor_section == 0 {
+        // Already at the top — stay put.
         return;
     }
-    let mut sec = state.cursor_section - 1;
-    loop {
-        if !doc.sections[sec].items.is_empty() {
-            state.cursor_section = sec;
-            state.cursor_item = doc.sections[sec].items.len() - 1;
-            return;
-        }
-        if sec == 0 {
-            break;
-        }
-        sec -= 1;
+    let prev = state.cursor_section - 1;
+    if doc.sections[prev].items.is_empty() {
+        // Previous section is empty: land on its header.
+        state.cursor_section = prev;
+        state.cursor_item = 0;
+    } else {
+        // Previous section has items: land on its last item.
+        state.cursor_section = prev;
+        state.cursor_item = doc.sections[prev].items.len() - 1;
     }
 }
 
@@ -811,7 +813,7 @@ workspace: test-ws
     }
 
     #[test]
-    fn j_skips_empty_sections() {
+    fn j_lands_on_empty_section_header_then_skips_on_next_j() {
         let mut doc = make_doc();
         // Clear Current surfaces items.
         doc.sections[1].items.clear();
@@ -820,7 +822,11 @@ workspace: test-ws
             cursor_item: 0,
             ..Default::default()
         };
-        // Goal item 0 → skip empty Current surfaces → Tasks item 0.
+        // Goal item 0 → j → land on empty Current surfaces header.
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
+        assert_eq!(state.cursor_section, 1);
+        assert_eq!(state.cursor_item, 0);
+        // j again → Tasks item 0.
         handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
         assert_eq!(state.cursor_section, 2);
         assert_eq!(state.cursor_item, 0);
@@ -1483,7 +1489,80 @@ workspace: test-ws
         assert_eq!(state.cursor_item, 1, "j must still move cursor on Current surfaces");
     }
 
-    // ── Part 2 helpers: description ↔ Goal round-trip ────────────────────────
+    // ── T-phase3: empty-section cursor navigation ────────────────────────────
+
+    #[test]
+    fn j_traverses_empty_sections() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections(); // all 3 sections present, all empty
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0; // Goal
+        state.cursor_item = 0;
+        // j → Current surfaces (still cursor_item = 0)
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
+        assert_eq!(state.cursor_section, 1);
+        assert_eq!(state.cursor_item, 0);
+        // j → Tasks & Progress
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
+        assert_eq!(state.cursor_section, 2);
+        // j again clamps at last section
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
+        assert_eq!(state.cursor_section, 2);
+    }
+
+    #[test]
+    fn k_traverses_empty_sections_backward() {
+        let mut doc = TrajectoryDoc::default(); doc.ensure_sections();
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 2; state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('k')));
+        assert_eq!(state.cursor_section, 1);
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('k')));
+        assert_eq!(state.cursor_section, 0);
+        // clamp at top
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('k')));
+        assert_eq!(state.cursor_section, 0);
+    }
+
+    #[test]
+    fn j_from_last_item_of_goal_lands_on_empty_current_surfaces_header() {
+        let mut doc = TrajectoryDoc::default(); doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: "g1".to_string(), is_checkbox: false, checked: None, surface_id: None
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0; state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
+        // Current surfaces is empty → cursor lands there with item=0
+        assert_eq!(state.cursor_section, 1);
+        assert_eq!(state.cursor_item, 0);
+    }
+
+    #[test]
+    fn k_from_first_item_of_tasks_lands_on_empty_current_surfaces_header() {
+        let mut doc = TrajectoryDoc::default(); doc.ensure_sections();
+        doc.sections[2].items.push(Item {
+            text: "t1".to_string(), is_checkbox: true, checked: Some(false), surface_id: None
+        });
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 2; state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('k')));
+        assert_eq!(state.cursor_section, 1);
+        assert_eq!(state.cursor_item, 0);
+    }
+
+    #[test]
+    fn i_on_empty_goal_header_after_j_navigation_still_creates_first_item() {
+        // Verify the existing T3 logic still kicks in.
+        let mut doc = TrajectoryDoc::default(); doc.ensure_sections();
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0; state.cursor_item = 0;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        assert!(matches!(state.mode, EditMode::Insert { .. }));
+        assert_eq!(doc.sections[0].items.len(), 1);
+    }
+
+        // ── Part 2 helpers: description ↔ Goal round-trip ────────────────────────
 
     #[test]
     fn goal_items_render_to_multi_line_description() {
