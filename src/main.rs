@@ -342,6 +342,15 @@ async fn run_app(
                                         matches!(s.mode, EditMode::Insert { .. })
                                     });
 
+                                // When peek mode is active, route ALL keys through
+                                // handle_trajectory_key so Esc clears peek, `-`
+                                // page-ups, and unknown keys are silently consumed
+                                // (rather than e.g. Esc bouncing the user out to
+                                // the sidebar while peek_state lingers).
+                                let in_peek = app
+                                    .selected_workspace()
+                                    .map_or(false, |ws| ws.peek_state.is_some());
+
                                 let is_traj_nav_key = matches!(
                                     key.code,
                                     KeyCode::Char('j')
@@ -353,6 +362,7 @@ async fn run_app(
                                         | KeyCode::Char('i')
                                         | KeyCode::Enter
                                         | KeyCode::Char(' ')
+                                        | KeyCode::Char('-')
                                         | KeyCode::Char('x')
                                         | KeyCode::Char('d')
                                         | KeyCode::Char('o')
@@ -361,7 +371,7 @@ async fn run_app(
                                         | KeyCode::Char('K')
                                 );
 
-                                if in_insert || is_traj_nav_key {
+                                if in_peek || in_insert || is_traj_nav_key {
                                     let actions = app.handle_trajectory_key(key);
                                     if !actions.is_empty() {
                                         if let Err(e) = app.save_trajectory_edits(&actions) {
