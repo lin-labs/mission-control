@@ -1,5 +1,6 @@
 mod cli;
 mod cmux;
+mod commands;
 mod config;
 mod llm;
 mod mc_data;
