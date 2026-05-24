@@ -21,7 +21,7 @@ impl Summarizer for MockSummarizer {
         })
     }
 
-    async fn regenerate_trajectory(&self, _prompt: &str) -> Result<String> {
+    async fn regenerate_trajectory(&self, _system: &str, _user: &str) -> Result<String> {
         Ok(self.response.clone())
     }
 }

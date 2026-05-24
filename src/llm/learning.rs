@@ -27,8 +27,8 @@ pub async fn produce_learning(
     summarizer: &Arc<dyn Summarizer>,
     inputs: &LearningInputs,
 ) -> Result<LearningOutputs> {
-    let prompt = build_prompt(inputs);
-    let response = summarizer.regenerate_trajectory(&prompt).await?;
+    let (system_prompt, user_prompt) = build_split_prompt(inputs);
+    let response = summarizer.regenerate_trajectory(&system_prompt, &user_prompt).await?;
     // For Phase 5 v1: assume the LLM returns the full 9-section record.
     // Split off the "Prompt-optimization candidates" section into a separate proposals file.
     let candidates = extract_candidates_section(&response);
@@ -40,6 +40,22 @@ pub async fn produce_learning(
 }
 
 /// Build the cached-system + fresh-data prompt per the spec.
+/// Split the prompt into stable (system) and fresh (user) parts for prompt caching.
+/// The system part contains the instructions; the user part contains workspace-specific data.
+pub fn build_split_prompt(inputs: &LearningInputs) -> (String, String) {
+    let combined = build_prompt(inputs);
+    const SEPARATOR: &str = "[USER MESSAGE]
+";
+    if let Some(pos) = combined.find(SEPARATOR) {
+        let system = combined[..pos].trim_end().to_string();
+        let user = combined[pos + SEPARATOR.len()..].to_string();
+        (system, user)
+    } else {
+        // Fallback: treat entire prompt as user message with empty system.
+        (String::new(), combined)
+    }
+}
+
 pub fn build_prompt(inputs: &LearningInputs) -> String {
     let mut prompt = String::new();
 

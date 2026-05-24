@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 pub struct OpenAISummarizer {
     client: Client,
@@ -97,43 +98,69 @@ impl Summarizer for OpenAISummarizer {
         parse_summary(&text)
     }
 
-    async fn regenerate_trajectory(&self, prompt: &str) -> Result<String> {
+    async fn regenerate_trajectory(&self, system: &str, user: &str) -> Result<String> {
         let timer = CallTimer::start();
+        let log_prompt = format!("[system]\n{system}\n\n[user]\n{user}");
 
-        let request = ChatRequest {
-            model: self.model.clone(),
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: prompt.to_string(),
-            }],
-            max_tokens: 2048,
-            temperature: 0.2,
-        };
+        let client = self.client.clone();
+        let api_key = self.api_key.clone();
+        let model = self.model.clone();
+        let system = system.to_string();
+        let user = user.to_string();
 
-        let result: Result<String> = async {
-            let response = self
-                .client
-                .post("https://api.openai.com/v1/chat/completions")
-                .header("Authorization", format!("Bearer {}", self.api_key))
-                .json(&request)
-                .send()
-                .await
-                .context("OpenAI API request failed")?
-                .json::<ChatResponse>()
-                .await
-                .context("failed to parse OpenAI response")?;
+        let result = crate::llm::with_retry(move || {
+            let client = client.clone();
+            let api_key = api_key.clone();
+            let model = model.clone();
+            let system = system.clone();
+            let user = user.clone();
+            async move {
+                // Build request body with cache_control on the system message.
+                let body = json!({
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": system,
+                                    "cache_control": { "type": "ephemeral" }
+                                }
+                            ]
+                        },
+                        {
+                            "role": "user",
+                            "content": user
+                        }
+                    ],
+                    "max_tokens": 2048,
+                    "temperature": 0.2
+                });
 
-            Ok(response
-                .choices
-                .first()
-                .map(|c| c.message.content.clone())
-                .unwrap_or_default())
-        }
+                let response: ChatResponse = client
+                    .post("https://api.openai.com/v1/chat/completions")
+                    .header("Authorization", format!("Bearer {api_key}"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .context("OpenAI API request failed")?
+                    .json::<ChatResponse>()
+                    .await
+                    .context("failed to parse OpenAI response")?;
+
+                Ok(response
+                    .choices
+                    .first()
+                    .map(|c| c.message.content.clone())
+                    .unwrap_or_default())
+            }
+        })
         .await;
 
         match &result {
-            Ok(text) => log_call("openai-regen", prompt, Ok(text.as_str()), timer.ms()),
-            Err(e) => log_call("openai-regen", prompt, Err(&format!("{:#}", e)), timer.ms()),
+            Ok(text) => log_call("openai-regen", &log_prompt, Ok(text.as_str()), timer.ms()),
+            Err(e) => log_call("openai-regen", &log_prompt, Err(&format!("{:#}", e)), timer.ms()),
         }
 
         result

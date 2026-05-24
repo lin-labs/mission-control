@@ -120,17 +120,40 @@ pub fn render(
                             .bg(Color::Cyan),
                     ))
                 } else if is_insert_cursor {
-                    // Insert mode cursor: show buffer text with an underscore cursor
-                    // and a distinct style.
-                    let cursor_char = if focused { "▋" } else { "_" };
+                    // Insert mode cursor: render with a block cursor at cursor_col.
+                    // Split: prefix + chars[..cursor_col] | cursor char | chars[cursor_col+1..]
+                    let cursor_col = edit_state.map(|s| s.cursor_col).unwrap_or(0);
+                    let chars: Vec<char> = display_text.chars().collect();
+                    let before: String = chars[..cursor_col.min(chars.len())].iter().collect();
+                    let cursor_char: String = if cursor_col < chars.len() {
+                        chars[cursor_col].to_string()
+                    } else {
+                        " ".to_string()
+                    };
+                    let after: String = if cursor_col + 1 < chars.len() {
+                        chars[cursor_col + 1..].iter().collect()
+                    } else {
+                        String::new()
+                    };
                     Line::from(vec![
                         Span::styled(
-                            format!("{prefix}{display_text}"),
+                            format!("{prefix}{before}"),
                             Style::default()
                                 .fg(Color::White)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(cursor_char, Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            cursor_char,
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Yellow),
+                        ),
+                        Span::styled(
+                            after,
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                     ])
                 } else {
                     Line::from(Span::styled(

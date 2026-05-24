@@ -43,12 +43,14 @@ impl Summarizer for CodexSummarizer {
         parse_summary(&text)
     }
 
-    async fn regenerate_trajectory(&self, prompt: &str) -> Result<String> {
+    async fn regenerate_trajectory(&self, system: &str, user: &str) -> Result<String> {
+        // Codex CLI doesn't support prompt caching — just concatenate the parts.
+        let prompt = format!("{system}\n\n{user}");
         let timer = CallTimer::start();
-        let result = self.summarize_inner(prompt).await;
+        let result = self.summarize_inner(&prompt).await;
         match &result {
-            Ok(text) => log_call("codex-regen", prompt, Ok(text.as_str()), timer.ms()),
-            Err(e) => log_call("codex-regen", prompt, Err(&format!("{:#}", e)), timer.ms()),
+            Ok(text) => log_call("codex-regen", &prompt, Ok(text.as_str()), timer.ms()),
+            Err(e) => log_call("codex-regen", &prompt, Err(&format!("{:#}", e)), timer.ms()),
         }
         result
     }

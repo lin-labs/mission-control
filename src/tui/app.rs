@@ -602,6 +602,9 @@ pub struct App {
     session_to_workspace: HashMap<String, String>,
     workspace_index: HashMap<String, usize>,
     bullet_hashes: HashMap<PathBuf, u64>,
+    /// Workspace UUID awaiting the second `D` confirmation for dismissal.
+    /// Set on first `D`; cleared on second `D` (executes dismissal) or any other key.
+    pub pending_dismissal: Option<String>,
 }
 
 impl App {
@@ -615,6 +618,7 @@ impl App {
             session_to_workspace: HashMap::new(),
             workspace_index: HashMap::new(),
             bullet_hashes: HashMap::new(),
+            pending_dismissal: None,
         }
     }
 
@@ -761,6 +765,60 @@ impl App {
         self.workspace_index.clear();
         for (i, ws) in self.workspaces.iter().enumerate() {
             self.workspace_index.insert(ws.workspace.uuid.clone(), i);
+        }
+
+        // Project cmux surfaces into the trajectory's ## Current surfaces section.
+        // We do this in a second pass (after the map/collect above) so we have
+        // access to both the built WorkspaceState and can mutate it.
+        for ws_state in self.workspaces.iter_mut() {
+            let Some(ref mut doc) = ws_state.trajectory else { continue };
+
+            // Build the new item list from the surfaces vec.
+            // Each surface item uses the workspace ref_id as surface_id because
+            // `cmux read-screen` takes a workspace ref — peek mode passes
+            // surface_id directly to read_screen, so this is the correct identifier.
+            let surface_items: Vec<crate::mc_data::trajectory::Item> = ws_state
+                .surfaces
+                .iter()
+                .map(|s| {
+                    crate::mc_data::trajectory::Item {
+                        text: s.title.clone(),
+                        is_checkbox: false,
+                        checked: None,
+                        // Use the workspace ref_id so peek mode can call
+                        // `cmux read-screen --workspace <ref_id>`.
+                        surface_id: Some(ws_state.workspace.ref_id.clone()),
+                    }
+                })
+                .collect();
+
+            // Skip save if the projected surface list is identical to what's
+            // already in the doc — avoids redundant iCloud file-watcher churn.
+            let existing_items = doc
+                .section(crate::mc_data::trajectory::SECTION_CURRENT_SURFACES)
+                .map(|s| s.items.as_slice())
+                .unwrap_or(&[]);
+            let unchanged = existing_items.len() == surface_items.len()
+                && existing_items
+                    .iter()
+                    .zip(surface_items.iter())
+                    .all(|(a, b)| a.text == b.text && a.surface_id == b.surface_id);
+            if unchanged {
+                continue;
+            }
+
+            doc.replace_section_items(
+                crate::mc_data::trajectory::SECTION_CURRENT_SURFACES,
+                surface_items,
+            );
+
+            let traj_path = crate::mc_data::paths::trajectory_path(&ws_state.workspace.uuid);
+            if let Err(e) = doc.save_to_file(&traj_path) {
+                eprintln!(
+                    "save trajectory after surface refresh ({}): {e:?}",
+                    ws_state.workspace.uuid
+                );
+            }
         }
 
         Ok(())
@@ -1100,6 +1158,13 @@ impl App {
         // Cmux surface order from workspace surfaces list (use titles as identifiers)
         let cmux_surface_order = ws.surfaces.iter().map(|s| s.title.clone()).collect();
 
+        // Canonical user ask from ~obsAgents/Sessions/<file>.md (last `## boyan` block).
+        let user_ask = crate::mc_data::session_log::latest_session_file_for_workspace(uuid)
+            .ok()
+            .flatten()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| crate::mc_data::session_log::last_user_turn(&s));
+
         Some(RegenInputs {
             workspace_name: ws.workspace.name.clone(),
             current_trajectory: trajectory.to_markdown(),
@@ -1109,6 +1174,7 @@ impl App {
             surface_summaries,
             tool_call_count: ws.tool_call_count,
             cmux_surface_order,
+            user_ask,
         })
     }
 
@@ -1569,6 +1635,70 @@ impl App {
             if !self.workspaces.is_empty() && self.selected >= self.workspaces.len() {
                 self.selected = self.workspaces.len() - 1;
             }
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // D dismissal confirmation
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Trigger immediate dismissal for a workspace by setting its grace timer
+    /// far enough in the past that the next dismiss_tick fires right away.
+    pub fn start_immediate_dismissal(&mut self, workspace_id: &str) {
+        if let Some(&idx) = self.workspace_index.get(workspace_id) {
+            let ws = &mut self.workspaces[idx];
+            if !ws.dismissal.dismissing {
+                ws.dismissal.grace_started_at =
+                    Some(Instant::now() - std::time::Duration::from_secs(600));
+            }
+        }
+    }
+
+    /// First `D` — record the pending dismissal; returns `false` (not yet acted).
+    /// Second `D` on the same workspace — execute the dismissal; returns `true`.
+    /// Switching to a different workspace on the first `D` replaces the pending entry.
+    pub fn handle_dismissal_request(&mut self, workspace_id: &str) -> bool {
+        match &self.pending_dismissal {
+            Some(prior) if prior == workspace_id => {
+                // Second D — execute.
+                self.pending_dismissal = None;
+                self.start_immediate_dismissal(workspace_id);
+                true
+            }
+            _ => {
+                // First D or different workspace — record pending.
+                self.pending_dismissal = Some(workspace_id.to_string());
+                false
+            }
+        }
+    }
+
+    /// Clear the pending dismissal (call on any non-D keypress).
+    pub fn clear_pending_dismissal(&mut self) {
+        self.pending_dismissal = None;
+    }
+
+    /// Return the UUID of the workspace currently pending dismissal confirmation.
+    pub fn pending_dismissal_workspace(&self) -> Option<&str> {
+        self.pending_dismissal.as_deref()
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Force-regen (Shift+R)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Mark the currently-selected workspace as due for regen on the next tick,
+    /// bypassing the event-count and time thresholds.
+    pub fn force_regen_selected_workspace(&mut self) {
+        let uuid = match self.selected_workspace() {
+            Some(ws) => ws.workspace.uuid.clone(),
+            None => return,
+        };
+        if let Some(&idx) = self.workspace_index.get(&uuid) {
+            // Set events_since_last_regen high enough to trigger the next tick.
+            self.workspaces[idx].regen.events_since_last_regen = u32::MAX;
+            // Also reset last_regen_at so the time-threshold is also satisfied.
+            self.workspaces[idx].regen.last_regen_at = None;
         }
     }
 
@@ -2171,5 +2301,96 @@ workspace: test-ws
             !goal_items.iter().any(|t| t.contains("Should not appear")),
             "trajectory should NOT be replaced while in insert mode"
         );
+    }
+
+    // ── T10: D dismissal confirmation ─────────────────────────────────────────
+
+    #[test]
+    fn first_d_records_pending_returns_false() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let executed = app.handle_dismissal_request("ws-1");
+        assert!(!executed, "first D should not execute dismissal");
+        assert_eq!(
+            app.pending_dismissal_workspace(),
+            Some("ws-1"),
+            "first D should set pending_dismissal to the workspace id"
+        );
+    }
+
+    #[test]
+    fn second_d_on_same_workspace_executes() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        // Add a workspace with uuid "ws-exec" so start_immediate_dismissal can look it up.
+        let ws2 = make_ws(SAMPLE_WITH_SURFACE);
+        let mut ws2 = ws2;
+        ws2.workspace.uuid = "ws-exec".to_string();
+        app.workspaces.push(ws2);
+        app.workspace_index.insert("ws-exec".to_string(), 1);
+
+        app.handle_dismissal_request("ws-exec");
+        let executed = app.handle_dismissal_request("ws-exec");
+        assert!(executed, "second D on same workspace should execute dismissal");
+        assert!(
+            app.pending_dismissal_workspace().is_none(),
+            "pending_dismissal should be cleared after execution"
+        );
+    }
+
+    #[test]
+    fn d_on_different_workspace_replaces_pending() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.handle_dismissal_request("ws-1");
+        app.handle_dismissal_request("ws-2");
+        assert_eq!(
+            app.pending_dismissal_workspace(),
+            Some("ws-2"),
+            "second D on a different workspace should replace the pending entry"
+        );
+    }
+
+    #[test]
+    fn clear_pending_dismissal_resets() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.handle_dismissal_request("ws-1");
+        app.clear_pending_dismissal();
+        assert!(
+            app.pending_dismissal_workspace().is_none(),
+            "clear_pending_dismissal should set pending_dismissal to None"
+        );
+    }
+
+    // ── T11: Force-regen via Shift+R ──────────────────────────────────────────
+
+    #[test]
+    fn force_regen_marks_workspace_due() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        // Start in a state that would NOT normally be due for regen.
+        app.workspaces[0].regen.events_since_last_regen = 0;
+        app.workspaces[0].regen.last_regen_at = Some(Instant::now());
+
+        app.force_regen_selected_workspace();
+
+        assert_eq!(
+            app.workspaces[0].regen.events_since_last_regen,
+            u32::MAX,
+            "force_regen should set events_since_last_regen to u32::MAX"
+        );
+        assert!(
+            app.workspaces[0].regen.last_regen_at.is_none(),
+            "force_regen should clear last_regen_at"
+        );
+        // The workspace should now appear in workspaces_due_for_regen.
+        let due = app.workspaces_due_for_regen();
+        assert!(
+            due.contains(&"test-uuid-1".to_string()),
+            "workspace should be due for regen after force_regen"
+        );
+    }
+
+    #[test]
+    fn force_regen_with_no_selection_is_noop() {
+        let mut app = App::new();
+        // No workspaces — should not panic.
+        app.force_regen_selected_workspace();
     }
 }

@@ -44,6 +44,19 @@ pub struct TrajectoryDoc {
 }
 
 impl TrajectoryDoc {
+    /// Canonical empty 3-section skeleton with frontmatter for a fresh workspace.
+    pub fn skeleton(uuid: &str, name: &str, _project: &str) -> Self {
+        let frontmatter = Frontmatter {
+            workspace: Some(name.to_string()),
+            workspace_id: Some(uuid.to_string()),
+            updated: Some(chrono::Utc::now().to_rfc3339()),
+            snapshot: Some(0),
+        };
+        let mut doc = TrajectoryDoc { frontmatter, sections: Vec::new() };
+        doc.ensure_sections();
+        doc
+    }
+
     pub fn parse(text: &str) -> Result<Self> {
         let (fm_str, body) = split_frontmatter(text);
         let frontmatter: Frontmatter = if fm_str.is_empty() {
@@ -134,6 +147,18 @@ impl TrajectoryDoc {
             }
         }
         out
+    }
+
+    /// Swap in a new item list for a named section. No-op if the section
+    /// doesn't exist (in Phase 1a/1b, ensure_sections() always backfills, so
+    /// this should never silently drop work — but be defensive).
+    pub fn replace_section_items(&mut self, name: &str, items: Vec<Item>) {
+        for s in self.sections.iter_mut() {
+            if s.name == name {
+                s.items = items;
+                return;
+            }
+        }
     }
 
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
