@@ -39,7 +39,17 @@ pub struct PeekState {
     pub last_poll: Option<Instant>,
     /// Whether we're currently waiting for a poll to complete.
     pub polling: bool,
+    /// When true, every `ingest_screen` snaps `scroll_offset` to the bottom
+    /// so the user sees the most recent content by default. Any manual
+    /// scroll up (j/k/page/g) disables auto-follow; `G` (go_bottom) or `f`
+    /// re-enables it.
+    pub auto_follow: bool,
 }
+
+/// Pagination jump for Space (page-down) / `-` (page-up). Fixed-size rather
+/// than tied to visible area height because PeekState doesn't know the
+/// render area's height.
+pub const PAGE_SIZE: u16 = 10;
 
 impl PeekState {
     pub fn new(surface_ref: String, surface_label: String) -> Self {
@@ -50,6 +60,7 @@ impl PeekState {
             screen_buffer: Vec::new(),
             last_poll: None,
             polling: false,
+            auto_follow: true,
         }
     }
 
@@ -76,10 +87,16 @@ impl PeekState {
         }
         self.last_poll = Some(Instant::now());
         self.polling = false;
-        // Clamp scroll_offset so it can't go past the buffer end.
-        let max_offset = self.max_scroll();
-        if self.scroll_offset > max_offset {
-            self.scroll_offset = max_offset;
+        // Auto-follow: when active, every ingest pins the view to the bottom
+        // so the user sees the freshest content by default.
+        if self.auto_follow {
+            self.scroll_offset = self.max_scroll();
+        } else {
+            // Manual mode — clamp so the offset can't go past the buffer end.
+            let max_offset = self.max_scroll();
+            if self.scroll_offset > max_offset {
+                self.scroll_offset = max_offset;
+            }
         }
     }
 
@@ -89,24 +106,44 @@ impl PeekState {
     }
 
     // ── Key actions ────────────────────────────────────────────────────────────
+    //
+    // Any manual scroll disables auto-follow; only `go_bottom` re-enables it
+    // because that's an explicit "snap to fresh" gesture.
 
     pub fn scroll_down(&mut self) {
         let max = self.max_scroll();
         if self.scroll_offset < max {
             self.scroll_offset = self.scroll_offset.saturating_add(3).min(max);
         }
+        self.auto_follow = false;
     }
 
     pub fn scroll_up(&mut self) {
         self.scroll_offset = self.scroll_offset.saturating_sub(3);
+        self.auto_follow = false;
+    }
+
+    /// Page-down (Space). Jumps PAGE_SIZE lines toward the bottom.
+    pub fn page_down(&mut self) {
+        let max = self.max_scroll();
+        self.scroll_offset = self.scroll_offset.saturating_add(PAGE_SIZE).min(max);
+        self.auto_follow = false;
+    }
+
+    /// Page-up (`-`). Jumps PAGE_SIZE lines toward the top.
+    pub fn page_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(PAGE_SIZE);
+        self.auto_follow = false;
     }
 
     pub fn go_top(&mut self) {
         self.scroll_offset = 0;
+        self.auto_follow = false;
     }
 
     pub fn go_bottom(&mut self) {
         self.scroll_offset = self.max_scroll();
+        self.auto_follow = true;
     }
 }
 
@@ -119,7 +156,7 @@ pub fn render(f: &mut Frame, area: Rect, peek: &PeekState, focused: bool) {
     let border_color = if focused { Color::Magenta } else { Color::DarkGray };
 
     let title = format!(
-        " Peek: {} (j/k scroll · g/G top/bot · Esc back · Enter yield) ",
+        " Peek: {} (j/k slow · Space/- page · g/G top/bot · Esc back · Enter yield) ",
         peek.surface_label,
     );
     let block = Block::default()
@@ -309,7 +346,12 @@ mod tests {
     #[test]
     fn render_shows_screen_buffer_content() {
         let mut ps = make_state();
+        // Disable auto-follow so the view starts at the top — keeps this
+        // test focused on "the renderer actually emits buffer content"
+        // regardless of where the cursor sits.
+        ps.auto_follow = false;
         ps.ingest_screen("hello from peek\nworld line\n");
+        ps.scroll_offset = 0;
         let backend = TestBackend::new(80, 15);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -320,5 +362,128 @@ mod tests {
             dump.contains("hello from peek"),
             "screen content not shown: {dump}"
         );
+    }
+
+    #[test]
+    fn render_with_auto_follow_shows_bottom_of_buffer() {
+        let mut ps = make_state();
+        ps.ingest_screen("hello from peek\nworld line\n");
+        // auto_follow is on by default — ingest should snap to bottom.
+        let backend = TestBackend::new(80, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, Rect::new(0, 0, 80, 5), &ps, true))
+            .unwrap();
+        let dump = buf_dump(&terminal);
+        // With a 5-row pane (3 inner rows) and 2 lines of content scrolled to
+        // the bottom, "world line" should be visible — that's the newest.
+        assert!(dump.contains("world line"), "bottom line not shown: {dump}");
+    }
+
+    // ── Auto-follow + pagination ────────────────────────────────────────────
+
+    #[test]
+    fn auto_follow_initially_true() {
+        let ps = make_state();
+        assert!(ps.auto_follow, "auto_follow should default to true on new()");
+    }
+
+    #[test]
+    fn ingest_with_auto_follow_snaps_to_bottom() {
+        let mut ps = make_state();
+        for i in 0..30 {
+            ps.screen_buffer.push(format!("line {i}"));
+        }
+        ps.scroll_offset = 0;
+        ps.auto_follow = true;
+        // simulate a new ingest that adds more content
+        ps.ingest_screen("new-line-a\nnew-line-b\n");
+        // After ingest, scroll_offset should be at the buffer's max (bottom).
+        assert_eq!(ps.scroll_offset, ps.max_scroll());
+        assert!(ps.auto_follow, "ingest must not disable auto_follow on its own");
+    }
+
+    #[test]
+    fn ingest_without_auto_follow_preserves_offset() {
+        let mut ps = make_state();
+        for i in 0..30 {
+            ps.screen_buffer.push(format!("line {i}"));
+        }
+        ps.scroll_offset = 5;
+        ps.auto_follow = false;
+        ps.ingest_screen("new-line\n");
+        // Offset stays at 5 (clamped within range, which it is).
+        assert_eq!(ps.scroll_offset, 5);
+    }
+
+    #[test]
+    fn manual_scroll_down_disables_auto_follow() {
+        let mut ps = make_state();
+        for i in 0..30 {
+            ps.screen_buffer.push(format!("line {i}"));
+        }
+        assert!(ps.auto_follow);
+        ps.scroll_down();
+        assert!(!ps.auto_follow, "j must disable auto_follow");
+    }
+
+    #[test]
+    fn page_down_moves_by_page_size() {
+        let mut ps = make_state();
+        for i in 0..50 {
+            ps.screen_buffer.push(format!("line {i}"));
+        }
+        ps.scroll_offset = 0;
+        ps.page_down();
+        assert_eq!(ps.scroll_offset, PAGE_SIZE);
+        assert!(!ps.auto_follow);
+    }
+
+    #[test]
+    fn page_down_clamps_at_bottom() {
+        let mut ps = make_state();
+        for i in 0..50 {
+            ps.screen_buffer.push(format!("line {i}"));
+        }
+        let max = ps.max_scroll();
+        ps.scroll_offset = max.saturating_sub(2);
+        ps.page_down();
+        assert_eq!(ps.scroll_offset, max);
+    }
+
+    #[test]
+    fn page_up_moves_by_page_size() {
+        let mut ps = make_state();
+        for i in 0..50 {
+            ps.screen_buffer.push(format!("line {i}"));
+        }
+        ps.scroll_offset = 25;
+        ps.page_up();
+        assert_eq!(ps.scroll_offset, 25 - PAGE_SIZE);
+        assert!(!ps.auto_follow);
+    }
+
+    #[test]
+    fn page_up_saturates_at_zero() {
+        let mut ps = make_state();
+        for i in 0..50 {
+            ps.screen_buffer.push(format!("line {i}"));
+        }
+        ps.scroll_offset = 3;
+        ps.page_up();
+        assert_eq!(ps.scroll_offset, 0);
+    }
+
+    #[test]
+    fn go_bottom_reenables_auto_follow() {
+        let mut ps = make_state();
+        for i in 0..30 {
+            ps.screen_buffer.push(format!("line {i}"));
+        }
+        ps.scroll_up(); // disables auto_follow
+        assert!(!ps.auto_follow);
+        ps.go_bottom();
+        assert!(ps.auto_follow, "G must re-enable auto_follow");
+        assert_eq!(ps.scroll_offset, ps.max_scroll());
     }
 }

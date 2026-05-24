@@ -1306,6 +1306,8 @@ impl App {
                 match key.code {
                     KeyCode::Char('j') | KeyCode::Down => { peek.scroll_down(); }
                     KeyCode::Char('k') | KeyCode::Up   => { peek.scroll_up(); }
+                    KeyCode::Char(' ')                  => { peek.page_down(); }
+                    KeyCode::Char('-')                  => { peek.page_up(); }
                     KeyCode::Char('g')                  => { peek.go_top(); }
                     KeyCode::Char('G')                  => { peek.go_bottom(); }
                     KeyCode::Esc => {
