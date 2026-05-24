@@ -287,6 +287,10 @@ async fn run_app(
         Result<crate::mc_data::dismissal::DismissalArtifacts, String>,
     )>(8);
 
+    // Channel for `:command` results (e.g. :summarize completing).
+    let (command_tx, mut command_rx) =
+        mpsc::channel::<crate::commands::CommandResult>(8);
+
     let mut refresh_interval = interval(Duration::from_secs(30));
     let mut screen_interval = interval(Duration::from_secs(15));
     let mut regen_tick = interval(Duration::from_secs(30));
@@ -923,6 +927,25 @@ async fn run_app(
 
             Some((uuid, sid, summary)) = surface_summary_rx.recv() => {
                 app.apply_surface_summary(&uuid, &sid, summary);
+            }
+
+            Some(result) = command_rx.recv() => {
+                use crate::commands::CommandResult;
+                use crate::tui::command::{InputMode, StatusLine};
+                if let InputMode::Command(ref mut cl) = app.input_mode {
+                    cl.status = Some(match result {
+                        CommandResult::SummarizeDone(path) => {
+                            let name = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("(unknown)")
+                                .to_string();
+                            StatusLine::Ok(format!("wrote {}", name))
+                        }
+                        CommandResult::Err(msg) => StatusLine::Err(msg),
+                    });
+                }
+                // If the user already exited Command mode (Esc), drop the result.
             }
 
             _ = dismiss_tick.tick() => {
