@@ -366,6 +366,9 @@ async fn run_app(
                                     if !actions.is_empty() {
                                         if let Err(e) = app.save_trajectory_edits(&actions) {
                                             eprintln!("save_trajectory_edits: {e:?}");
+                                        } else {
+                                            // Push Goal back to cmux description (non-fatal).
+                                            app.spawn_push_goal_to_cmux(cmux_client.clone());
                                         }
                                     }
                                     continue;
@@ -408,6 +411,9 @@ async fn run_app(
                                     if in_insert {
                                         if let Err(e) = app.save_trajectory_edits(&[]) {
                                             eprintln!("auto-save on switch: {e:?}");
+                                        } else {
+                                            // Push Goal back to cmux description (non-fatal).
+                                            app.spawn_push_goal_to_cmux(cmux_client.clone());
                                         }
                                     }
                                     app.next();
@@ -436,6 +442,9 @@ async fn run_app(
                                     if in_insert {
                                         if let Err(e) = app.save_trajectory_edits(&[]) {
                                             eprintln!("auto-save on switch: {e:?}");
+                                        } else {
+                                            // Push Goal back to cmux description (non-fatal).
+                                            app.spawn_push_goal_to_cmux(cmux_client.clone());
                                         }
                                     }
                                     app.previous();
