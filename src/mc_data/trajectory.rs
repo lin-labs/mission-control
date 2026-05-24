@@ -161,6 +161,45 @@ impl TrajectoryDoc {
         }
     }
 
+    pub fn sort_tasks_if_long(&mut self) {
+        for s in self.sections.iter_mut() {
+            if s.name != SECTION_TASKS {
+                continue;
+            }
+            if s.items.len() <= 10 {
+                return;
+            }
+            let with_idx: Vec<(usize, Item)> = s.items.drain(..).enumerate().collect();
+            let mut todos: Vec<(usize, Item)> = Vec::new();
+            let mut dones: Vec<(usize, Item)> = Vec::new();
+            for (i, item) in with_idx {
+                if item.is_checkbox && item.checked == Some(true) {
+                    dones.push((i, item));
+                } else {
+                    todos.push((i, item));
+                }
+            }
+            todos.sort_by_key(|(idx, item)| {
+                let prio = priority_of(&item.text);
+                // Encode: Some(n) < None. Use (0u8, n) vs (1u8, 0) for ordering.
+                let prio_key = match prio {
+                    Some(n) => (0u8, n),
+                    None => (1u8, 0u8),
+                };
+                (prio_key, *idx)
+            });
+            // dones stay in original order — drain already preserved that, but we
+            // need to sort by original idx since both vecs got idx tags.
+            dones.sort_by_key(|(idx, _)| *idx);
+            s.items = todos
+                .into_iter()
+                .chain(dones.into_iter())
+                .map(|(_, item)| item)
+                .collect();
+            return;
+        }
+    }
+
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -190,6 +229,20 @@ impl TrajectoryDoc {
             Err(e) => Err(anyhow::Error::from(e).context(format!("read {path:?}"))),
         }
     }
+}
+
+pub fn priority_of(text: &str) -> Option<u8> {
+    let t = text.trim_start();
+    let bytes = t.as_bytes();
+    if bytes.len() >= 4
+        && bytes[0] == b'['
+        && (bytes[1] == b'P' || bytes[1] == b'p')
+        && bytes[2].is_ascii_digit()
+        && bytes[3] == b']'
+    {
+        return Some(bytes[2] - b'0');
+    }
+    None
 }
 
 fn split_frontmatter(text: &str) -> (&str, &str) {

@@ -1,4 +1,4 @@
-use mission_control::mc_data::trajectory::{TrajectoryDoc, Section, Item};
+use mission_control::mc_data::trajectory::{TrajectoryDoc, Section, Item, priority_of};
 
 const SAMPLE: &str = "---
 workspace: predinvest
@@ -207,4 +207,128 @@ fn replace_section_items_is_noop_for_unknown_section() {
     let before_len = doc.sections.len();
     doc.replace_section_items("Nonexistent", vec![]);
     assert_eq!(doc.sections.len(), before_len, "should not add a new section");
+}
+
+#[test]
+fn priority_of_extracts_p0_through_p9_prefix() {
+    assert_eq!(priority_of("[P0] urgent"), Some(0));
+    assert_eq!(priority_of("[P9] later"), Some(9));
+    assert_eq!(priority_of("[p3] lowercase"), Some(3));
+}
+
+#[test]
+fn priority_of_none_when_no_prefix() {
+    assert_eq!(priority_of("regular task"), None);
+    assert_eq!(priority_of("[Q0] wrong letter"), None);
+    assert_eq!(priority_of("[P] no digit"), None);
+    assert_eq!(priority_of("[P10] too many"), None);
+}
+
+#[test]
+fn sort_tasks_noop_when_section_has_10_or_fewer() {
+    let mut doc = TrajectoryDoc::default();
+    doc.ensure_sections();
+    for i in 0..10 {
+        doc.sections[2].items.push(Item {
+            text: format!("task {i}"),
+            is_checkbox: true,
+            checked: Some(i % 2 == 0),
+            surface_id: None,
+        });
+    }
+    let before: Vec<String> = doc.sections[2].items.iter().map(|i| i.text.clone()).collect();
+    doc.sort_tasks_if_long();
+    let after: Vec<String> = doc.sections[2].items.iter().map(|i| i.text.clone()).collect();
+    assert_eq!(before, after, "must not sort when <= 10 items");
+}
+
+#[test]
+fn sort_tasks_with_11_items_splits_todo_first_done_last() {
+    let mut doc = TrajectoryDoc::default();
+    doc.ensure_sections();
+    for i in 0..11 {
+        doc.sections[2].items.push(Item {
+            text: format!("task {i}"),
+            is_checkbox: true,
+            checked: Some(i % 3 == 0),
+            surface_id: None,
+        });
+    }
+    doc.sort_tasks_if_long();
+    let items = &doc.sections[2].items;
+    let mut seen_done = false;
+    for it in items {
+        let is_done = it.checked == Some(true);
+        if is_done {
+            seen_done = true;
+        } else {
+            assert!(!seen_done, "TODO appeared after a DONE: {}", it.text);
+        }
+    }
+}
+
+#[test]
+fn sort_tasks_orders_todos_by_priority_high_to_low() {
+    let mut doc = TrajectoryDoc::default();
+    doc.ensure_sections();
+    let inputs = [
+        "no prio task A",
+        "[P2] med",
+        "[P0] urgent",
+        "another no-prio",
+        "[P1] medium-high",
+        "[P0] another urgent",
+        "[P5] later",
+        "[P3] meh",
+        "[P9] sometime",
+        "[P1] also med-high",
+        "[P0] third urgent",
+    ];
+    for t in inputs {
+        doc.sections[2].items.push(Item {
+            text: t.to_string(),
+            is_checkbox: true,
+            checked: Some(false),
+            surface_id: None,
+        });
+    }
+    doc.sort_tasks_if_long();
+    let order: Vec<String> = doc.sections[2].items.iter().map(|i| i.text.clone()).collect();
+    // First three should be P0 (in their original insertion order -- stable).
+    assert!(order[0].starts_with("[P0] urgent"));
+    assert!(order[1].starts_with("[P0] another urgent"));
+    assert!(order[2].starts_with("[P0] third urgent"));
+    // Next should be P1.
+    assert!(order[3].starts_with("[P1] medium-high"));
+    assert!(order[4].starts_with("[P1] also med-high"));
+    assert!(order[5].starts_with("[P2] med"));
+    assert!(order[6].starts_with("[P3] meh"));
+    assert!(order[7].starts_with("[P5] later"));
+    assert!(order[8].starts_with("[P9] sometime"));
+    // Last two are the no-priority items, in original insertion order.
+    assert_eq!(order[9], "no prio task A");
+    assert_eq!(order[10], "another no-prio");
+}
+
+#[test]
+fn sort_tasks_preserves_done_insertion_order() {
+    let mut doc = TrajectoryDoc::default();
+    doc.ensure_sections();
+    let dones = ["d1", "d2", "d3", "d4", "d5", "d6"];
+    let todos = ["t1", "t2", "t3", "t4", "t5", "t6"];
+    for (i, name) in todos.iter().chain(dones.iter()).enumerate() {
+        let is_done = i >= 6;
+        doc.sections[2].items.push(Item {
+            text: name.to_string(),
+            is_checkbox: true,
+            checked: Some(is_done),
+            surface_id: None,
+        });
+    }
+    doc.sort_tasks_if_long();
+    // After sort: all 6 todos first (no priority, stable order = original order),
+    // then 6 dones in original order.
+    let order: Vec<String> = doc.sections[2].items.iter().map(|i| i.text.clone()).collect();
+    assert_eq!(&order[..6], &["t1", "t2", "t3", "t4", "t5", "t6"]);
+    assert_eq!(&order[6..], &["d1", "d2", "d3", "d4", "d5", "d6"]);
 }
