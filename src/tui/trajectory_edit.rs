@@ -70,6 +70,8 @@ pub struct TrajectoryEditState {
     pub edit_start_text: Option<String>,
     /// Cursor column within `edit_buffer` in insert mode (char count, not byte count).
     pub cursor_col: usize,
+    /// Timestamp of the first `d` keypress, for the `dd` two-key sequence.
+    pub pending_d_at: Option<std::time::Instant>,
 }
 
 impl Default for TrajectoryEditState {
@@ -82,6 +84,7 @@ impl Default for TrajectoryEditState {
             input_ctx_buffer: String::new(),
             edit_start_text: None,
             cursor_col: 0,
+            pending_d_at: None,
         }
     }
 }
@@ -115,54 +118,83 @@ fn handle_nav_key(
     match key.code {
         // ── Movement ────────────────────────────────────────────────────────
         KeyCode::Char('j') | KeyCode::Down => {
+            state.pending_d_at = None;
             move_cursor_down(state, doc);
         }
         KeyCode::Char('k') | KeyCode::Up => {
+            state.pending_d_at = None;
             move_cursor_up(state, doc);
         }
         KeyCode::Char('g') => {
+            state.pending_d_at = None;
             state.cursor_section = first_non_empty_section(doc);
             state.cursor_item = 0;
         }
         KeyCode::Char('G') => {
+            state.pending_d_at = None;
             let (s, i) = last_item_pos(doc);
             state.cursor_section = s;
             state.cursor_item = i;
         }
         // ── Editing ─────────────────────────────────────────────────────────
         KeyCode::Char(' ') => {
+            state.pending_d_at = None;
             if let Some(action) = toggle_checkbox(state, doc) {
                 actions.push(action);
             }
         }
-        KeyCode::Char('x') | KeyCode::Char('d') => {
+        KeyCode::Char('x') => {
+            state.pending_d_at = None;
             if let Some(action) = delete_item(state, doc) {
                 actions.push(action);
             }
         }
+        KeyCode::Char('d') => {
+            if let Some(t) = state.pending_d_at {
+                if t.elapsed() <= std::time::Duration::from_secs(1) {
+                    // Second `d` within window — delete.
+                    state.pending_d_at = None;
+                    if let Some(action) = delete_item(state, doc) {
+                        actions.push(action);
+                    }
+                    return actions;
+                }
+            }
+            // First `d` (or expired) — start the window.
+            state.pending_d_at = Some(std::time::Instant::now());
+        }
         KeyCode::Char('o') => {
+            state.pending_d_at = None;
             insert_item_below(state, doc);
         }
         KeyCode::Char('O') => {
+            state.pending_d_at = None;
             insert_item_above(state, doc);
         }
         KeyCode::Char('i') | KeyCode::Enter => {
+            state.pending_d_at = None;
             enter_insert_mode(state, doc);
         }
         // ── Move item within section ─────────────────────────────────────────
         KeyCode::Char('J') => {
+            state.pending_d_at = None;
             if let Some(action) = move_item_down(state, doc) {
                 actions.push(action);
             }
         }
         KeyCode::Char('K') => {
+            state.pending_d_at = None;
             if let Some(action) = move_item_up(state, doc) {
                 actions.push(action);
             }
         }
         // Esc is a no-op in nav mode
-        KeyCode::Esc => {}
-        _ => {}
+        KeyCode::Esc => {
+            state.pending_d_at = None;
+        }
+        _ => {
+            state.pending_d_at = None;
+        }
     }
     actions
 }
@@ -1209,5 +1241,73 @@ workspace: test-ws
         assert_eq!(state.edit_buffer, "ä");
         // Verify edit_buffer byte length is > 1 (it's multi-byte UTF-8)
         assert!(state.edit_buffer.len() > 1);
+    }
+
+    // ── T9: `dd` two-key sequence ────────────────────────────────────────────
+
+    #[test]
+    fn dd_within_one_second_deletes_item() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: "kill me".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('d')));
+        assert!(state.pending_d_at.is_some());
+        assert_eq!(doc.sections[0].items.len(), 1, "first d should NOT delete");
+        let actions = handle_key(&mut state, &mut doc, key(KeyCode::Char('d')));
+        assert_eq!(doc.sections[0].items.len(), 0);
+        assert!(!actions.is_empty()); // delete action emitted
+        assert!(state.pending_d_at.is_none());
+    }
+
+    #[test]
+    fn single_d_does_nothing_destructive() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: "keep me".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('d')));
+        assert_eq!(doc.sections[0].items.len(), 1, "single d should NOT delete");
+    }
+
+    #[test]
+    fn d_followed_by_non_d_clears_pending() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: "x".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('d')));
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('j'))); // any other key
+        assert!(state.pending_d_at.is_none(), "d-pending should clear on non-d");
+    }
+
+    #[test]
+    fn x_still_deletes_in_one_keypress() {
+        let mut doc = TrajectoryDoc::default();
+        doc.ensure_sections();
+        doc.sections[0].items.push(Item {
+            text: "x".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('x')));
+        assert_eq!(doc.sections[0].items.len(), 0);
     }
 }
