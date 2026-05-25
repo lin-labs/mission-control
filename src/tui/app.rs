@@ -1804,7 +1804,6 @@ impl App {
                     //     which the peek_tick path reads via
                     //     surface.read_text (per-surface), NOT
                     //     read-screen (workspace-level).
-                    use crate::mc_data::surface_kind::SurfaceKind;
                     let source = if surface_kind.is_agent() {
                         let agent_label = surface_kind.label();
                         let same_agent_index = ws

@@ -394,6 +394,84 @@ async fn run_app(
                         continue;
                     }
 
+                        // ── Command-mode key routing (TOP PRIORITY) ──────────
+                        // When `:` was pressed, all keys are typed into the
+                        // command buffer until the user submits (Enter),
+                        // cancels (Esc), or backspaces past the empty buffer.
+                        // This MUST run before any other key router (trajectory,
+                        // dismissal, normal-mode match) — otherwise letters like
+                        // `i`, `q`, `j`, `k` would be intercepted by their other
+                        // owners while the user is mid-command-typing.
+                        if let crate::tui::command::InputMode::Command(ref mut cl) = app.input_mode {
+                            use crate::tui::command::{InputMode, StatusLine};
+                            match (key.code, key.modifiers) {
+                                (KeyCode::Esc, _) => {
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                (KeyCode::Enter, _) => {
+                                    let buffer = cl.buffer.trim().to_string();
+                                    if buffer.is_empty() {
+                                        app.input_mode = InputMode::Normal;
+                                    } else {
+                                        let cmd = buffer.split_whitespace().next().unwrap_or("");
+                                        match cmd {
+                                            "summarize" => {
+                                                // Reject if another summarize is in flight.
+                                                let already_running = matches!(
+                                                    cl.status,
+                                                    Some(StatusLine::Running(_))
+                                                );
+                                                if already_running {
+                                                    cl.status = Some(StatusLine::Err(
+                                                        "summarize already running".into(),
+                                                    ));
+                                                } else {
+                                                    cl.status = Some(StatusLine::Running(
+                                                        "summarize…".into(),
+                                                    ));
+                                                    let digests = crate::commands::summarize::collect_digests(&app);
+                                                    let summarizer_opt = summarizer.clone();
+                                                    let tx = command_tx.clone();
+                                                    tokio::spawn(async move {
+                                                        let res = crate::commands::summarize::run(
+                                                            digests,
+                                                            summarizer_opt,
+                                                        )
+                                                        .await;
+                                                        let _ = tx.send(res).await;
+                                                    });
+                                                }
+                                            }
+                                            other => {
+                                                cl.status = Some(StatusLine::Err(format!(
+                                                    "unknown command: {}",
+                                                    other
+                                                )));
+                                            }
+                                        }
+                                    }
+                                }
+                                (KeyCode::Backspace, _) => {
+                                    if !cl.backspace() {
+                                        app.input_mode = InputMode::Normal;
+                                    }
+                                }
+                                (KeyCode::Tab, _) => {
+                                    let _ = cl.tab();
+                                }
+                                (KeyCode::Left, _) => cl.cursor_left(),
+                                (KeyCode::Right, _) => cl.cursor_right(),
+                                (KeyCode::Home, _) => cl.cursor_home(),
+                                (KeyCode::End, _) => cl.cursor_end(),
+                                (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+                                    cl.insert_char(c);
+                                }
+                                _ => {}
+                            }
+                            continue; // exclusive owner — never fall through
+                        }
+                        // ─────────────────────────────────────────────────────
+
                         // ── Trajectory key routing ────────────────────────────
                         // When in Detail focus and the selected workspace has a
                         // trajectory loaded, intercept keys for the editor.
@@ -495,79 +573,9 @@ async fn run_app(
                             app.clear_pending_dismissal();
                         }
 
-                        // ── Command-mode key routing ─────────────────────────────────────────
-                        // When `:` was pressed, all keys are typed into the command buffer
-                        // until the user submits (Enter), cancels (Esc), or backspaces past
-                        // the empty buffer.
-                        if let crate::tui::command::InputMode::Command(ref mut cl) = app.input_mode {
-                            use crate::tui::command::{InputMode, StatusLine};
-                            match (key.code, key.modifiers) {
-                                (KeyCode::Esc, _) => {
-                                    app.input_mode = InputMode::Normal;
-                                }
-                                (KeyCode::Enter, _) => {
-                                    let buffer = cl.buffer.trim().to_string();
-                                    if buffer.is_empty() {
-                                        app.input_mode = InputMode::Normal;
-                                    } else {
-                                        let cmd = buffer.split_whitespace().next().unwrap_or("");
-                                        match cmd {
-                                            "summarize" => {
-                                                // Reject if another summarize is in flight.
-                                                let already_running = matches!(
-                                                    cl.status,
-                                                    Some(StatusLine::Running(_))
-                                                );
-                                                if already_running {
-                                                    cl.status = Some(StatusLine::Err(
-                                                        "summarize already running".into(),
-                                                    ));
-                                                } else {
-                                                    cl.status = Some(StatusLine::Running(
-                                                        "summarize…".into(),
-                                                    ));
-                                                    let digests = crate::commands::summarize::collect_digests(&app);
-                                                    let summarizer_opt = summarizer.clone();
-                                                    let tx = command_tx.clone();
-                                                    tokio::spawn(async move {
-                                                        let res = crate::commands::summarize::run(
-                                                            digests,
-                                                            summarizer_opt,
-                                                        )
-                                                        .await;
-                                                        let _ = tx.send(res).await;
-                                                    });
-                                                }
-                                            }
-                                            other => {
-                                                cl.status = Some(StatusLine::Err(format!(
-                                                    "unknown command: {}",
-                                                    other
-                                                )));
-                                            }
-                                        }
-                                    }
-                                }
-                                (KeyCode::Backspace, _) => {
-                                    if !cl.backspace() {
-                                        app.input_mode = InputMode::Normal;
-                                    }
-                                }
-                                (KeyCode::Tab, _) => {
-                                    let _ = cl.tab();
-                                }
-                                (KeyCode::Left, _) => cl.cursor_left(),
-                                (KeyCode::Right, _) => cl.cursor_right(),
-                                (KeyCode::Home, _) => cl.cursor_home(),
-                                (KeyCode::End, _) => cl.cursor_end(),
-                                (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
-                                    cl.insert_char(c);
-                                }
-                                _ => {}
-                            }
-                            continue; // swallow this key — never fall through to Normal-mode match
-                        }
-                        // ─────────────────────────────────────────────────────────────────────
+                        // Command-mode is now handled at the top of this arm
+                        // (above the trajectory router) so it owns its keys
+                        // exclusively. No second copy needed here.
 
                         match (key.code, key.modifiers) {
                             (KeyCode::Char('q'), _)
