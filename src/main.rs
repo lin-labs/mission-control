@@ -903,22 +903,26 @@ async fn run_app(
             }
 
             _ = peek_tick.tick() => {
-                if let Some((uuid, workspace_ref)) = app.peek_needs_poll() {
+                if let Some((uuid, surface_ref)) = app.peek_needs_poll() {
                     let uuid = uuid.to_string();
-                    let workspace_ref = workspace_ref.to_string();
+                    let surface_ref = surface_ref.to_string();
                     let uses_cmux = app.workspaces.iter()
                         .find(|ws| ws.workspace.uuid == uuid)
                         .and_then(|ws| ws.peek_state.as_ref())
                         .map_or(false, |p| p.uses_cmux_screen());
                     app.mark_peek_polling();
                     if uses_cmux {
-                        // Shell source: poll cmux read-screen in a background task.
+                        // Non-agent surface: read this specific surface's
+                        // screen via `cmux rpc surface.read_text`. Per F11,
+                        // do NOT use `read-screen --workspace` here — that
+                        // collapses every surface in the workspace onto one
+                        // stream.
                         let client = cmux_client.clone();
                         let tx = peek_tx.clone();
                         tokio::spawn(async move {
                             let result = tokio::time::timeout(
                                 Duration::from_secs(5),
-                                client.read_screen(&workspace_ref, 100),
+                                client.read_surface_text(&surface_ref, 100),
                             )
                             .await
                             .ok()

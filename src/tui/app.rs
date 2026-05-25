@@ -1785,21 +1785,17 @@ impl App {
                     let surface_kind = this_surface
                         .map(|s| s.kind)
                         .unwrap_or_default();
-                    // Decide whether to look for a session log at all:
-                    //   Shell → live cmux screen, no log lookup.
-                    //   Claude / Codex / OtherAgent → filter logs by this agent.
-                    //   Unknown → kind detection failed; try resolving without
-                    //     an agent filter so the peek still surfaces something
-                    //     useful (the legacy behavior).
+                    // Per F11 in .agents/validate.md:
+                    //   - Agent surfaces (Claude/Codex/OtherAgent) → resolve to
+                    //     session.md. NEVER fall back to Shell — that would
+                    //     show the wrong content from cmux read-screen.
+                    //   - Non-agent surfaces (Shell, Unknown) → Shell source,
+                    //     which the peek_tick path reads via
+                    //     surface.read_text (per-surface), NOT
+                    //     read-screen (workspace-level).
                     use crate::mc_data::surface_kind::SurfaceKind;
-                    let source = if surface_kind == SurfaceKind::Shell {
-                        crate::tui::peek_view::PeekSource::Shell
-                    } else {
-                        let agent_label: Option<&str> = if surface_kind.is_agent() {
-                            Some(surface_kind.label())
-                        } else {
-                            None
-                        };
+                    let source = if surface_kind.is_agent() {
+                        let agent_label = surface_kind.label();
                         let same_agent_index = ws
                             .surfaces
                             .iter()
@@ -1814,14 +1810,24 @@ impl App {
                             &ws.workspace.uuid,
                             surface_id_for_lookup,
                             &peek_ctx,
-                            agent_label,
+                            Some(agent_label),
                             same_agent_index,
                         ) {
                             Ok(Some(path)) => {
                                 crate::tui::peek_view::PeekSource::Agent { session_path: path }
                             }
-                            _ => crate::tui::peek_view::PeekSource::Shell,
+                            // Agent surface with no resolved session.md:
+                            // keep Agent source with an empty session path so
+                            // render shows a clear "no session yet" state
+                            // rather than collapsing to Shell (which would
+                            // show some unrelated surface's content).
+                            _ => crate::tui::peek_view::PeekSource::Agent {
+                                session_path: std::path::PathBuf::new(),
+                            },
                         }
+                    } else {
+                        // Shell or Unknown: read this surface's own screen.
+                        crate::tui::peek_view::PeekSource::Shell
                     };
                     ws.peek_state = Some(crate::tui::peek_view::PeekState::new(
                         ws.workspace.ref_id.clone(),
@@ -1959,13 +1965,15 @@ impl App {
     }
 
     /// Returns whether the selected workspace is currently in peek mode and
-    /// needs a screen poll. Returns `(workspace_uuid, workspace_ref)` —
-    /// the workspace ref is what `cmux read-screen --workspace` needs.
+    /// needs a screen poll. Returns `(workspace_uuid, surface_ref)` — the
+    /// surface ref is what `cmux rpc surface.read_text` accepts, giving us
+    /// per-surface content (vs `read-screen --workspace` which collapses
+    /// every surface onto one stream). See F11 in `.agents/validate.md`.
     pub fn peek_needs_poll(&self) -> Option<(&str, &str)> {
         let ws = self.workspaces.get(self.selected)?;
         let peek = ws.peek_state.as_ref()?;
         if peek.should_poll() {
-            Some((&ws.workspace.uuid, &peek.workspace_ref))
+            Some((&ws.workspace.uuid, &peek.surface_ref))
         } else {
             None
         }

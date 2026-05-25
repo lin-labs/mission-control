@@ -207,7 +207,16 @@ pub fn truncate_words(s: &str, n: usize) -> String {
 pub fn rebuild_agent_buffer(state: &mut PeekState, session_path: &Path) {
     let text = match std::fs::read_to_string(session_path) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(_) => {
+            // Path is empty or unreadable (e.g. an agent surface whose
+            // session.md hasn't been resolved yet). Clear polling so the
+            // peek_tick doesn't deadlock and the render shows the
+            // empty-buffer placeholder rather than "Loading screen…"
+            // forever.
+            state.polling = false;
+            state.last_poll = Some(Instant::now());
+            return;
+        }
     };
     let turns = crate::mc_data::session_log::parse(&text);
     let mut buffer: Vec<String> = Vec::new();

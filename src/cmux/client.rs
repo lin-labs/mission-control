@@ -207,7 +207,11 @@ impl CmuxClient {
         Ok(())
     }
 
-    /// Read the last N lines of a surface's screen.
+    /// Read the last N lines of a *workspace's* current screen via
+    /// `cmux read-screen --workspace`. Collapses N surfaces onto one
+    /// stream — for per-surface reads, prefer `read_surface_text`.
+    /// Kept for compatibility with callers that genuinely want the
+    /// workspace-level view.
     pub async fn read_screen(&self, workspace_ref: &str, lines: u32) -> Result<String> {
         let output = self
             .cmd()
@@ -223,6 +227,50 @@ impl CmuxClient {
             .context("failed to run cmux read-screen")?;
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    /// Read the last N lines of a *specific surface's* screen via
+    /// `cmux rpc surface.read_text`. This is the per-surface analog of
+    /// `read_screen` — peek mode uses this so non-agent surfaces in the
+    /// same workspace don't all show the same content (F11 in
+    /// `.agents/validate.md`).
+    ///
+    /// `surface_ref` accepts a surface ref (e.g. `"surface:121"`) or a
+    /// surface UUID; cmux is flexible on the value.
+    pub async fn read_surface_text(&self, surface_ref: &str, lines: u32) -> Result<String> {
+        // Build the JSON params: {"surface_id": <ref>, "lines": N}. Escape
+        // is unnecessary because surface refs are `surface:<digits>`.
+        let params = format!(
+            r#"{{"surface_id":"{}","lines":{}}}"#,
+            surface_ref, lines
+        );
+        let output = self
+            .cmd()
+            .args(["rpc", "surface.read_text", &params])
+            .output()
+            .await
+            .context("failed to run cmux rpc surface.read_text")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("cmux rpc surface.read_text failed: {}", stderr);
+        }
+
+        // The response is a JSON object with a `text` field. Use
+        // serde_json so we don't have to escape-parse the inner content.
+        #[derive(serde::Deserialize)]
+        struct Response {
+            text: String,
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: Response = serde_json::from_str(&stdout)
+            .with_context(|| {
+                format!(
+                    "failed to parse cmux rpc surface.read_text output for {}",
+                    surface_ref
+                )
+            })?;
+        Ok(parsed.text)
     }
 
     /// Select a workspace (focus it).
