@@ -34,6 +34,13 @@ cross-check each F-entry against what was done this session.
 - For changes touching session-log resolution or workspace attribution: did
   the post-change manual inspection step (tier 5) get done? Cross-workspace
   contamination is silent and expensive.
+- Did the session run a multi-task sprint via
+  `superpowers:subagent-driven-development` on a separate branch/worktree?
+  If yes, check: did the controller invoke
+  `superpowers:finishing-a-development-branch` immediately after the final
+  subagent's success report, OR did Boyan have to ask "let's merge to main"
+  later? "Boyan-had-to-ask" is the symptom of validate.md F9 (tier-6 skip);
+  the merge cost compounds with every hour of base-branch drift.
 
 ## Recurring failure modes (codified)
 

@@ -120,6 +120,31 @@ done | grep -i "<workspace-name>"
 references a project outside the workspace's own cwd. No session log is tagged
 with a workspace whose `current_directory` is unrelated to the log's `cwd`.
 
+### Tier 6 — Integration back to base branch
+
+Sprint code-complete is NOT sprint-done. After the final task subagent
+reports success, the controller MUST invoke
+`superpowers:finishing-a-development-branch` (or the equivalent merge-choice
+prompt) before declaring the sprint complete. Boyan should never have to
+ask "can you merge this to main?" — that prompt is the symptom of a missed
+tier-6 gate.
+
+**Pass criteria**: one of the 4 finishing options has been chosen and
+executed:
+1. Merged locally to base + branch deleted + worktree removed.
+2. Pushed to remote + PR opened (worktree kept for iteration).
+3. Kept as-is (Boyan explicitly opted to keep the branch open).
+4. Discarded (with typed confirmation).
+
+A controller who jumps from "T<final> complete" straight to "run validation"
+or "rebuild and test" without presenting the 4 options has skipped tier 6.
+Deferred tier 4 (e.g. TUI can't launch in this shell) does NOT excuse
+skipping tier 6 — present the options anyway; Boyan can pick "keep as-is"
+and exercise the branch first.
+
+See AGENTS.shared.md "Sprint Completion Contract" for the cross-project
+rule.
+
 ---
 
 ## Warning budget
@@ -279,6 +304,41 @@ the filesystem. Manual `git worktree remove` doesn't update the session.
 - After merging a feature branch, use `ExitWorktree { action: "remove", discard_changes: true }`
   rather than `git worktree remove` directly.
 - If session-state gets confused, `ExitWorktree { action: "keep" }` then re-`EnterWorktree`.
+
+### F9 — Sprint branch orphaned by skipped integration step
+
+**Symptom**: Boyan eventually asks "let's commit all things into main"
+hours-to-days after the final subagent reported success. The feature
+branch has accumulated commits that aren't merged; meanwhile master has
+drifted forward (parallel work + uncommitted edits). What was a clean
+merge at sprint-end becomes a 13-file conflict resolution session.
+
+**Root cause**: the controller skipped
+`superpowers:subagent-driven-development`'s final integration step. The
+skill's own flowchart ends with "Dispatch final code reviewer → Use
+`superpowers:finishing-a-development-branch`," but the controller went
+straight from "T<final> complete" to "report sprint complete + list
+next-step ideas" — bypassing the merge-choice prompt entirely. The
+finishing skill was even loaded into the session; it just wasn't invoked.
+
+**Prevention checklist** for any sprint dispatched via
+`subagent-driven-development` (or any multi-agent feature build on a
+branch):
+
+1. The moment the final task subagent reports DONE/DONE_WITH_CONCERNS,
+   the controller's next action is `superpowers:finishing-a-development-branch`.
+   Not "summarize." Not "run validation." Not "rebuild." The 4-option
+   prompt comes FIRST; Boyan picks which path includes validation.
+2. If a deferred Tier 4 (e.g. interactive TUI) makes the controller
+   hesitate, present the 4 options anyway. Boyan can choose "keep
+   as-is" and exercise the branch before deciding to merge — that's a
+   conscious choice, not a default-to-orphan.
+3. Cross-check: does master have uncommitted work in its working tree?
+   If yes, surface that BEFORE attempting any merge. (See this session
+   for the 58-file WIP that nearly got steamrolled.)
+
+See AGENTS.shared.md "Sprint Completion Contract" for the cross-project
+codification.
 
 ---
 
