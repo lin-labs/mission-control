@@ -89,11 +89,20 @@ impl CodexSummarizer {
             stdin.shutdown().await.ok();
         }
 
-        // 90s timeout — codex exec for a tiny summary should be well under this
-        let output = match timeout(Duration::from_secs(90), child.wait_with_output()).await {
+        // 5-minute timeout. `codex exec` is fast for a single-workspace
+        // trajectory regen (the original use case here), but the `:summarize`
+        // command aggregates 20+ workspaces of session summaries into one
+        // prompt, and on that workload codex routinely runs 60-120s. The
+        // previous 90s budget was too tight and produced
+        // `codex exec timed out after 90s` mid-summary.
+        const CODEX_TIMEOUT: Duration = Duration::from_secs(300);
+        let output = match timeout(CODEX_TIMEOUT, child.wait_with_output()).await {
             Ok(Ok(out)) => out,
             Ok(Err(e)) => anyhow::bail!("codex wait failed: {}", e),
-            Err(_) => anyhow::bail!("codex exec timed out after 90s"),
+            Err(_) => anyhow::bail!(
+                "codex exec timed out after {}s",
+                CODEX_TIMEOUT.as_secs()
+            ),
         };
 
         if !output.status.success() {
