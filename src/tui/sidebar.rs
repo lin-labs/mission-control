@@ -7,6 +7,10 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState},
 };
 
+/// Width consumed by the heavy-box edges on each workspace row.
+/// Layout: `┃ <content> ┃` — 1 box char + 1 pad cell on each side = 4 cells of chrome.
+const BOX_EDGE_COLS: u16 = 4;
+
 pub fn render_sidebar(
     f: &mut Frame,
     area: Rect,
@@ -14,22 +18,28 @@ pub fn render_sidebar(
     selected: usize,
     focused: bool,
 ) {
-    // Inner width = area width minus 2 border columns.
+    // Inner width = area width minus 2 outer-border columns.
     let inner_width = area.width.saturating_sub(2);
-    let content_width = inner_width.saturating_sub(row_edge_width());
+    // Between-the-┃s width (the bar above/below + the content cells).
+    let bar_width = inner_width.saturating_sub(2);
+    // Width available for the actual title text inside the padded box.
+    let text_width = inner_width.saturating_sub(BOX_EDGE_COLS);
 
     let items: Vec<ListItem> = workspaces
         .iter()
         .enumerate()
         .map(|(idx, ws)| {
             let is_selected = idx == selected;
-            // Spinner when an async refresh is in flight, otherwise status dot
+
+            // Status leader: spinner when refresh in flight, otherwise dot.
             let (leader, leader_color) = if ws.loading {
                 (spinner_frame().to_string(), Color::Cyan)
             } else {
                 let (dot, c) = status_indicator(ws);
                 (dot.to_string(), c)
             };
+            let leader_str = format!("{} ", leader);
+
             let host_badge = ws
                 .session
                 .as_ref()
@@ -38,48 +48,60 @@ pub fn render_sidebar(
                 .map(|h| format!(" [{}]", h))
                 .unwrap_or_default();
 
-            let accent_color =
-                crate::sidebar_pure::workspace_accent_color(ws.workspace.custom_color.as_deref());
-            let leader_text = format!("{} ", leader);
-            let display_name = truncate_for_width(
-                &ws.workspace.name,
-                content_width
-                    .saturating_sub(leader_text.chars().count() as u16)
-                    .saturating_sub(host_badge.chars().count() as u16),
-            );
+            let border_color = crate::sidebar_pure::workspace_accent_color(
+                ws.workspace.custom_color.as_deref(),
+            )
+            .unwrap_or(Color::DarkGray);
 
-            let name_line = decorate_sidebar_line(
-                Line::from(vec![
-                    Span::styled(leader_text, Style::default().fg(leader_color)),
-                    Span::styled(
-                        display_name,
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(host_badge, Style::default().fg(Color::DarkGray)),
-                ]),
-                accent_color,
-            );
-            let item_style = if is_selected {
-                Style::default().bg(Color::DarkGray)
+            // Truncate name to fit between leader and host_badge inside the box.
+            let name_max = (text_width as usize)
+                .saturating_sub(leader_str.chars().count())
+                .saturating_sub(host_badge.chars().count());
+            let display_name = truncate_for_width(&ws.workspace.name, name_max as u16);
+
+            // Compute the right-pad needed to fill the box width.
+            let used =
+                1 + leader_str.chars().count() + display_name.chars().count() + host_badge.chars().count();
+            let pad = " ".repeat((bar_width as usize).saturating_sub(used));
+
+            let bar = "━".repeat(bar_width as usize);
+            let border_style = Style::default().fg(border_color);
+            let content_bg = if is_selected {
+                Color::DarkGray
             } else {
-                Style::default()
+                Color::Reset
             };
 
-            // Optionally render a dim description subtitle line.
-            if let Some(sub) =
-                description_subtitle_line(ws.workspace.description.as_deref(), content_width)
-            {
-                ListItem::new(vec![name_line, decorate_sidebar_line(sub, accent_color)])
-                    .style(item_style)
-            } else {
-                ListItem::new(name_line).style(item_style)
-            }
+            let top_line = Line::from(Span::styled(format!("┏{}┓", bar), border_style));
+            let bot_line = Line::from(Span::styled(format!("┗{}┛", bar), border_style));
+
+            let content_line = Line::from(vec![
+                Span::styled("┃", border_style),
+                Span::styled(" ", Style::default().bg(content_bg)),
+                Span::styled(
+                    leader_str,
+                    Style::default().fg(leader_color).bg(content_bg),
+                ),
+                Span::styled(
+                    display_name,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(content_bg),
+                ),
+                Span::styled(
+                    host_badge,
+                    Style::default().fg(Color::DarkGray).bg(content_bg),
+                ),
+                Span::styled(pad, Style::default().bg(content_bg)),
+                Span::styled("┃", border_style),
+            ]);
+
+            ListItem::new(vec![top_line, content_line, bot_line])
         })
         .collect();
 
-    let border_color = if focused {
+    let outer_border_color = if focused {
         Color::Cyan
     } else {
         Color::DarkGray
@@ -88,62 +110,13 @@ pub fn render_sidebar(
         Block::default()
             .title(" Workspaces ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color)),
+            .border_style(Style::default().fg(outer_border_color)),
     );
 
     let mut state = ListState::default();
     state.select(Some(selected));
 
     f.render_stateful_widget(list, area, &mut state);
-}
-
-/// Build the dim subtitle `Line` for a workspace description, or `None` if there is nothing to
-/// show.
-///
-/// Rules:
-/// - Only the first line of `description` is used (split on `\n`).
-/// - Leading/trailing whitespace is trimmed.
-/// - The result is indented by 2 spaces.
-/// - If the text (after indent) would exceed `sidebar_inner_width`, it is truncated with `…`.
-/// - Returns `None` when `description` is `None` or blank after trimming.
-///
-/// The same function is exposed from the library crate at
-/// `mission_control::sidebar_pure::description_subtitle_line` for integration tests.
-pub fn description_subtitle_line(
-    description: Option<&str>,
-    sidebar_inner_width: u16,
-) -> Option<Line<'static>> {
-    let raw = description?;
-    let first = raw.lines().next().unwrap_or("").trim();
-    if first.is_empty() {
-        return None;
-    }
-
-    // Available columns: inner_width minus 2-space indent, minus 1 for the possible ellipsis.
-    // We need at least 1 column for content.
-    let indent = "  ";
-    let indent_len = 2u16;
-    let max_text_cols = sidebar_inner_width
-        .saturating_sub(indent_len)
-        .saturating_sub(1);
-    if max_text_cols == 0 {
-        return None;
-    }
-
-    // Count Unicode scalar values (chars) as a proxy for display columns (ASCII-safe).
-    let char_count = first.chars().count();
-    let text: String = if char_count > max_text_cols as usize {
-        let truncated: String = first.chars().take(max_text_cols as usize).collect();
-        format!("{}…", truncated)
-    } else {
-        first.to_owned()
-    };
-
-    let line = Line::from(vec![
-        Span::raw(indent),
-        Span::styled(text, Style::default().fg(Color::DarkGray)),
-    ]);
-    Some(line)
 }
 
 fn status_indicator(ws: &WorkspaceState) -> (&str, Color) {
@@ -163,30 +136,6 @@ pub fn spinner_frame() -> char {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     FRAMES[((ms / 80) as usize) % FRAMES.len()]
-}
-
-fn row_edge_width() -> u16 {
-    4
-}
-
-fn decorate_sidebar_line(line: Line<'static>, accent_color: Option<Color>) -> Line<'static> {
-    let mut spans = Vec::with_capacity(line.spans.len() + 2);
-
-    if let Some(color) = accent_color {
-        spans.push(Span::styled("▌ ", Style::default().fg(color)));
-    } else {
-        spans.push(Span::raw("  "));
-    }
-
-    spans.extend(line.spans);
-
-    if let Some(color) = accent_color {
-        spans.push(Span::styled(" ▐", Style::default().fg(color)));
-    } else {
-        spans.push(Span::raw("  "));
-    }
-
-    Line::from(spans)
 }
 
 fn truncate_for_width(text: &str, max_cols: u16) -> String {
@@ -248,46 +197,147 @@ mod tests {
         }
     }
 
+    fn buf_row(terminal: &Terminal<TestBackend>, y: u16) -> String {
+        let buf = terminal.backend().buffer();
+        (0..buf.area.width)
+            .filter_map(|x| {
+                buf.cell((x, y))
+                    .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            })
+            .collect()
+    }
+
     #[test]
-    fn render_sidebar_uses_side_accents_instead_of_name_tint() {
+    fn workspace_renders_inside_heavy_box_with_accent_color() {
         let workspaces = vec![test_workspace_state("alpha", Some("#C0392B"))];
-        let backend = TestBackend::new(40, 6);
+        let backend = TestBackend::new(30, 8);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|f| render_sidebar(f, Rect::new(0, 0, 40, 6), &workspaces, 0, true))
+            .draw(|f| render_sidebar(f, Rect::new(0, 0, 30, 8), &workspaces, 0, true))
             .unwrap();
 
-        let buf = terminal.backend().buffer();
-        let mut found_name = false;
-
-        for y in 0..buf.area.height {
-            let row: String = (0..buf.area.width)
-                .filter_map(|x| {
-                    buf.cell((x, y))
-                        .map(|c| c.symbol().chars().next().unwrap_or(' '))
-                })
-                .collect();
-
-            if row.contains("alpha") {
-                let left_bar = (0..buf.area.width)
-                    .find_map(|x| buf.cell((x, y)).filter(|cell| cell.symbol() == "▌"))
-                    .expect("left accent bar should be present");
-                assert_eq!(left_bar.style().fg, Some(Color::Rgb(0xC0, 0x39, 0x2B)));
-
-                for x in 0..buf.area.width {
-                    if let Some(cell) = buf.cell((x, y)) {
-                        if cell.symbol() == "a" {
-                            assert_eq!(cell.style().fg, Some(Color::White));
-                            assert_eq!(cell.style().bg, Some(Color::DarkGray));
-                            found_name = true;
-                            break;
-                        }
-                    }
-                }
+        // Find the row containing "alpha".
+        let mut alpha_row: Option<u16> = None;
+        for y in 0..8 {
+            if buf_row(&terminal, y).contains("alpha") {
+                alpha_row = Some(y);
+                break;
             }
         }
+        let y = alpha_row.expect("workspace name was not rendered");
 
-        assert!(found_name, "workspace name was not rendered");
+        // Row above must be a heavy top border ┏━━…━━┓ in the accent color.
+        let above = buf_row(&terminal, y - 1);
+        assert!(
+            above.contains('┏') && above.contains('┓'),
+            "expected ┏ … ┓ top border above the name row, got: {:?}",
+            above
+        );
+
+        // Row below must be a heavy bottom border ┗━━…━━┛.
+        let below = buf_row(&terminal, y + 1);
+        assert!(
+            below.contains('┗') && below.contains('┛'),
+            "expected ┗ … ┛ bottom border below the name row, got: {:?}",
+            below
+        );
+
+        // The border ┏ on the top row should be tinted with the workspace's
+        // custom color (#C0392B → rgb(192, 57, 43)).
+        let buf = terminal.backend().buffer();
+        let top_corner = (0..buf.area.width)
+            .find_map(|x| buf.cell((x, y - 1)).filter(|cell| cell.symbol() == "┏"))
+            .expect("top-left corner should be present");
+        assert_eq!(top_corner.style().fg, Some(Color::Rgb(0xC0, 0x39, 0x2B)));
+
+        // The name itself should be bold White.
+        let name_cell = (0..buf.area.width)
+            .find_map(|x| buf.cell((x, y)).filter(|cell| cell.symbol() == "a"))
+            .expect("workspace name should be rendered");
+        assert_eq!(name_cell.style().fg, Some(Color::White));
+    }
+
+    #[test]
+    fn selected_workspace_fills_content_with_dark_gray_bg() {
+        let workspaces = vec![
+            test_workspace_state("alpha", Some("#C0392B")),
+            test_workspace_state("beta", Some("#006B6B")),
+        ];
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Select beta (idx 1).
+        terminal
+            .draw(|f| render_sidebar(f, Rect::new(0, 0, 30, 10), &workspaces, 1, true))
+            .unwrap();
+
+        // Find the content row of beta.
+        let mut beta_row: Option<u16> = None;
+        for y in 0..10 {
+            if buf_row(&terminal, y).contains("beta") {
+                beta_row = Some(y);
+                break;
+            }
+        }
+        let y = beta_row.expect("beta should render");
+
+        // The name cell ("b") should have DarkGray bg (selection fill).
+        let buf = terminal.backend().buffer();
+        let beta_b = (0..buf.area.width)
+            .find_map(|x| buf.cell((x, y)).filter(|cell| cell.symbol() == "b"))
+            .expect("beta should be in buffer");
+        assert_eq!(
+            beta_b.style().bg,
+            Some(Color::DarkGray),
+            "selected row content should have DarkGray background"
+        );
+
+        // The border characters on beta's box should NOT have bg fill.
+        let beta_left_border = (0..buf.area.width)
+            .find_map(|x| buf.cell((x, y)).filter(|cell| cell.symbol() == "┃"))
+            .expect("beta box left ┃ should be present");
+        assert_ne!(
+            beta_left_border.style().bg,
+            Some(Color::DarkGray),
+            "border characters should not get the selection bg fill"
+        );
+
+        // The non-selected workspace (alpha) should NOT have bg fill on its name.
+        let mut alpha_row: Option<u16> = None;
+        for yy in 0..10 {
+            if buf_row(&terminal, yy).contains("alpha") {
+                alpha_row = Some(yy);
+                break;
+            }
+        }
+        let ay = alpha_row.expect("alpha should render");
+        let alpha_a = (0..buf.area.width)
+            .find_map(|x| buf.cell((x, ay)).filter(|cell| cell.symbol() == "a"))
+            .expect("alpha should be in buffer");
+        assert_ne!(
+            alpha_a.style().bg,
+            Some(Color::DarkGray),
+            "unselected row should not have selection bg"
+        );
+    }
+
+    #[test]
+    fn workspace_without_custom_color_uses_dark_gray_border() {
+        let workspaces = vec![test_workspace_state("plain", None)];
+        let backend = TestBackend::new(30, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|f| render_sidebar(f, Rect::new(0, 0, 30, 6), &workspaces, 0, true))
+            .unwrap();
+
+        // The border characters should be DarkGray when no custom_color is set.
+        let buf = terminal.backend().buffer();
+        let any_border = (0..buf.area.width)
+            .flat_map(|x| (0..buf.area.height).map(move |y| (x, y)))
+            .find_map(|(x, y)| buf.cell((x, y)).filter(|cell| cell.symbol() == "┃"))
+            .expect("at least one ┃ border should be rendered");
+        assert_eq!(any_border.style().fg, Some(Color::DarkGray));
     }
 }
