@@ -1710,32 +1710,43 @@ impl App {
                     let surface_kind = this_surface
                         .map(|s| s.kind)
                         .unwrap_or_default();
-                    let agent_label: Option<&str> = if surface_kind.is_agent() {
-                        Some(surface_kind.label())
+                    // Decide whether to look for a session log at all:
+                    //   Shell → live cmux screen, no log lookup.
+                    //   Claude / Codex / OtherAgent → filter logs by this agent.
+                    //   Unknown → kind detection failed; try resolving without
+                    //     an agent filter so the peek still surfaces something
+                    //     useful (the legacy behavior).
+                    use crate::mc_data::surface_kind::SurfaceKind;
+                    let source = if surface_kind == SurfaceKind::Shell {
+                        crate::tui::peek_view::PeekSource::Shell
                     } else {
-                        None
-                    };
-                    let same_agent_index = ws
-                        .surfaces
-                        .iter()
-                        .filter(|s| s.kind == surface_kind)
-                        .position(|s| s.ref_id == surface_id_for_lookup)
-                        .unwrap_or(0);
-                    let peek_ctx = crate::mc_data::session_log::WorkspaceContext {
-                        host: Some(hostname_short()),
-                        cwd: ws.workspace.current_directory.clone(),
-                    };
-                    let source = match crate::mc_data::session_log::resolve_session_log_for_surface(
-                        &ws.workspace.uuid,
-                        surface_id_for_lookup,
-                        &peek_ctx,
-                        agent_label,
-                        same_agent_index,
-                    ) {
-                        Ok(Some(path)) => {
-                            crate::tui::peek_view::PeekSource::Agent { session_path: path }
+                        let agent_label: Option<&str> = if surface_kind.is_agent() {
+                            Some(surface_kind.label())
+                        } else {
+                            None
+                        };
+                        let same_agent_index = ws
+                            .surfaces
+                            .iter()
+                            .filter(|s| s.kind == surface_kind)
+                            .position(|s| s.ref_id == surface_id_for_lookup)
+                            .unwrap_or(0);
+                        let peek_ctx = crate::mc_data::session_log::WorkspaceContext {
+                            host: Some(hostname_short()),
+                            cwd: ws.workspace.current_directory.clone(),
+                        };
+                        match crate::mc_data::session_log::resolve_session_log_for_surface(
+                            &ws.workspace.uuid,
+                            surface_id_for_lookup,
+                            &peek_ctx,
+                            agent_label,
+                            same_agent_index,
+                        ) {
+                            Ok(Some(path)) => {
+                                crate::tui::peek_view::PeekSource::Agent { session_path: path }
+                            }
+                            _ => crate::tui::peek_view::PeekSource::Shell,
                         }
-                        _ => crate::tui::peek_view::PeekSource::Shell,
                     };
                     ws.peek_state = Some(crate::tui::peek_view::PeekState::new(
                         surface_ref,

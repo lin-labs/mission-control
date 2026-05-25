@@ -274,14 +274,20 @@ pub fn latest_session_file_for_workspace(
 /// Three-step lookup:
 /// 1. Per-surface pointer file: `<surfaces_dir>/<surface_id>.session-path`.
 ///    If it exists and its content points to an existing file, return that path.
-/// 2. Filter workspace-matched logs by agent (so a claude surface only sees
-///    `agent: claude` logs), then distribute among same-agent surfaces by
-///    `same_agent_index` (position of this surface among same-kind siblings
-///    in the workspace's surface list).
-///    Logs whose frontmatter has no `agent:` field are kept as candidates
-///    for any agent kind — pre-tagging logs must still resolve.
-/// 3. Return `None` if no matches exist, or when `agent_label` is `None`
-///    (non-agent surface — peek should fall through to live shell).
+/// 2. Collect workspace-matched logs (host+cwd or workspace_uuid tier).
+///    When `agent_label` is `Some("claude" | "codex" | …)`, filter to logs
+///    whose frontmatter `agent` field matches; logs without an `agent` field
+///    are kept as candidates for any agent kind (pre-tagging back-compat).
+///    When `agent_label` is `None` (surface kind couldn't be detected), no
+///    agent filter is applied — fall back to the workspace-wide candidate
+///    list so the peek shows *something* relevant.
+///    Distribute the resulting list across same-kind siblings by
+///    `same_agent_index`; overflow returns the oldest match.
+/// 3. Return `None` only when no candidate files exist after the filter.
+///
+/// **Shell surfaces should not call this function.** Callers know their
+/// surface kind and force `PeekSource::Shell` directly for shells; this
+/// function exists only for peeks that *might* have a backing session log.
 pub fn resolve_session_log_for_surface(
     workspace_uuid: &str,
     surface_id: &str,
@@ -289,7 +295,7 @@ pub fn resolve_session_log_for_surface(
     agent_label: Option<&str>,
     same_agent_index: usize,
 ) -> Result<Option<PathBuf>> {
-    // Step 1: per-surface pointer file (works for any surface kind, including shells).
+    // Step 1: per-surface pointer file (works for any surface kind).
     let pointer = crate::mc_data::paths::surfaces_dir(workspace_uuid)
         .join(format!("{surface_id}.session-path"));
     if let Ok(content) = std::fs::read_to_string(&pointer) {
@@ -299,42 +305,39 @@ pub fn resolve_session_log_for_surface(
         }
     }
 
-    // Non-agent surfaces don't peek session logs — return None so the caller
-    // renders the live cmux screen instead of someone else's conversation.
-    let Some(agent_label) = agent_label else {
-        return Ok(None);
-    };
-
-    // Step 2: collect matches, filter by agent, then index into the filtered set.
+    // Step 2: collect matches, optionally filter by agent, then index.
     let matches = matching_session_files_for_workspace(workspace_uuid, ctx)?;
     if matches.is_empty() {
         return Ok(None);
     }
 
-    let filtered: Vec<PathBuf> = matches
-        .into_iter()
-        .filter(|p| {
-            let text = match std::fs::read_to_string(p) {
-                Ok(t) => t,
-                Err(_) => return false,
-            };
-            let fm = parse_frontmatter(&text);
-            // Missing agent: keep as candidate (pre-tagging compatibility).
-            // Present agent: must match this surface's kind.
-            fm.agent
-                .as_deref()
-                .map(|a| a.eq_ignore_ascii_case(agent_label))
-                .unwrap_or(true)
-        })
-        .collect();
+    let candidates: Vec<PathBuf> = match agent_label {
+        Some(label) => matches
+            .into_iter()
+            .filter(|p| {
+                let text = match std::fs::read_to_string(p) {
+                    Ok(t) => t,
+                    Err(_) => return false,
+                };
+                let fm = parse_frontmatter(&text);
+                // Missing agent: keep as candidate (pre-tagging compatibility).
+                // Present agent: must match this surface's kind.
+                fm.agent
+                    .as_deref()
+                    .map(|a| a.eq_ignore_ascii_case(label))
+                    .unwrap_or(true)
+            })
+            .collect(),
+        None => matches,
+    };
 
-    if filtered.is_empty() {
+    if candidates.is_empty() {
         return Ok(None);
     }
-    if same_agent_index < filtered.len() {
-        Ok(Some(filtered[same_agent_index].clone()))
+    if same_agent_index < candidates.len() {
+        Ok(Some(candidates[same_agent_index].clone()))
     } else {
-        Ok(filtered.into_iter().last())
+        Ok(candidates.into_iter().last())
     }
 }
 
