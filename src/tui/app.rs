@@ -1927,8 +1927,10 @@ impl App {
     }
 
     /// Called from the event loop to check whether a peek-yield is pending for
-    /// the selected workspace. Clears the flag and returns the workspace ref_id
-    /// to pass to `cmux select-workspace`.
+    /// the selected workspace. Clears the flag and returns the WORKSPACE ref
+    /// to pass to `cmux select-workspace`. (Passing a surface ref would error
+    /// "Workspace not found" — cmux's select-workspace only accepts workspace
+    /// refs.)
     pub fn take_peek_yield(&mut self) -> Option<String> {
         let idx = self.selected;
         let ws = self.workspaces.get_mut(idx)?;
@@ -1938,7 +1940,7 @@ impl App {
             let ref_id = ws
                 .peek_state
                 .as_ref()
-                .map(|p| p.surface_ref.clone())
+                .map(|p| p.workspace_ref.clone())
                 .unwrap_or_else(|| ws.workspace.ref_id.clone());
             ws.peek_state = None;
             Some(ref_id)
@@ -2780,8 +2782,8 @@ workspace: test-ws
     fn take_peek_yield_returns_ref_id_and_clears_peek() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
         app.workspaces[0].peek_state = Some(crate::tui::peek_view::PeekState::new(
-            "workspace:1".to_string(),
-            "workspace:3".to_string(),
+            "workspace:7".to_string(),  // workspace_ref — what select-workspace needs
+            "surface:42".to_string(),    // surface_ref — for future per-surface use
             "test".to_string(),
             crate::tui::peek_view::PeekSource::Shell,
         ));
@@ -2789,7 +2791,11 @@ workspace: test-ws
 
         let ref_id = app.take_peek_yield();
 
-        assert_eq!(ref_id, Some("workspace:3".to_string()));
+        assert_eq!(
+            ref_id,
+            Some("workspace:7".to_string()),
+            "yield must return the workspace_ref (not the surface_ref) so cmux select-workspace works"
+        );
         assert!(
             app.workspaces[0].peek_state.is_none(),
             "peek_state cleared on yield"

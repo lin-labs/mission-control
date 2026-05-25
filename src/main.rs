@@ -903,11 +903,9 @@ async fn run_app(
             }
 
             _ = peek_tick.tick() => {
-                if let Some((uuid, surface_ref)) = app.peek_needs_poll() {
-                    // Owned copies for the spawned task.
+                if let Some((uuid, workspace_ref)) = app.peek_needs_poll() {
                     let uuid = uuid.to_string();
-                    let surface_ref = surface_ref.to_string();
-                    // Check whether this is an agent-log source or a shell source.
+                    let workspace_ref = workspace_ref.to_string();
                     let uses_cmux = app.workspaces.iter()
                         .find(|ws| ws.workspace.uuid == uuid)
                         .and_then(|ws| ws.peek_state.as_ref())
@@ -920,7 +918,7 @@ async fn run_app(
                         tokio::spawn(async move {
                             let result = tokio::time::timeout(
                                 Duration::from_secs(5),
-                                client.read_screen(&surface_ref, 100),
+                                client.read_screen(&workspace_ref, 100),
                             )
                             .await
                             .ok()
