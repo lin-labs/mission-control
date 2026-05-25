@@ -448,7 +448,21 @@ async fn run_app(
                                     .selected_workspace()
                                     .map_or(false, |ws| ws.dispatch_modal.is_some());
 
-                                if in_peek || in_insert || in_dispatch || is_traj_nav_key {
+                                // Global quit / reload keys must always work,
+                                // even inside peek / insert / dispatch. Without
+                                // this escape hatch, `q` and ^c are swallowed
+                                // by the trajectory handler's catch-all and
+                                // the user can't exit the app.
+                                let is_global_quit_key = matches!(
+                                    (key.code, key.modifiers),
+                                    (KeyCode::Char('q'), KeyModifiers::NONE)
+                                        | (KeyCode::Char('c'), KeyModifiers::CONTROL)
+                                        | (KeyCode::Char('r'), KeyModifiers::CONTROL)
+                                );
+
+                                if !is_global_quit_key
+                                    && (in_peek || in_insert || in_dispatch || is_traj_nav_key)
+                                {
                                     let actions = app.handle_trajectory_key(key);
                                     if !actions.is_empty() {
                                         if let Err(e) = app.save_trajectory_edits(&actions) {
