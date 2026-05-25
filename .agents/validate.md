@@ -421,6 +421,69 @@ grep -rn "client\.\(read_screen\|select_workspace\|send_text\|new_surface\|close
 four commits, six back-and-forths with Boyan. Codifying it here as
 prevention.
 
+### F12 — Per-surface session binding not produced (no `.session-path` pointer)
+
+**Symptom**: Two agent surfaces in the same cmux workspace peek the same
+session.md (the only one whose frontmatter's `workspace_id` matches the
+workspace UUID via tier-2 fallback). The user sees identical
+conversation content for what should be two different agents.
+
+**Root cause**: The peek resolver's tier-1 looks for
+`<surfaces_dir>/<surface_ref>.session-path` and uses it
+authoritatively. Without that producer running on agent SessionStart,
+no pointer file is ever written, so the resolver falls through to
+tier-2 (workspace_id), which returns one file for many surfaces.
+
+The producer lives in the **agents repo**, not in this repo:
+`~/Projects/agents/hooks/mission-control-hook.sh`. It is symlinked into
+`~/.claude/hooks/` and `~/.codex/hooks/` (and reaches future agents via
+the same blueprint mechanism). The hook is wired to `SessionStart` for
+each supported agent.
+
+**Prevention checklist** for any change to the peek pipeline OR the
+session-binding hook:
+
+1. **Hook is present and executable on this machine**:
+   ```bash
+   ls -la ~/.claude/hooks/mission-control-hook.sh
+   ls -la ~/.codex/hooks/mission-control-hook.sh
+   readlink ~/.claude/hooks   # should resolve into agents repo
+   ```
+2. **Hook's `mc bind` block exists** (not silently reverted):
+   ```bash
+   grep -n "mc bind --session-file" \
+     ~/Projects/agents/hooks/mission-control-hook.sh
+   ```
+3. **`mc` resolves on PATH** (otherwise the hook silently no-ops by design):
+   ```bash
+   command -v mc
+   ```
+4. **Live verification — pointer appears for active agent surfaces**:
+   ```bash
+   for d in ~/data/mission-control/.data/*/surfaces/; do
+     ls "$d"/*.session-path 2>/dev/null
+   done
+   ```
+5. **Two agent surfaces in one workspace have distinct pointers**:
+   Pick a workspace with ≥2 claude/codex surfaces. Peek surface A, peek
+   surface B. The two peeks MUST show different content. Same content
+   means tier-2 collapsed them — the hook didn't fire or didn't write
+   the pointer.
+6. **Smoke from a known-good cmux shell**:
+   ```bash
+   echo '{"hook_event_name":"SessionStart","session_id":"claude-test"}' \
+     | bash ~/Projects/agents/hooks/mission-control-hook.sh
+   ls ~/data/mission-control/.data/$CMUX_WORKSPACE_ID/surfaces/*.session-path
+   ```
+   The file should appear with the surface ref as basename (e.g.
+   `surface:74.session-path`) and contain an absolute session.md path.
+
+**Cross-reference**: producer hook lives in
+`blinboyan/blin-agents` repo, file
+`hooks/mission-control-hook.sh`. Consumer is the resolver step 1 at
+`src/mc_data/session_log.rs::resolve_session_log_for_surface`. Producer
+fix landed on agents `7e82a82` (2026-05-25); mc-side gap was F11.
+
 ### F11 — Peek source mental model: agent → session.md; non-agent → that tty
 
 **Symptom**: peeking different surfaces in the same workspace shows the
