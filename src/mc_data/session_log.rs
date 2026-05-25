@@ -205,35 +205,40 @@ pub fn matching_session_files_for_workspace(
     }
 
     // Tier 1: host + cwd match.
-    // Only active when ctx has both host and cwd set.
+    // Only active when ctx has both host and cwd set AND ctx.cwd is specific
+    // enough (not the user's home dir or shallower). cwd = $HOME would match
+    // every session log Boyan ever wrote, so we skip tier-1 in that case and
+    // let tier-2 (workspace_id match) decide.
     if let (Some(ctx_host), Some(ctx_cwd)) = (&ctx.host, &ctx.cwd) {
-        let ctx_host_norm = normalize_host(ctx_host);
-
-        let mut tier1: Vec<&Candidate> = candidates
-            .iter()
-            .filter(|c| {
-                let host_ok =
-                    c.fm.host
+        if !cwd_is_too_shallow(ctx_cwd) {
+            let mut tier1: Vec<&Candidate> = candidates
+                .iter()
+                .filter(|c| {
+                    let host_ok = c
+                        .fm
+                        .host
                         .as_deref()
-                        .map(|h| normalize_host(h) == ctx_host_norm)
+                        .map(|h| hosts_match(h, ctx_host))
                         .unwrap_or(false);
-                let cwd_ok =
-                    c.fm.cwd
+                    let cwd_ok = c
+                        .fm
+                        .cwd
                         .as_deref()
                         .map(|fc| is_descendant(fc, ctx_cwd))
                         .unwrap_or(false);
-                host_ok && cwd_ok
-            })
-            .collect();
+                    host_ok && cwd_ok
+                })
+                .collect();
 
-        if !tier1.is_empty() {
-            // Sort by most-specific cwd (deepest) first, tie-break by newest mtime.
-            tier1.sort_by(|a, b| {
-                let da = a.fm.cwd.as_deref().map(cwd_depth).unwrap_or(0);
-                let db = b.fm.cwd.as_deref().map(cwd_depth).unwrap_or(0);
-                db.cmp(&da).then_with(|| b.mtime.cmp(&a.mtime))
-            });
-            return Ok(tier1.into_iter().map(|c| c.path.clone()).collect());
+            if !tier1.is_empty() {
+                // Sort by most-specific cwd (deepest) first, tie-break by newest mtime.
+                tier1.sort_by(|a, b| {
+                    let da = a.fm.cwd.as_deref().map(cwd_depth).unwrap_or(0);
+                    let db = b.fm.cwd.as_deref().map(cwd_depth).unwrap_or(0);
+                    db.cmp(&da).then_with(|| b.mtime.cmp(&a.mtime))
+                });
+                return Ok(tier1.into_iter().map(|c| c.path.clone()).collect());
+            }
         }
     }
 
@@ -372,4 +377,39 @@ fn cwd_depth(p: &str) -> usize {
 /// Normalize a hostname for case-insensitive comparison: lowercase + strip trailing dots.
 fn normalize_host(h: &str) -> String {
     h.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Fuzzy hostname match: equal after normalization, or one is a substring of
+/// the other. Real-world reason: Boyan's machine's `hostname -s` is
+/// `blin-mbp` but his session logs are tagged `host: mbp`. Strict equality
+/// would never match.
+fn hosts_match(a: &str, b: &str) -> bool {
+    let na = normalize_host(a);
+    let nb = normalize_host(b);
+    if na == nb {
+        return true;
+    }
+    // Substring in either direction — `mbp` matches `blin-mbp` and vice versa.
+    !na.is_empty() && !nb.is_empty() && (na.contains(&nb) || nb.contains(&na))
+}
+
+/// `cwd` too broad to be useful for matching session files. We treat the
+/// user's home dir (or any path shallower than `/Users/<name>/<one-level>`)
+/// as "too shallow" — matching by it would pull in every session log under
+/// $HOME, which is everything Boyan has ever written.
+fn cwd_is_too_shallow(cwd: &str) -> bool {
+    let trimmed = cwd.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "/" {
+        return true;
+    }
+    if let Some(home) = dirs::home_dir() {
+        let home_str = home.to_string_lossy();
+        let home_trim = home_str.trim_end_matches('/');
+        if trimmed == home_trim {
+            return true;
+        }
+    }
+    // Depth heuristic: fewer than 3 path segments under root is too shallow
+    // (e.g., `/Users`, `/Users/blin`).
+    cwd_depth(trimmed) < 3
 }

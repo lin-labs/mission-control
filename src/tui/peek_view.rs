@@ -38,9 +38,13 @@ pub enum PeekSource {
 /// State for peek mode (reading a surface's screen).
 #[derive(Debug, Clone)]
 pub struct PeekState {
-    /// The surface/workspace reference ID used to call `read_screen`.
-    /// This is the workspace `ref_id` (e.g., "workspace:3") since
-    /// `cmux read-screen` takes a workspace ref, not a surface id.
+    /// The workspace ref (e.g., "workspace:3") used to call `cmux read-screen`.
+    /// `read-screen` rejects surface refs — passing one yields "Workspace not
+    /// found" — so this must be the workspace ref, not the surface ref.
+    pub workspace_ref: String,
+    /// The surface ref (e.g., "surface:121") this peek targets. Carried for
+    /// future use (e.g., when cmux adds a per-surface read-screen) and for
+    /// debugging; not currently passed to read-screen.
     pub surface_ref: String,
     /// Human-readable label shown in the peek title bar.
     pub surface_label: String,
@@ -67,8 +71,14 @@ pub struct PeekState {
 pub const PAGE_SIZE: u16 = 10;
 
 impl PeekState {
-    pub fn new(surface_ref: String, surface_label: String, source: PeekSource) -> Self {
+    pub fn new(
+        workspace_ref: String,
+        surface_ref: String,
+        surface_label: String,
+        source: PeekSource,
+    ) -> Self {
         Self {
+            workspace_ref,
             surface_ref,
             surface_label,
             source,
@@ -291,6 +301,7 @@ mod tests {
 
     fn make_state() -> PeekState {
         PeekState::new(
+            "workspace:1".to_string(),
             "workspace:3".to_string(),
             "workspace:3".to_string(),
             PeekSource::Shell,
@@ -423,6 +434,7 @@ mod tests {
     #[test]
     fn render_shows_surface_id_in_title() {
         let mut ps = PeekState::new(
+            "workspace:1".to_string(),
             "workspace:5".to_string(),
             "my-surface".to_string(),
             PeekSource::Shell,
@@ -634,6 +646,7 @@ mod tests {
 
         let mut ps = PeekState::new(
             "workspace:1".to_string(),
+            "surface:1".to_string(),
             "test".to_string(),
             PeekSource::Agent {
                 session_path: tmp.path().to_path_buf(),
@@ -681,6 +694,7 @@ mod tests {
 
         let mut ps = PeekState::new(
             "workspace:1".to_string(),
+            "surface:1".to_string(),
             "test".to_string(),
             PeekSource::Agent {
                 session_path: tmp.path().to_path_buf(),
