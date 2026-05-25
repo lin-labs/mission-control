@@ -696,14 +696,35 @@ pub async fn gather_refresh_snapshot(
     let workspaces = client.list_workspaces().await?;
     let surfaces_map = client.get_surfaces().await.unwrap_or_default();
 
+    // Set of UUIDs we still need to find sessions for. The parser loop
+    // below exits as soon as every workspace has a hit, so on the typical
+    // case we parse roughly one file per workspace instead of every recent
+    // session log.
+    let known_uuids: std::collections::HashSet<String> =
+        workspaces.iter().map(|w| w.uuid.clone()).collect();
+
     let dir = histories_dir.to_path_buf();
     let sessions_by_ws_id = tokio::task::spawn_blocking(move || {
+        // 1. Filename-based recency filter: skip session logs older than
+        //    7 days without stat'ing them. Boyan's histories dir routinely
+        //    holds 1000+ lifetime files; this trims to a few-hundred recent.
+        // 2. Sort newest-first by filename (YYYY-MM-DD-HH prefix is
+        //    lexicographically chronological).
+        // 3. Parse files in order, stopping as soon as we've covered every
+        //    known workspace UUID. Worst case (workspaces with no recent
+        //    session) scans the whole recent window; typical case parses
+        //    just N files for N workspaces.
         let mut map: HashMap<String, SessionFile> = HashMap::new();
-        let files = file::list_session_files(&dir).unwrap_or_default();
+        let files = file::list_recent_session_files(&dir, 7).unwrap_or_default();
         for path in files {
+            if known_uuids.len() > 0 && map.len() == known_uuids.len() {
+                break; // all known workspaces have a session — stop early.
+            }
             if let Ok(sf) = SessionFile::parse(&path) {
                 if let Some(ref ws_id) = sf.frontmatter.workspace_id {
-                    map.entry(ws_id.clone()).or_insert(sf);
+                    if known_uuids.contains(ws_id) {
+                        map.entry(ws_id.clone()).or_insert(sf);
+                    }
                 }
             }
         }

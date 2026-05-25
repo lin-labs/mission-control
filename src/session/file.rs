@@ -156,6 +156,7 @@ fn split_frontmatter(content: &str) -> Result<(Frontmatter, String)> {
     Ok((frontmatter, body.trim_start_matches('\n').to_string()))
 }
 
+#[allow(dead_code)] // superseded in the binary by `list_recent_session_files`; integration tests still exercise it.
 pub fn list_session_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files: Vec<_> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
@@ -173,5 +174,49 @@ pub fn list_session_files(dir: &Path) -> Result<Vec<PathBuf>> {
         mb.cmp(&ma)
     });
 
+    Ok(files)
+}
+
+/// List session files whose filename starts with a date prefix in the last
+/// `days` days. Purely filename-based — does NOT stat each file, so the cost
+/// is one `read_dir` syscall regardless of how many old session logs the
+/// directory contains.
+///
+/// Per the AGENTS.md "Session History Logging" convention each file is named
+/// `YYYY-MM-DD-HH-slug.md` (Pacific Time at session start). String comparison
+/// works as chronological comparison for the `YYYY-MM-DD` prefix.
+///
+/// Files are returned sorted by filename **descending** (newest first), which
+/// for this naming convention is equivalent to most-recent-first.
+pub fn list_recent_session_files(dir: &Path, days: i64) -> Result<Vec<PathBuf>> {
+    let cutoff = (chrono::Local::now() - chrono::Duration::days(days))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                return false;
+            };
+            if !p.extension().is_some_and(|ext| ext == "md") {
+                return false;
+            }
+            if name.starts_with('.') {
+                return false;
+            }
+            // Filename must start with a YYYY-MM-DD prefix that's >= cutoff.
+            // Lexicographic comparison works because the prefix is fixed-width
+            // ISO 8601 date.
+            name.len() >= 10
+                && name.as_bytes()[4] == b'-'
+                && name.as_bytes()[7] == b'-'
+                && &name[..10] >= cutoff.as_str()
+        })
+        .collect();
+
+    // Sort by filename descending — newest first, no stat() calls needed.
+    files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
     Ok(files)
 }

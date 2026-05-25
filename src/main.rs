@@ -316,6 +316,29 @@ async fn run_app(
     let mut peek_tick = tokio::time::interval(Duration::from_millis(200));
     peek_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Dedicated OS thread for terminal input. Crossterm's `event::read()` is a
+    // blocking call; running it on a thread of its own means keypresses are
+    // dequeued instantly even when the async main loop is busy applying a
+    // refresh snapshot, running an LLM result, or doing any other work. The
+    // input thread just forwards every event into `input_rx` — the main loop
+    // picks them up in its select! and routes them.
+    let (input_tx, mut input_rx) = mpsc::channel::<Event>(256);
+    std::thread::Builder::new()
+        .name("mc-input".into())
+        .spawn(move || {
+            loop {
+                match event::read() {
+                    Ok(ev) => {
+                        if input_tx.blocking_send(ev).is_err() {
+                            break; // main loop dropped the receiver
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .expect("spawn input thread");
+
     loop {
         terminal.draw(|f| {
             // Split vertically: main area on top, single-line shortcut footer on the bottom.
@@ -350,24 +373,26 @@ async fn run_app(
             }
         })?;
 
-        // Adaptive draw/input-poll tick. When a workspace is mid-refresh
-        // (spinner animation needs ~12 fps), use a tight 80ms tick. When idle
-        // we relax to 200ms — drops the redraw rate from 20 fps → 5 fps, which
-        // is the dominant lever on idle CPU (~1.3% → ~0.3% on this machine).
-        // Key responsiveness stays well within human "feels-instant" range
-        // (~200ms is below the 300ms threshold for perceptible lag on a single
-        // press).
+        // Spinner needs ~12 fps to animate smoothly while a refresh is in
+        // flight. When nothing is loading we let the loop go fully
+        // event-driven (input + channel + interval arms only), so idle CPU
+        // approaches zero.
         let any_loading = app.workspaces.iter().any(|ws| ws.loading);
-        let tick_ms: u64 = if any_loading { 80 } else { 200 };
         tokio::select! {
-            // Poll terminal events on an adaptive tick (see above).
-            _ = tokio::time::sleep(Duration::from_millis(tick_ms)) => {
-                while event::poll(std::time::Duration::from_millis(0))? {
-                    if let Event::Key(key) = event::read()? {
-                        // Only process key press events (not release/repeat)
-                        if key.kind != KeyEventKind::Press {
-                            continue;
-                        }
+            // Spinner-animation tick. The `if any_loading` guard makes this
+            // future "never resolve" when nothing is animating, so the main
+            // loop incurs no periodic wakeups at idle.
+            _ = tokio::time::sleep(Duration::from_millis(80)), if any_loading => {}
+
+            // Terminal key events arrive via a dedicated OS thread (see
+            // `mc-input` spawn above), so a busy main loop never delays a
+            // keypress past the next select! iteration.
+            Some(event) = input_rx.recv() => {
+                if let Event::Key(key) = event {
+                    // Only process key press events (not release/repeat)
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
 
                         // ── Trajectory key routing ────────────────────────────
                         // When in Detail focus and the selected workspace has a
@@ -743,7 +768,7 @@ async fn run_app(
                         }
                     }
                 }
-            }
+
 
             Some(agent_event) = event_rx.recv() => {
                 let ws_uuid = agent_event.workspace_id.clone();
