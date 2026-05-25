@@ -448,15 +448,15 @@ async fn run_app(
                                     .selected_workspace()
                                     .map_or(false, |ws| ws.dispatch_modal.is_some());
 
-                                // Global quit / reload keys must always work,
-                                // even inside peek / insert / dispatch. Without
-                                // this escape hatch, `q` and ^c are swallowed
-                                // by the trajectory handler's catch-all and
-                                // the user can't exit the app.
+                                // ^c / ^r are truly global — they must work
+                                // even inside peek / insert / dispatch.
+                                // (`q` is intentionally NOT global: it
+                                // respects mode boundaries, so the user
+                                // exits peek/insert/dispatch with Esc first
+                                // and then quits with `q` in Normal mode.)
                                 let is_global_quit_key = matches!(
                                     (key.code, key.modifiers),
-                                    (KeyCode::Char('q'), KeyModifiers::NONE)
-                                        | (KeyCode::Char('c'), KeyModifiers::CONTROL)
+                                    (KeyCode::Char('c'), KeyModifiers::CONTROL)
                                         | (KeyCode::Char('r'), KeyModifiers::CONTROL)
                                 );
 
