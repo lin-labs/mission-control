@@ -667,6 +667,58 @@ pub struct App {
     pub input_mode: crate::tui::command::InputMode,
 }
 
+/// Pre-gathered data for one refresh cycle. Produced off the main loop by
+/// [`gather_refresh_snapshot`] (cmux IO + session-file parsing) and consumed
+/// on the main loop by [`App::apply_refresh_snapshot`]. Decoupling these two
+/// phases is what keeps the UI responsive while a refresh is in flight — on
+/// machines with hundreds of session-log files the parse alone can take
+/// multiple seconds, which would otherwise freeze the event loop.
+pub struct RefreshSnapshot {
+    pub workspaces: Vec<Workspace>,
+    pub surfaces_map: HashMap<String, Vec<SurfaceInfo>>,
+    pub sessions_by_ws_id: HashMap<String, SessionFile>,
+}
+
+/// Gather everything a refresh needs WITHOUT touching App state.
+///
+/// Runs as a free async function so it can be `tokio::spawn`-ed: the main
+/// event loop kicks it off, continues serving key events, and applies the
+/// resulting [`RefreshSnapshot`] once the gather finishes.
+///
+/// - cmux subprocess calls are already async (`tokio::process::Command`)
+///   and yield naturally during I/O.
+/// - The session-file parse (potentially hundreds of files) runs inside
+///   `spawn_blocking` so it doesn't starve other tokio tasks.
+pub async fn gather_refresh_snapshot(
+    client: &CmuxClient,
+    histories_dir: &std::path::Path,
+) -> Result<RefreshSnapshot> {
+    let workspaces = client.list_workspaces().await?;
+    let surfaces_map = client.get_surfaces().await.unwrap_or_default();
+
+    let dir = histories_dir.to_path_buf();
+    let sessions_by_ws_id = tokio::task::spawn_blocking(move || {
+        let mut map: HashMap<String, SessionFile> = HashMap::new();
+        let files = file::list_session_files(&dir).unwrap_or_default();
+        for path in files {
+            if let Ok(sf) = SessionFile::parse(&path) {
+                if let Some(ref ws_id) = sf.frontmatter.workspace_id {
+                    map.entry(ws_id.clone()).or_insert(sf);
+                }
+            }
+        }
+        map
+    })
+    .await
+    .unwrap_or_default();
+
+    Ok(RefreshSnapshot {
+        workspaces,
+        surfaces_map,
+        sessions_by_ws_id,
+    })
+}
+
 impl App {
     pub fn new() -> Self {
         Self {
@@ -688,19 +740,23 @@ impl App {
         client: &CmuxClient,
         histories_dir: &std::path::Path,
     ) -> Result<()> {
-        let workspaces = client.list_workspaces().await?;
-        let surfaces_map = client.get_surfaces().await.unwrap_or_default();
-        let session_files = file::list_session_files(histories_dir).unwrap_or_default();
+        let snap = gather_refresh_snapshot(client, histories_dir).await?;
+        self.apply_refresh_snapshot(snap);
+        Ok(())
+    }
 
-        // Parse all sessions, index by workspace_id
-        let mut sessions_by_ws_id: HashMap<String, SessionFile> = HashMap::new();
-        for path in &session_files {
-            if let Ok(sf) = SessionFile::parse(path) {
-                if let Some(ref ws_id) = sf.frontmatter.workspace_id {
-                    sessions_by_ws_id.entry(ws_id.clone()).or_insert(sf);
-                }
-            }
-        }
+    /// Apply a pre-gathered refresh snapshot to `self`. Pure mutation, no I/O
+    /// that could block: the slow parts (cmux client calls, 999-file session
+    /// parsing) ran off-thread in `gather_refresh_snapshot` and arrived here as
+    /// data. Per-workspace file reads (trajectory.md, notes, hook_status) are
+    /// still synchronous but are bounded — ~25 workspaces × ~4 small files ≈
+    /// 100 reads, which is ~tens of ms total on a warm cache.
+    pub fn apply_refresh_snapshot(&mut self, snap: RefreshSnapshot) {
+        let RefreshSnapshot {
+            workspaces,
+            surfaces_map,
+            mut sessions_by_ws_id,
+        } = snap;
 
         let old_counts: HashMap<String, u32> = self
             .workspaces
@@ -1094,8 +1150,6 @@ impl App {
                 );
             }
         }
-
-        Ok(())
     }
 
     pub fn handle_agent_event(&mut self, event: &AgentEvent) {
@@ -1735,13 +1789,24 @@ impl App {
                             host: Some(hostname_short()),
                             cwd: ws.workspace.current_directory.clone(),
                         };
-                        match crate::mc_data::session_log::resolve_session_log_for_surface(
+                        let resolved = crate::mc_data::session_log::resolve_session_log_for_surface(
                             &ws.workspace.uuid,
                             surface_id_for_lookup,
                             &peek_ctx,
                             agent_label,
                             same_agent_index,
-                        ) {
+                        );
+                        eprintln!(
+                            "peek-debug: ws={} surface={} kind={:?} agent_label={:?} same_agent_index={} cwd={:?} resolved={:?}",
+                            ws.workspace.uuid,
+                            surface_id_for_lookup,
+                            surface_kind,
+                            agent_label,
+                            same_agent_index,
+                            peek_ctx.cwd,
+                            resolved.as_ref().map(|o| o.as_ref().map(|p| p.display().to_string())),
+                        );
+                        match resolved {
                             Ok(Some(path)) => {
                                 crate::tui::peek_view::PeekSource::Agent { session_path: path }
                             }
@@ -1907,16 +1972,27 @@ impl App {
     /// path when `peek.uses_cmux_screen()` is false.
     pub fn refresh_agent_peek_buffer(&mut self, uuid: &str) {
         let Some(&idx) = self.workspace_index.get(uuid) else {
+            eprintln!("peek-debug: refresh_agent_peek_buffer: no workspace index for uuid={}", uuid);
             return;
         };
         let Some(peek) = self.workspaces[idx].peek_state.as_mut() else {
+            eprintln!("peek-debug: refresh_agent_peek_buffer: no peek_state for uuid={}", uuid);
             return;
         };
         let crate::tui::peek_view::PeekSource::Agent { session_path } = &peek.source else {
+            eprintln!("peek-debug: refresh_agent_peek_buffer: source is not Agent for uuid={}", uuid);
             return;
         };
         let session_path = session_path.clone();
+        let before = peek.screen_buffer.len();
         crate::tui::peek_view::rebuild_agent_buffer(peek, &session_path);
+        eprintln!(
+            "peek-debug: rebuild_agent_buffer path={} before={} after={} polling={}",
+            session_path.display(),
+            before,
+            peek.screen_buffer.len(),
+            peek.polling,
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────────

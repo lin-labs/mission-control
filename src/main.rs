@@ -290,6 +290,14 @@ async fn run_app(
     // Channel for `:command` results (e.g. :summarize completing).
     let (command_tx, mut command_rx) = mpsc::channel::<crate::commands::CommandResult>(8);
 
+    // Channel for refresh-snapshot results. The refresh tick spawns a
+    // background task that gathers cmux state + parses session logs, then
+    // sends the snapshot here. The main loop applies it without blocking on
+    // any of the slow I/O.
+    let (refresh_tx, mut refresh_rx) =
+        mpsc::channel::<anyhow::Result<crate::tui::app::RefreshSnapshot>>(4);
+    let mut refresh_inflight: bool = false;
+
     let mut refresh_interval = interval(Duration::from_secs(30));
     let mut screen_interval = interval(Duration::from_secs(15));
     let mut regen_tick = interval(Duration::from_secs(30));
@@ -804,27 +812,54 @@ async fn run_app(
             }
 
             _ = refresh_interval.tick() => {
-                let _ = app.refresh_workspaces(cmux_client, &config.histories_dir).await;
-                // After refresh, diff surface counts to detect detachments.
-                // cmux doesn't yet emit surface.opened/surface.closed events, so
-                // we poll on each refresh tick (every 30 s).
-                let surface_diffs: Vec<(String, u32)> = app
-                    .workspaces
-                    .iter()
-                    .filter_map(|ws| {
-                        let uuid = ws.workspace.uuid.clone();
-                        let new_count = ws.surfaces.len() as u32;
-                        let old_count = prev_surface_counts.get(&uuid).copied();
-                        prev_surface_counts.insert(uuid.clone(), new_count);
-                        if old_count.is_none() || old_count == Some(new_count) {
-                            None
-                        } else {
-                            Some((uuid, new_count))
+                // Kick refresh off as a background task — never block the main
+                // event loop on the cmux + 999-session-file gather. The result
+                // comes back via `refresh_rx` below and gets applied on the
+                // main loop in a quick non-blocking pass. `refresh_inflight`
+                // de-dupes overlapping ticks.
+                if !refresh_inflight {
+                    refresh_inflight = true;
+                    let client = cmux_client.clone();
+                    let dir = config.histories_dir.clone();
+                    let tx = refresh_tx.clone();
+                    tokio::spawn(async move {
+                        let result =
+                            crate::tui::app::gather_refresh_snapshot(&client, &dir).await;
+                        let _ = tx.send(result).await;
+                    });
+                }
+            }
+
+            Some(refresh_result) = refresh_rx.recv() => {
+                refresh_inflight = false;
+                match refresh_result {
+                    Ok(snap) => {
+                        app.apply_refresh_snapshot(snap);
+                        // After applying, diff surface counts to detect
+                        // detachments (cmux doesn't yet emit
+                        // surface.opened/closed events).
+                        let surface_diffs: Vec<(String, u32)> = app
+                            .workspaces
+                            .iter()
+                            .filter_map(|ws| {
+                                let uuid = ws.workspace.uuid.clone();
+                                let new_count = ws.surfaces.len() as u32;
+                                let old_count = prev_surface_counts.get(&uuid).copied();
+                                prev_surface_counts.insert(uuid.clone(), new_count);
+                                if old_count.is_none() || old_count == Some(new_count) {
+                                    None
+                                } else {
+                                    Some((uuid, new_count))
+                                }
+                            })
+                            .collect();
+                        for (uuid, count) in surface_diffs {
+                            app.set_open_surfaces(&uuid, count);
                         }
-                    })
-                    .collect();
-                for (uuid, count) in surface_diffs {
-                    app.set_open_surfaces(&uuid, count);
+                    }
+                    Err(e) => {
+                        eprintln!("refresh: gather failed: {e:?}");
+                    }
                 }
             }
 
