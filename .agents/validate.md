@@ -13,6 +13,59 @@ regardless of what the subagent's self-report said.
 
 ---
 
+## The validation contract — every new development must pass this
+
+Per-2026-05-25 directive from Boyan: every change to this repo must check
+itself against this file BEFORE declaring done. The contract is:
+
+1. Run **pre-flight** (below) at session start. Surface dirty state.
+2. For each affected area, run the **per-area cheat sheet** (lower in
+   this file) AND verify against the **failure modes F1–F11**. If your
+   change touches any area, you cross-check the matching F-entry.
+3. Run the **five-tier gate** in order. Don't skip Tier 4. The user's
+   keyboard is not your CI.
+4. If the change touches a NEW cmux command, NEW external command, NEW
+   keybinding, or NEW per-surface behavior — open this file and look for
+   the F-entry that covers it. If no F-entry exists yet and the area is
+   error-prone, ADD one in the same commit. Don't wait for the next
+   retro.
+5. End with the **post-merge release ritual** (`cargo build --release`).
+
+Any "DONE" report that doesn't cite the F-entries it cross-checked is
+incomplete. A grep of `F[0-9]+` references in your subagent report is the
+single best proxy for "did the agent actually use this file."
+
+## Pre-flight at session start (before touching any code)
+
+Run this once when starting work on this repo. Mid-session surprise — like
+a partial 53-file merge appearing — costs at least one back-and-forth, and
+in the worst case (this happened on 2026-05-24) blocks a feature build
+entirely until the prior work is resolved.
+
+```bash
+cd /Users/blin/Tools/mission-control
+git status --short
+git diff --stat HEAD | tail -3
+grep -rn "^<<<<<<<\|^>>>>>>>" src/ tests/ 2>/dev/null   # unresolved conflict markers
+git log --oneline -5
+```
+
+**Required actions before writing code**:
+- If `git status --short` shows more than `?? .claude/` (which is expected,
+  it's the worktree dir), **surface the dirty state to the user** and
+  confirm intent before staging or committing anything.
+- If conflict markers exist, **stop and ask the user** how to resolve
+  them. Do not unilaterally take a side — those markers represent the
+  user's in-progress work on another branch.
+- If `git log` shows unfamiliar recent commits (e.g. a squash-merge from a
+  worktree), read the message and decide whether they impact the planned
+  work before proceeding.
+
+This pre-flight takes < 5 seconds and prevents the
+"resolve conflicts mid-feature" scramble that happened in commit `cfbc3c0`
+(the Mission/Goals rename squash-merge that landed while I was editing
+sidebar.rs).
+
 ## The five-tier validation gate (every feature dispatch must clear them in order)
 
 Tier-skipping is the source of every "this doesn't work" turn in this repo's
@@ -304,6 +357,117 @@ the filesystem. Manual `git worktree remove` doesn't update the session.
 - After merging a feature branch, use `ExitWorktree { action: "remove", discard_changes: true }`
   rather than `git worktree remove` directly.
 - If session-state gets confused, `ExitWorktree { action: "keep" }` then re-`EnterWorktree`.
+
+### F10 — cmux ref-type confusion (surface_ref vs workspace_ref)
+
+**Symptom**: `cmux <command> returns "Workspace not found"`, or a cmux call
+silently does nothing. From the user's perspective the feature doesn't
+work; from the test perspective everything's green because we never
+exercise the live cmux call.
+
+**Root cause**: cmux refs come in distinct families — `window:N`,
+`workspace:N`, `pane:N`, `surface:N` — and each cmux subcommand accepts
+ONLY specific families. Passing a `surface:N` where the command expects
+`workspace:N` doesn't fail at compile time and isn't caught by typecheck;
+cmux just errors at runtime. We've burned cycles on this twice in one
+session (`read-screen --workspace surface:121` → "Workspace not found";
+then `select-workspace --workspace surface:121` → same error in the yield
+path). Same root pattern, same blast radius, two commits apart.
+
+**Ref-kind lookup table** (verified live against cmux on 2026-05-25; cross-check
+`cmux <cmd> --help` when in doubt):
+
+| Command                          | What goes after `--workspace` | What goes after `--surface` | Other |
+|----------------------------------|--------------------------------|------------------------------|-------|
+| `select-workspace`               | `workspace:N` or window UUID   | (n/a)                        | |
+| `read-screen`                    | `workspace:N` or window UUID   | (n/a)                        | |
+| `send`                           | `workspace:N` (required)       | `surface:N`                  | text trailing |
+| `new-surface`                    | `workspace:N`                  | (n/a — emits new surface:N)  | |
+| `close-surface`                  | optional context               | `surface:N` (target)         | |
+| `tab-action`                     | optional context               | `surface:N` via `--tab`      | `--action <name>` |
+| `focus-pane`                     | optional context               | (n/a)                        | `--pane <pane:N>` |
+| `workspace-action`               | `workspace:N`                  | (n/a)                        | `--action <name>` |
+| `list-pane-surfaces`             | optional `workspace:N`         | (n/a)                        | `--pane <pane:N>` |
+| `move-surface`                   | optional `workspace:N`         | `surface:N` (required)       | `--pane`, `--window`, `--before`/`--after` |
+| `rpc workspace.list`             | `{"window_id": "<uuid>"}` JSON | (n/a)                        | for cross-window listing |
+
+**Prevention checklist** for any new or modified call to `cmux` in
+`src/cmux/`, `src/tui/`, or `src/main.rs`:
+
+1. Identify which ref family the cmux subcommand needs (the table above).
+2. Search the call site: is the variable being passed a workspace ref or a
+   surface ref? Variable names are routinely misleading — `surface_ref`
+   was passed to `read-screen --workspace` for months because the type
+   system can't catch a `String → String` mismatch.
+3. Add a **comment** at the call site naming the expected ref kind, so
+   the next reader doesn't have to re-discover.
+4. If a struct field (e.g. `PeekState`) is consumed by cmux calls, name
+   it after the ref-kind it carries (`workspace_ref` vs `surface_ref`),
+   and document it on the field.
+5. Tier 4 manual smoke: run the live cmux command from the shell first to
+   confirm it accepts the ref you're going to pass. Anything that errors
+   "not_found: Workspace not found" is the smoking gun.
+
+**Grep when this F-mode is suspected** (catches every cmux call site at once):
+
+```bash
+grep -rn "client\.\(read_screen\|select_workspace\|send_text\|new_surface\|close_surface\)" src/ \
+  --include='*.rs'
+# For each hit, verify the first `&str` argument is the right ref-kind for that command.
+```
+
+**Cross-reference**: this F-mode was the source of bugs in commits
+`2039a42`, `baba59d`, `ba20f73`, and `72ad28e` on 2026-05-24/25. Same root,
+four commits, six back-and-forths with Boyan. Codifying it here as
+prevention.
+
+### F11 — Peek source mental model: agent → session.md; non-agent → that tty
+
+**Symptom**: peeking different surfaces in the same workspace shows the
+same content (the cmux read-screen for the workspace returns a single
+screen — usually whatever pane/surface is currently focused, not the
+surface the user clicked). User reports "peek is pointing to the same tty
+again."
+
+**Root cause**: cmux `read-screen --workspace <ref>` reads the workspace's
+current screen, not a specific surface's screen. So routing all
+"non-Agent" peeks to `read-screen --workspace` collapses N surfaces onto
+one stream of bytes. Separately, routing agent peeks through `read-screen`
+at all is wrong: agents have a persistent transcript at
+`~obsAgents/Sessions/*.md` that's the canonical source.
+
+**The correct mental model (per user, 2026-05-25):**
+
+- **Agent surface** (Claude / Codex / OpenCode / OtherAgent): peek the
+  surface's **stored `session.md`**. If no matching session log exists,
+  the peek should show an empty-with-explanation state, NOT fall back to
+  cmux read-screen for the workspace.
+- **Non-agent surface** (Shell / Unknown that's actually a shell): peek
+  **that tty's** screen. The current cmux CLI exposes only
+  `read-screen --workspace` which doesn't give per-surface granularity;
+  if we need per-surface tty reads, that's a feature request to cmux OR
+  we read the tty directly via the lsof+ps detection path (the same path
+  used for kind detection).
+
+**Prevention checklist** for any change to peek source resolution
+(`src/tui/app.rs` peek-entry block, `src/mc_data/session_log.rs` resolver,
+`src/tui/peek_view.rs::PeekSource`):
+
+1. Agent surfaces (`SurfaceKind::is_agent() == true`) must resolve to
+   `PeekSource::Agent { session_path }` or to a dedicated
+   `PeekSource::AgentMissing` placeholder — NEVER to `PeekSource::Shell`.
+2. Non-agent surfaces (Shell, Unknown) must resolve to a per-surface tty
+   read, NEVER to a workspace-level `read-screen`. If cmux doesn't
+   provide a per-surface read, prefer a clear "live tty not yet supported
+   in mc-tui" placeholder over showing the wrong content.
+3. Cross-surface invariant test: peek surface A, peek surface B in the
+   same workspace, content MUST differ (or both must be a clear
+   "unavailable" placeholder).
+
+**Cross-reference**: this is the deeper root behind commits `2039a42`,
+`baba59d`, `ba20f73`, `72ad28e`. F10 was the surface-bug (passing the
+wrong ref family); F11 is the architectural bug (wrong source for the
+surface kind).
 
 ### F9 — Sprint branch orphaned by skipped integration step
 

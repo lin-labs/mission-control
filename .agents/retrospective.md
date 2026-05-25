@@ -41,6 +41,14 @@ cross-check each F-entry against what was done this session.
   subagent's success report, OR did Boyan have to ask "let's merge to main"
   later? "Boyan-had-to-ask" is the symptom of validate.md F9 (tier-6 skip);
   the merge cost compounds with every hour of base-branch drift.
+- Did the change add or modify a `cmux` CLI call? Cross-check the
+  ref-kind table in validate.md F10 (workspace_ref vs surface_ref). The
+  type system can't catch a `String → String` ref-family mismatch, so
+  this MUST be checked by reading the call site against the table.
+- For peek / per-surface UI work: did the agent vs non-agent source split
+  follow validate.md F11 (agent → session.md; non-agent → that tty)?
+  Crossing them is a recurring contributor to "the same content for two
+  surfaces" complaints.
 
 ## Recurring failure modes (codified)
 
@@ -55,8 +63,23 @@ The authoritative codified list lives in `.agents/validate.md` under
 
 Meta-patterns observed so far:
 
-(none yet — promote from "Project-specific signals" once a pattern repeats
-at the retro level, not the code level)
+- **Same-session bug-class repetition = codify NOW**. If the SAME root
+  pattern bites twice in one session (e.g. surface_ref vs workspace_ref
+  in two cmux commands on 2026-05-25), open `validate.md` and add the
+  F-entry in the same session. Don't wait for the next retro. Two
+  occurrences is the promotion threshold.
+- **Grep every callsite of a class on first detection of the class**.
+  When a bug points at a *category* of API misuse (e.g., wrong cmux
+  ref family), the immediate next step is a project-wide grep for all
+  callers of that category, not a one-line fix on the reported case.
+  This session: read-screen was fixed in `ba20f73`, select-workspace
+  in `72ad28e`. Both should have landed in one commit if I'd grepped
+  `client.\(read_screen\|select_workspace\|send_text\)` at first
+  detection.
+- **Take the user's mental model as ground truth**. When Boyan said
+  "agent surface should point to the stored session.md, non-agent
+  surface should point to the tty console itself" — that's the spec.
+  Don't bottom-up re-derive it from code. Confirm, then implement.
 
 ## Successful patterns worth reinforcing
 
@@ -65,6 +88,16 @@ at the retro level, not the code level)
 - Running tier 4 (`mc` against real cmux) before claiming done, even when
   unit tests are green.
 - Recording warning count in PR description so drift is visible.
+- **File-logged diagnostics for TUI bugs**. The TUI captures stderr to
+  the alt-screen, so `eprintln!` is invisible to the user. Writing to
+  `/tmp/mc-peek-debug.log` (or similar) with `OpenOptions::append`
+  inside hot paths cracked the peek bug in one round after weeks of
+  guesswork. Pattern to repeat: when a TUI bug resists 2+ analytical
+  rounds, ship a file-logged diagnostic build immediately rather than
+  speculate further.
+- **Asking Boyan for concrete repro IDs** (e.g.
+  `workspace_id=ED00E698... surface_ref=surface:121`) the moment a UI
+  bug stalls. Three lines of IDs > three back-and-forths of "try this."
 
 ## Where retro findings from this project should land
 
