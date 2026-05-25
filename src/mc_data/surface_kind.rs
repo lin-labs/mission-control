@@ -22,6 +22,7 @@
 //! The whole pipeline is best-effort: any failure returns `SurfaceKind::Unknown`
 //! so detection never blocks the TUI refresh tick.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -100,6 +101,10 @@ impl Default for SurfaceKind {
 ///
 /// `tty` may be `"ttys030"` or `"/dev/ttys030"`. Returns `Unknown` on any error
 /// — this function must never panic and must never block the caller for long.
+///
+/// Prefer [`detect_all`] when resolving more than a couple of ttys — it spawns
+/// one `ps -A` instead of `lsof + ps` per call.
+#[allow(dead_code)]
 pub fn detect(tty: &str) -> SurfaceKind {
     let dev_path = if tty.starts_with("/dev/") {
         tty.to_string()
@@ -161,6 +166,80 @@ pub fn detect(tty: &str) -> SurfaceKind {
         None => return SurfaceKind::Unknown,
     };
     SurfaceKind::from_comm(&comm)
+}
+
+/// Batched variant of [`detect`]. Resolves the surface kind for every requested
+/// tty in a SINGLE `ps -A` call instead of spawning `lsof` + `ps` per tty.
+///
+/// With ~30 surfaces, this turns ~60 subprocess spawns per refresh tick into 1.
+///
+/// Input ttys may be in any of the forms cmux/lsof use:
+///   - `"ttys030"`
+///   - `"/dev/ttys030"`
+/// The returned `HashMap` is keyed by the *input* string verbatim, so callers
+/// can look up by the same tty string they passed in.
+///
+/// Any error path returns a map where the requested ttys map to
+/// `SurfaceKind::Unknown` — never panics, never blocks indefinitely.
+pub fn detect_all(ttys: &[&str]) -> HashMap<String, SurfaceKind> {
+    let mut result: HashMap<String, SurfaceKind> =
+        ttys.iter().map(|t| (t.to_string(), SurfaceKind::Unknown)).collect();
+    if ttys.is_empty() {
+        return result;
+    }
+
+    let ps = std::process::Command::new("ps")
+        .args(["-A", "-o", "tty=,stat=,comm="])
+        .output();
+    let Ok(ps) = ps else { return result };
+    if !ps.status.success() {
+        return result;
+    }
+
+    // macOS `ps` prints tty without the `tty` prefix (e.g. `s030` for
+    // `/dev/ttys030`). Build a map from the SHORT form to the foreground
+    // process's `comm`. STAT containing `+` marks the foreground process
+    // group — the one driving the terminal.
+    let stdout = String::from_utf8_lossy(&ps.stdout);
+    let mut fg_by_short: HashMap<String, String> = HashMap::new();
+    let mut last_by_short: HashMap<String, String> = HashMap::new();
+    for line in stdout.lines() {
+        let mut tokens = line.split_whitespace();
+        let tty = match tokens.next() {
+            Some(t) if t != "??" => t.to_string(),
+            _ => continue,
+        };
+        let stat = match tokens.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let comm: String = tokens.collect::<Vec<_>>().join(" ");
+        if comm.is_empty() {
+            continue;
+        }
+        if stat.contains('+') {
+            fg_by_short.insert(tty.clone(), comm.clone());
+        }
+        last_by_short.insert(tty, comm);
+    }
+
+    for tty in ttys {
+        // `ps -A -o tty=` emits the full short tty name (e.g. `ttys001`) on
+        // macOS — same form cmux already gives us. We only need to strip a
+        // leading `/dev/` if a caller passed the full device path.
+        let key = tty.trim_start_matches("/dev/");
+        let comm = fg_by_short
+            .get(key)
+            .or_else(|| last_by_short.get(key));
+        if let Some(comm) = comm {
+            // Strip leading `-` that `ps` prepends for login shells
+            // (e.g. `-/bin/zsh` is the login shell form of `zsh`).
+            let trimmed = comm.trim_start_matches('-');
+            result.insert(tty.to_string(), SurfaceKind::from_comm(trimmed));
+        }
+    }
+
+    result
 }
 
 // ── Last-agent persistence ─────────────────────────────────────────────────

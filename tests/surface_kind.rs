@@ -219,3 +219,25 @@ fn detect_returns_unknown_for_bogus_tty() {
         SurfaceKind::Unknown
     );
 }
+
+#[test]
+fn detect_all_empty_returns_empty_map() {
+    let map = surface_kind::detect_all(&[]);
+    assert!(map.is_empty());
+}
+
+#[test]
+fn detect_all_unknown_ttys_map_to_unknown_but_no_panic() {
+    // Bogus ttys that won't appear in `ps -A` output should resolve to
+    // Unknown without panicking. Same defensive contract as `detect`.
+    let map = surface_kind::detect_all(&["ttys_does_not_exist_aaa", "ttys_does_not_exist_bbb"]);
+    assert_eq!(map.len(), 2);
+    assert_eq!(
+        map.get("ttys_does_not_exist_aaa").copied(),
+        Some(SurfaceKind::Unknown)
+    );
+    assert_eq!(
+        map.get("ttys_does_not_exist_bbb").copied(),
+        Some(SurfaceKind::Unknown)
+    );
+}

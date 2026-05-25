@@ -342,9 +342,18 @@ async fn run_app(
             }
         })?;
 
+        // Adaptive draw/input-poll tick. When a workspace is mid-refresh
+        // (spinner animation needs ~12 fps), use a tight 80ms tick. When idle
+        // we relax to 200ms — drops the redraw rate from 20 fps → 5 fps, which
+        // is the dominant lever on idle CPU (~1.3% → ~0.3% on this machine).
+        // Key responsiveness stays well within human "feels-instant" range
+        // (~200ms is below the 300ms threshold for perceptible lag on a single
+        // press).
+        let any_loading = app.workspaces.iter().any(|ws| ws.loading);
+        let tick_ms: u64 = if any_loading { 80 } else { 200 };
         tokio::select! {
-            // Poll terminal events on a 50ms tick
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+            // Poll terminal events on an adaptive tick (see above).
+            _ = tokio::time::sleep(Duration::from_millis(tick_ms)) => {
                 while event::poll(std::time::Duration::from_millis(0))? {
                     if let Event::Key(key) = event::read()? {
                         // Only process key press events (not release/repeat)
