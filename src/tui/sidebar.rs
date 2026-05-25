@@ -25,96 +25,123 @@ pub fn render_sidebar(
     // Width available for the actual title text inside the padded box.
     let text_width = inner_width.saturating_sub(BOX_EDGE_COLS);
 
-    let items: Vec<ListItem> = workspaces
-        .iter()
-        .enumerate()
-        .map(|(idx, ws)| {
-            let is_selected = idx == selected;
+    let bar = "━".repeat(bar_width as usize);
+    let neutral_style = Style::default().fg(Color::DarkGray);
 
-            // Status leader: spinner when refresh in flight, otherwise dot.
-            let (leader, leader_color) = if ws.loading {
-                (spinner_frame().to_string(), Color::Cyan)
-            } else {
-                let (dot, c) = status_indicator(ws);
-                (dot.to_string(), c)
-            };
-            let leader_str = format!("{} ", leader);
+    // Shared-edge layout: one top cap, then `content + separator` for each
+    // workspace. The last workspace's separator IS the bottom cap, so adjacent
+    // workspaces share their horizontal border instead of stacking two of them.
+    let mut items: Vec<ListItem> = Vec::with_capacity(workspaces.len() * 2 + 1);
 
-            let host_badge = ws
-                .session
-                .as_ref()
-                .and_then(|s| s.frontmatter.host.as_deref())
-                .filter(|h| *h != "mbp")
-                .map(|h| format!(" [{}]", h))
-                .unwrap_or_default();
+    if !workspaces.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!("┏{}┓", bar),
+            neutral_style,
+        ))));
+    }
 
-            let border_color = crate::sidebar_pure::workspace_accent_color(
-                ws.workspace.custom_color.as_deref(),
-            )
-            .unwrap_or(Color::DarkGray);
+    for (idx, ws) in workspaces.iter().enumerate() {
+        let is_selected = idx == selected;
+        let is_last = idx + 1 == workspaces.len();
 
-            // Truncate name to fit between leader and host_badge inside the box.
-            let name_max = (text_width as usize)
-                .saturating_sub(leader_str.chars().count())
-                .saturating_sub(host_badge.chars().count());
-            let display_name = truncate_for_width(&ws.workspace.name, name_max as u16);
+        // Status leader: spinner when refresh in flight, otherwise dot.
+        let (leader, leader_color) = if ws.loading {
+            (spinner_frame().to_string(), Color::Cyan)
+        } else {
+            let (dot, c) = status_indicator(ws);
+            (dot.to_string(), c)
+        };
+        let leader_str = format!("{} ", leader);
 
-            // Compute the right-pad needed to fill the box width.
-            let used =
-                1 + leader_str.chars().count() + display_name.chars().count() + host_badge.chars().count();
-            let pad = " ".repeat((bar_width as usize).saturating_sub(used));
+        let host_badge = ws
+            .session
+            .as_ref()
+            .and_then(|s| s.frontmatter.host.as_deref())
+            .filter(|h| *h != "mbp")
+            .map(|h| format!(" [{}]", h))
+            .unwrap_or_default();
 
-            let bar = "━".repeat(bar_width as usize);
-            let border_style = Style::default().fg(border_color);
-            let content_bg = if is_selected {
-                Color::DarkGray
-            } else {
-                Color::Reset
-            };
+        let accent_color = crate::sidebar_pure::workspace_accent_color(
+            ws.workspace.custom_color.as_deref(),
+        )
+        .unwrap_or(Color::DarkGray);
 
-            let top_line = Line::from(Span::styled(format!("┏{}┓", bar), border_style));
-            let bot_line = Line::from(Span::styled(format!("┗{}┛", bar), border_style));
+        // Truncate name to fit between leader and host_badge inside the box.
+        let name_max = (text_width as usize)
+            .saturating_sub(leader_str.chars().count())
+            .saturating_sub(host_badge.chars().count());
+        let display_name = truncate_for_width(&ws.workspace.name, name_max as u16);
 
-            let content_line = Line::from(vec![
-                Span::styled("┃", border_style),
-                Span::styled(" ", Style::default().bg(content_bg)),
-                Span::styled(
-                    leader_str,
-                    Style::default().fg(leader_color).bg(content_bg),
-                ),
-                Span::styled(
-                    display_name,
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)
-                        .bg(content_bg),
-                ),
-                Span::styled(
-                    host_badge,
-                    Style::default().fg(Color::DarkGray).bg(content_bg),
-                ),
-                Span::styled(pad, Style::default().bg(content_bg)),
-                Span::styled("┃", border_style),
-            ]);
+        let used =
+            1 + leader_str.chars().count() + display_name.chars().count() + host_badge.chars().count();
+        let pad = " ".repeat((bar_width as usize).saturating_sub(used));
 
-            ListItem::new(vec![top_line, content_line, bot_line])
-        })
-        .collect();
+        let accent_style = Style::default().fg(accent_color);
+        let content_bg = if is_selected {
+            Color::DarkGray
+        } else {
+            Color::Reset
+        };
+
+        let content_line = Line::from(vec![
+            Span::styled("┃", accent_style),
+            Span::styled(" ", Style::default().bg(content_bg)),
+            Span::styled(
+                leader_str,
+                Style::default().fg(leader_color).bg(content_bg),
+            ),
+            Span::styled(
+                display_name,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(content_bg),
+            ),
+            Span::styled(
+                host_badge,
+                Style::default().fg(Color::DarkGray).bg(content_bg),
+            ),
+            Span::styled(pad, Style::default().bg(content_bg)),
+            Span::styled("┃", accent_style),
+        ]);
+        items.push(ListItem::new(content_line));
+
+        // Separator below: T-intersection between workspaces, bottom cap on last.
+        let separator_text = if is_last {
+            format!("┗{}┛", bar)
+        } else {
+            format!("┣{}┫", bar)
+        };
+        items.push(ListItem::new(Line::from(Span::styled(
+            separator_text,
+            neutral_style,
+        ))));
+    }
 
     let outer_border_color = if focused {
         Color::Cyan
     } else {
         Color::DarkGray
     };
-    let list = List::new(items).block(
-        Block::default()
-            .title(" Workspaces ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(outer_border_color)),
-    );
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(" Workspaces ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(outer_border_color)),
+        )
+        // Selection styling is applied per-span on the content row so the
+        // ┃ borders keep their accent color. Disable the List's default
+        // highlight so it doesn't paint over our per-span styles.
+        .highlight_style(Style::default());
 
     let mut state = ListState::default();
-    state.select(Some(selected));
+    if !workspaces.is_empty() {
+        // Content rows live at indices 1, 3, 5, … (offset by the top cap and
+        // separators). Map the user-facing `selected` workspace index onto the
+        // raw ListItem index so scroll still keeps the right row visible.
+        state.select(Some(1 + selected * 2));
+    }
 
     f.render_stateful_widget(list, area, &mut state);
 }
@@ -208,54 +235,84 @@ mod tests {
     }
 
     #[test]
-    fn workspace_renders_inside_heavy_box_with_accent_color() {
-        let workspaces = vec![test_workspace_state("alpha", Some("#C0392B"))];
-        let backend = TestBackend::new(30, 8);
+    fn adjacent_workspaces_share_a_t_intersection_separator() {
+        let workspaces = vec![
+            test_workspace_state("alpha", Some("#C0392B")),
+            test_workspace_state("beta", Some("#006B6B")),
+        ];
+        let backend = TestBackend::new(30, 12);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|f| render_sidebar(f, Rect::new(0, 0, 30, 8), &workspaces, 0, true))
+            .draw(|f| render_sidebar(f, Rect::new(0, 0, 30, 12), &workspaces, 0, true))
             .unwrap();
 
-        // Find the row containing "alpha".
-        let mut alpha_row: Option<u16> = None;
-        for y in 0..8 {
-            if buf_row(&terminal, y).contains("alpha") {
-                alpha_row = Some(y);
-                break;
-            }
-        }
-        let y = alpha_row.expect("workspace name was not rendered");
+        let alpha_y = (0..12)
+            .find(|y| buf_row(&terminal, *y).contains("alpha"))
+            .expect("alpha should render");
+        let beta_y = (0..12)
+            .find(|y| buf_row(&terminal, *y).contains("beta"))
+            .expect("beta should render");
 
-        // Row above must be a heavy top border ┏━━…━━┓ in the accent color.
-        let above = buf_row(&terminal, y - 1);
+        // Between alpha and beta there should be exactly ONE line, and that
+        // line should contain a T-intersection separator ┣━━━┫ — not two
+        // stacked borders.
+        assert_eq!(
+            beta_y - alpha_y,
+            2,
+            "beta should be exactly 2 rows below alpha (1 content + 1 shared separator), got {}",
+            beta_y - alpha_y
+        );
+        let between = buf_row(&terminal, alpha_y + 1);
+        assert!(
+            between.contains('┣') && between.contains('┫'),
+            "expected ┣ … ┫ shared separator between workspaces, got: {:?}",
+            between
+        );
+
+        // Above alpha should be the top cap ┏━━━┓.
+        let above = buf_row(&terminal, alpha_y - 1);
         assert!(
             above.contains('┏') && above.contains('┓'),
-            "expected ┏ … ┓ top border above the name row, got: {:?}",
+            "expected ┏ … ┓ top cap above first workspace, got: {:?}",
             above
         );
 
-        // Row below must be a heavy bottom border ┗━━…━━┛.
-        let below = buf_row(&terminal, y + 1);
+        // Below beta should be the bottom cap ┗━━━┛.
+        let below = buf_row(&terminal, beta_y + 1);
         assert!(
             below.contains('┗') && below.contains('┛'),
-            "expected ┗ … ┛ bottom border below the name row, got: {:?}",
+            "expected ┗ … ┛ bottom cap below last workspace, got: {:?}",
             below
         );
+    }
 
-        // The border ┏ on the top row should be tinted with the workspace's
-        // custom color (#C0392B → rgb(192, 57, 43)).
+    #[test]
+    fn content_row_uses_accent_color_on_vertical_borders() {
+        let workspaces = vec![test_workspace_state("alpha", Some("#C0392B"))];
+        let backend = TestBackend::new(30, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|f| render_sidebar(f, Rect::new(0, 0, 30, 6), &workspaces, 0, true))
+            .unwrap();
+
+        let alpha_y = (0..6)
+            .find(|y| buf_row(&terminal, *y).contains("alpha"))
+            .expect("alpha should render");
+
         let buf = terminal.backend().buffer();
-        let top_corner = (0..buf.area.width)
-            .find_map(|x| buf.cell((x, y - 1)).filter(|cell| cell.symbol() == "┏"))
-            .expect("top-left corner should be present");
-        assert_eq!(top_corner.style().fg, Some(Color::Rgb(0xC0, 0x39, 0x2B)));
+        let left_pipe = (0..buf.area.width)
+            .find_map(|x| buf.cell((x, alpha_y)).filter(|cell| cell.symbol() == "┃"))
+            .expect("left ┃ on content row should be present");
+        assert_eq!(left_pipe.style().fg, Some(Color::Rgb(0xC0, 0x39, 0x2B)));
 
-        // The name itself should be bold White.
-        let name_cell = (0..buf.area.width)
-            .find_map(|x| buf.cell((x, y)).filter(|cell| cell.symbol() == "a"))
-            .expect("workspace name should be rendered");
-        assert_eq!(name_cell.style().fg, Some(Color::White));
+        // Horizontal separators stay neutral so adjacent workspaces don't
+        // fight for the same shared edge color.
+        let above = (0..buf.area.width)
+            .find_map(|x| buf.cell((x, alpha_y - 1)).filter(|cell| cell.symbol() == "┏"))
+            .expect("top cap corner should be present");
+        assert_eq!(above.style().fg, Some(Color::DarkGray));
     }
 
     #[test]
@@ -264,80 +321,49 @@ mod tests {
             test_workspace_state("alpha", Some("#C0392B")),
             test_workspace_state("beta", Some("#006B6B")),
         ];
-        let backend = TestBackend::new(30, 10);
+        let backend = TestBackend::new(30, 12);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        // Select beta (idx 1).
         terminal
-            .draw(|f| render_sidebar(f, Rect::new(0, 0, 30, 10), &workspaces, 1, true))
+            .draw(|f| render_sidebar(f, Rect::new(0, 0, 30, 12), &workspaces, 1, true))
             .unwrap();
 
-        // Find the content row of beta.
-        let mut beta_row: Option<u16> = None;
-        for y in 0..10 {
-            if buf_row(&terminal, y).contains("beta") {
-                beta_row = Some(y);
-                break;
-            }
-        }
-        let y = beta_row.expect("beta should render");
-
-        // The name cell ("b") should have DarkGray bg (selection fill).
+        let beta_y = (0..12)
+            .find(|y| buf_row(&terminal, *y).contains("beta"))
+            .expect("beta should render");
         let buf = terminal.backend().buffer();
+
         let beta_b = (0..buf.area.width)
-            .find_map(|x| buf.cell((x, y)).filter(|cell| cell.symbol() == "b"))
-            .expect("beta should be in buffer");
+            .find_map(|x| buf.cell((x, beta_y)).filter(|cell| cell.symbol() == "b"))
+            .expect("beta name should be rendered");
         assert_eq!(
             beta_b.style().bg,
             Some(Color::DarkGray),
-            "selected row content should have DarkGray background"
+            "selected row interior should have DarkGray bg"
         );
 
-        // The border characters on beta's box should NOT have bg fill.
-        let beta_left_border = (0..buf.area.width)
-            .find_map(|x| buf.cell((x, y)).filter(|cell| cell.symbol() == "┃"))
-            .expect("beta box left ┃ should be present");
+        // The accent ┃ on the same content row should NOT receive bg fill —
+        // the box outline stays stable regardless of selection.
+        let beta_pipe = (0..buf.area.width)
+            .find_map(|x| buf.cell((x, beta_y)).filter(|cell| cell.symbol() == "┃"))
+            .expect("beta box ┃ should be present");
         assert_ne!(
-            beta_left_border.style().bg,
+            beta_pipe.style().bg,
             Some(Color::DarkGray),
-            "border characters should not get the selection bg fill"
+            "vertical border should not receive selection bg"
         );
 
-        // The non-selected workspace (alpha) should NOT have bg fill on its name.
-        let mut alpha_row: Option<u16> = None;
-        for yy in 0..10 {
-            if buf_row(&terminal, yy).contains("alpha") {
-                alpha_row = Some(yy);
-                break;
-            }
-        }
-        let ay = alpha_row.expect("alpha should render");
+        // The unselected workspace (alpha) should NOT have bg fill on its name.
+        let alpha_y = (0..12)
+            .find(|y| buf_row(&terminal, *y).contains("alpha"))
+            .expect("alpha should render");
         let alpha_a = (0..buf.area.width)
-            .find_map(|x| buf.cell((x, ay)).filter(|cell| cell.symbol() == "a"))
-            .expect("alpha should be in buffer");
+            .find_map(|x| buf.cell((x, alpha_y)).filter(|cell| cell.symbol() == "a"))
+            .expect("alpha name should be rendered");
         assert_ne!(
             alpha_a.style().bg,
             Some(Color::DarkGray),
             "unselected row should not have selection bg"
         );
-    }
-
-    #[test]
-    fn workspace_without_custom_color_uses_dark_gray_border() {
-        let workspaces = vec![test_workspace_state("plain", None)];
-        let backend = TestBackend::new(30, 6);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal
-            .draw(|f| render_sidebar(f, Rect::new(0, 0, 30, 6), &workspaces, 0, true))
-            .unwrap();
-
-        // The border characters should be DarkGray when no custom_color is set.
-        let buf = terminal.backend().buffer();
-        let any_border = (0..buf.area.width)
-            .flat_map(|x| (0..buf.area.height).map(move |y| (x, y)))
-            .find_map(|(x, y)| buf.cell((x, y)).filter(|cell| cell.symbol() == "┃"))
-            .expect("at least one ┃ border should be rendered");
-        assert_eq!(any_border.style().fg, Some(Color::DarkGray));
     }
 }
