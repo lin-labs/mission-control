@@ -1782,9 +1782,20 @@ impl App {
                         .surfaces
                         .iter()
                         .find(|s| s.ref_id == surface_id_for_lookup);
-                    let surface_kind = this_surface
+                    let raw_kind = this_surface
                         .map(|s| s.kind)
                         .unwrap_or_default();
+                    // Use effective_kind (live kind + recent last-agent
+                    // fallback) so an agent surface that briefly drops to
+                    // shell/cmux foreground keeps its agent route to
+                    // session.md. Matches the trajectory glyph (set in the
+                    // projection at ~line 1071) so what the user sees in the
+                    // sidebar item lines up with what peek picks.
+                    let surface_kind = crate::mc_data::surface_kind::effective_kind(
+                        &ws.workspace.uuid,
+                        surface_id_for_lookup,
+                        raw_kind,
+                    );
                     // Per F11 in .agents/validate.md:
                     //   - Agent surfaces (Claude/Codex/OtherAgent) → resolve to
                     //     session.md. NEVER fall back to Shell — that would

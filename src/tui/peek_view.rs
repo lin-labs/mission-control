@@ -293,9 +293,22 @@ pub fn render(
         .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(Color::Gray))))
         .collect();
 
+    // When auto-following, the goal is "the LAST N lines fill the visible
+    // area, where N = inner.height". `peek.scroll_offset = max_scroll() =
+    // buffer.len() - 1` was wrong — it scrolled past everything except the
+    // final row, leaving the rest of the pane blank. Recompute the
+    // effective scroll at render time so we can use the actual area height
+    // (PeekState alone can't, because it doesn't know the area).
+    let effective_offset = if peek.auto_follow {
+        (peek.screen_buffer.len() as u16)
+            .saturating_sub(inner.height)
+    } else {
+        peek.scroll_offset
+    };
+
     let para = Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: false })
-        .scroll((peek.scroll_offset, 0));
+        .scroll((effective_offset, 0));
     f.render_widget(para, inner);
 }
 
