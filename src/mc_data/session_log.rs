@@ -27,6 +27,11 @@ pub struct Frontmatter {
     pub host: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Which agent wrote this log: "claude", "codex", "opencode", etc. Older
+    /// logs (pre-tagging) leave this absent — callers must treat missing as
+    /// "match any agent" so they don't silently drop those files.
+    #[serde(default)]
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -269,27 +274,22 @@ pub fn latest_session_file_for_workspace(
 /// Three-step lookup:
 /// 1. Per-surface pointer file: `<surfaces_dir>/<surface_id>.session-path`.
 ///    If it exists and its content points to an existing file, return that path.
-/// 2. Distribute multiple workspace-matched logs across surfaces by their
-///    `surface_index` (zero-based index_in_pane):
-///    - Call `matching_session_files_for_workspace` to get all matches sorted
-///      newest-first.
-///    - If `matches.len() > surface_index`, return `matches[surface_index]`.
-///    - Else return the last (oldest) match.
-/// 3. Return `None` if no matches exist.
-///
-/// **Heuristic** — until cmux env-var injection enables per-surface
-/// `.session-path` pointer files, we distribute multiple workspace-matched logs
-/// across surfaces by their index_in_pane.  Better than collapsing all peeks
-/// to one log.
-///
-/// Returns `Ok(None)` when no matching file is found (Shell source).
+/// 2. Filter workspace-matched logs by agent (so a claude surface only sees
+///    `agent: claude` logs), then distribute among same-agent surfaces by
+///    `same_agent_index` (position of this surface among same-kind siblings
+///    in the workspace's surface list).
+///    Logs whose frontmatter has no `agent:` field are kept as candidates
+///    for any agent kind — pre-tagging logs must still resolve.
+/// 3. Return `None` if no matches exist, or when `agent_label` is `None`
+///    (non-agent surface — peek should fall through to live shell).
 pub fn resolve_session_log_for_surface(
     workspace_uuid: &str,
     surface_id: &str,
     ctx: &WorkspaceContext,
-    surface_index: usize,
+    agent_label: Option<&str>,
+    same_agent_index: usize,
 ) -> Result<Option<PathBuf>> {
-    // Step 1: per-surface pointer file.
+    // Step 1: per-surface pointer file (works for any surface kind, including shells).
     let pointer = crate::mc_data::paths::surfaces_dir(workspace_uuid)
         .join(format!("{surface_id}.session-path"));
     if let Ok(content) = std::fs::read_to_string(&pointer) {
@@ -299,16 +299,42 @@ pub fn resolve_session_log_for_surface(
         }
     }
 
-    // Step 2: distribute across surfaces by index; fall back to oldest on overflow.
+    // Non-agent surfaces don't peek session logs — return None so the caller
+    // renders the live cmux screen instead of someone else's conversation.
+    let Some(agent_label) = agent_label else {
+        return Ok(None);
+    };
+
+    // Step 2: collect matches, filter by agent, then index into the filtered set.
     let matches = matching_session_files_for_workspace(workspace_uuid, ctx)?;
     if matches.is_empty() {
         return Ok(None);
     }
-    if surface_index < matches.len() {
-        Ok(Some(matches[surface_index].clone()))
+
+    let filtered: Vec<PathBuf> = matches
+        .into_iter()
+        .filter(|p| {
+            let text = match std::fs::read_to_string(p) {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
+            let fm = parse_frontmatter(&text);
+            // Missing agent: keep as candidate (pre-tagging compatibility).
+            // Present agent: must match this surface's kind.
+            fm.agent
+                .as_deref()
+                .map(|a| a.eq_ignore_ascii_case(agent_label))
+                .unwrap_or(true)
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        return Ok(None);
+    }
+    if same_agent_index < filtered.len() {
+        Ok(Some(filtered[same_agent_index].clone()))
     } else {
-        // Out of range: return the oldest match (last in mtime-desc order).
-        Ok(matches.into_iter().last())
+        Ok(filtered.into_iter().last())
     }
 }
 

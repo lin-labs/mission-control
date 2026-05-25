@@ -44,7 +44,7 @@ fn resolve_falls_back_to_workspace_log_when_no_pointer() {
         // The resolver should fall through to workspace-level lookup.
         // Empty ctx → tier 1 skipped → tier 2 (uuid match) applies.
         let ctx = WorkspaceContext::default();
-        let resolved = session_log::resolve_session_log_for_surface(uuid, "sid-no-pointer", &ctx, 0)
+        let resolved = session_log::resolve_session_log_for_surface(uuid, "sid-no-pointer", &ctx, Some("claude"), 0)
             .expect("resolve should not error");
         assert!(
             resolved.is_some(),
@@ -85,6 +85,7 @@ fn resolve_returns_none_when_no_log_exists() {
             "peek-agent-test-no-log-uuid",
             "sid-none",
             &ctx,
+            Some("claude"),
             0,
         )
         .expect("resolve should not error");
@@ -153,7 +154,7 @@ fn resolve_returns_most_recent_session_log() {
 
     let result = std::panic::catch_unwind(|| {
         let ctx = WorkspaceContext::default();
-        let resolved = session_log::resolve_session_log_for_surface(uuid, "sid-mr", &ctx, 0)
+        let resolved = session_log::resolve_session_log_for_surface(uuid, "sid-mr", &ctx, Some("claude"), 0)
             .expect("resolve should not error")
             .expect("expected Some from workspace-level fallback");
         let text = fs::read_to_string(&resolved).unwrap();

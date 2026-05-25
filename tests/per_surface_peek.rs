@@ -51,15 +51,15 @@ fn three_surfaces_get_distinct_logs() {
         // Empty ctx → tier 1 skipped → tier 2 (uuid match) applies.
         let ctx = WorkspaceContext::default();
 
-        let r0 = session_log::resolve_session_log_for_surface(workspace_id, "surface:92", &ctx, 0)
+        let r0 = session_log::resolve_session_log_for_surface(workspace_id, "surface:92", &ctx, Some("claude"), 0)
             .expect("resolve idx=0 should not error")
             .expect("expected Some for index 0");
 
-        let r1 = session_log::resolve_session_log_for_surface(workspace_id, "surface:93", &ctx, 1)
+        let r1 = session_log::resolve_session_log_for_surface(workspace_id, "surface:93", &ctx, Some("claude"), 1)
             .expect("resolve idx=1 should not error")
             .expect("expected Some for index 1");
 
-        let r2 = session_log::resolve_session_log_for_surface(workspace_id, "surface:94", &ctx, 2)
+        let r2 = session_log::resolve_session_log_for_surface(workspace_id, "surface:94", &ctx, Some("claude"), 2)
             .expect("resolve idx=2 should not error")
             .expect("expected Some for index 2");
 
@@ -115,7 +115,7 @@ fn out_of_range_index_returns_oldest_log() {
         let ctx = WorkspaceContext::default();
 
         // Index 5 is beyond the 2 matches → should return the oldest log.
-        let r = session_log::resolve_session_log_for_surface(workspace_id, "surface:99", &ctx, 5)
+        let r = session_log::resolve_session_log_for_surface(workspace_id, "surface:99", &ctx, Some("claude"), 5)
             .expect("resolve idx=5 should not error")
             .expect("expected Some for out-of-range index");
 

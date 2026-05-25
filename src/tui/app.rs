@@ -1696,18 +1696,30 @@ impl App {
                         })
                         .unwrap_or_else(|| ws.workspace.ref_id.clone());
                     // Detect Agent vs Shell source using the two-step resolver.
-                    // Look up the surface's index_in_pane so we can distribute
-                    // session logs deterministically across surfaces that share a
-                    // workspace (same host+cwd tier) — fixes the bug where all
-                    // surfaces in a cmux workspace showed the same conversation.
+                    // Per-workspace identity for a peek: agent kind + position
+                    // among same-kind surfaces. `index_in_pane` from cmux is
+                    // per-pane (two panes can both have idx=0), so we compute
+                    // a same-agent index over the workspace's flat surface list.
                     let surface_id_for_lookup = item
                         .and_then(|i| i.surface_id.as_deref())
                         .unwrap_or("");
-                    let surface_index = ws
+                    let this_surface = ws
                         .surfaces
                         .iter()
-                        .find(|s| s.ref_id == surface_id_for_lookup)
-                        .map(|s| s.index_in_pane)
+                        .find(|s| s.ref_id == surface_id_for_lookup);
+                    let surface_kind = this_surface
+                        .map(|s| s.kind)
+                        .unwrap_or_default();
+                    let agent_label: Option<&str> = if surface_kind.is_agent() {
+                        Some(surface_kind.label())
+                    } else {
+                        None
+                    };
+                    let same_agent_index = ws
+                        .surfaces
+                        .iter()
+                        .filter(|s| s.kind == surface_kind)
+                        .position(|s| s.ref_id == surface_id_for_lookup)
                         .unwrap_or(0);
                     let peek_ctx = crate::mc_data::session_log::WorkspaceContext {
                         host: Some(hostname_short()),
@@ -1717,7 +1729,8 @@ impl App {
                         &ws.workspace.uuid,
                         surface_id_for_lookup,
                         &peek_ctx,
-                        surface_index,
+                        agent_label,
+                        same_agent_index,
                     ) {
                         Ok(Some(path)) => {
                             crate::tui::peek_view::PeekSource::Agent { session_path: path }
