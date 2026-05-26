@@ -216,7 +216,7 @@ async fn run_summarize_cli(config: &Config) -> Result<()> {
 
     eprintln!("[2/4] applying snapshot (loads trajectory.md per workspace)…");
     let t = std::time::Instant::now();
-    app.apply_refresh_snapshot(snap);
+    app.apply_refresh_snapshot(snap, config.xai_api_key.as_deref()).await;
     eprintln!("      → done ({:.1}s)", t.elapsed().as_secs_f64());
 
     eprintln!("[3/4] collecting digests + git log per workspace…");
@@ -327,8 +327,12 @@ async fn run_app(
     classifier: Option<&TypeSafeClassifier>,
 ) -> Result<AppControl> {
     let mut app = App::new();
-    app.refresh_workspaces(cmux_client, &config.histories_dir)
-        .await?;
+    app.refresh_workspaces(
+        cmux_client,
+        &config.histories_dir,
+        config.xai_api_key.as_deref(),
+    )
+    .await?;
 
     // Channel for async screen-capture results (per-workspace, parallel)
     let (screen_tx, mut screen_rx) = mpsc::unbounded_channel::<crate::tui::app::ScreenUpdate>();
@@ -961,7 +965,7 @@ async fn run_app(
                 refresh_inflight = false;
                 match refresh_result {
                     Ok(snap) => {
-                        app.apply_refresh_snapshot(snap);
+                        app.apply_refresh_snapshot(snap, config.xai_api_key.as_deref()).await;
                         // After applying, diff surface counts to detect
                         // detachments (cmux doesn't yet emit
                         // surface.opened/closed events).

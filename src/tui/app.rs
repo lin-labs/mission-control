@@ -760,9 +760,10 @@ impl App {
         &mut self,
         client: &CmuxClient,
         histories_dir: &std::path::Path,
+        xai_api_key: Option<&str>,
     ) -> Result<()> {
         let snap = gather_refresh_snapshot(client, histories_dir).await?;
-        self.apply_refresh_snapshot(snap);
+        self.apply_refresh_snapshot(snap, xai_api_key).await;
         Ok(())
     }
 
@@ -772,7 +773,11 @@ impl App {
     /// data. Per-workspace file reads (trajectory.md, notes, hook_status) are
     /// still synchronous but are bounded — ~25 workspaces × ~4 small files ≈
     /// 100 reads, which is ~tens of ms total on a warm cache.
-    pub fn apply_refresh_snapshot(&mut self, snap: RefreshSnapshot) {
+    pub async fn apply_refresh_snapshot(
+        &mut self,
+        snap: RefreshSnapshot,
+        xai_api_key: Option<&str>,
+    ) {
         let RefreshSnapshot {
             workspaces,
             surfaces_map,
@@ -1128,20 +1133,67 @@ impl App {
                 .iter()
                 .any(|i| !i.text.trim().is_empty()
                     && !crate::mc_data::goals_json::has_id_prefix(&i.text));
-            // Generate a prefix lazily: the workspace earns one as soon as it
-            // has at least one non-empty goal row. Deterministic for now;
-            // xAI-driven nicer codes are a follow-up.
+            // Generate a prefix exactly ONCE per workspace — at the moment
+            // the workspace earns its first non-blank goal row. The picked
+            // value is persisted in goals.json and never regenerated on
+            // subsequent mc launches, even if xAI would now pick something
+            // nicer. (Renumbering an existing ID set on every restart would
+            // be the wrong UX — "MSN-3 is broken" must mean the same thing
+            // tomorrow as today.)
+            //
+            // Order of preference at the one-shot decision point:
+            //   1. xAI Grok if XAI_API_KEY is set (one-shot, ~1–5s call with
+            //      timeout). Gives nicer codes like MSC instead of MSN.
+            //   2. Deterministic fallback if xAI is unavailable or its two
+            //      retries fail. Always-on, instant.
             let needs_prefix = goals.prefix.is_none()
                 && goals_section_existing
                     .iter()
                     .any(|i| !i.text.trim().is_empty());
             if needs_prefix {
-                let derived = crate::llm::xai::deterministic_prefix(
-                    &ws_state.workspace.name,
-                    &used_prefixes_this_pass,
-                );
-                goals.prefix = Some(derived.clone());
-                used_prefixes_this_pass.push(derived);
+                let workspace_name = ws_state.workspace.name.clone();
+                let picked: String = match xai_api_key {
+                    Some(key) => {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            crate::llm::xai::generate_workspace_prefix(
+                                key,
+                                &workspace_name,
+                                &used_prefixes_this_pass,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Ok(p)) => p,
+                            Ok(Err(e)) => {
+                                eprintln!(
+                                    "xAI prefix gen failed for {}: {e:#}; using deterministic.",
+                                    workspace_name
+                                );
+                                crate::llm::xai::deterministic_prefix(
+                                    &workspace_name,
+                                    &used_prefixes_this_pass,
+                                )
+                            }
+                            Err(_) => {
+                                eprintln!(
+                                    "xAI prefix gen timed out for {}; using deterministic.",
+                                    workspace_name
+                                );
+                                crate::llm::xai::deterministic_prefix(
+                                    &workspace_name,
+                                    &used_prefixes_this_pass,
+                                )
+                            }
+                        }
+                    }
+                    None => crate::llm::xai::deterministic_prefix(
+                        &workspace_name,
+                        &used_prefixes_this_pass,
+                    ),
+                };
+                goals.prefix = Some(picked.clone());
+                used_prefixes_this_pass.push(picked);
             }
             let goals_need_rebuild = !goals.goals.is_empty()
                 || any_existing_badge
