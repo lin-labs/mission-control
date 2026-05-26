@@ -202,17 +202,54 @@ async fn run_summarize_cli(config: &Config) -> Result<()> {
     // build a transient App rather than reimplementing digest assembly —
     // this keeps the CLI path bit-for-bit identical to the TUI command.
     let mut app = App::new();
+    eprintln!("[1/4] gathering cmux workspace list + session logs…");
+    let t = std::time::Instant::now();
     let snap = crate::tui::app::gather_refresh_snapshot(&cmux_client, &config.histories_dir)
         .await
         .context("gather refresh snapshot")?;
+    eprintln!(
+        "      → {} workspace(s), {} session log(s) ({:.1}s)",
+        snap.workspaces.len(),
+        snap.sessions_by_ws_id.len(),
+        t.elapsed().as_secs_f64()
+    );
+
+    eprintln!("[2/4] applying snapshot (loads trajectory.md per workspace)…");
+    let t = std::time::Instant::now();
     app.apply_refresh_snapshot(snap);
+    eprintln!("      → done ({:.1}s)", t.elapsed().as_secs_f64());
 
-    let digests = commands::summarize::collect_digests(&app);
-    eprintln!("mc summarize: gathered {} workspace digest(s)", digests.len());
+    eprintln!("[3/4] collecting digests + git log per workspace…");
+    let t = std::time::Instant::now();
+    let mut digests = commands::summarize::collect_digests(&app);
+    commands::summarize::gather_commit_stats(&mut digests).await;
+    let stats = commands::summarize::SummaryStats::from_digests(&digests);
+    eprintln!(
+        "      → {} workspaces · {} surfaces ({} agent) · {} turns · ~{} tokens · {} commits 24h ({:.1}s)",
+        stats.workspaces,
+        stats.surfaces,
+        stats.agent_surfaces,
+        stats.turns,
+        stats.token_estimate,
+        stats.commits_24h,
+        t.elapsed().as_secs_f64()
+    );
+    for d in &digests {
+        let commits = d.commits_24h.as_ref().map(|c| c.count).unwrap_or(0);
+        eprintln!(
+            "        · {} ({}) — {} surfaces, {} turns, {} open goals, {} commits 24h",
+            d.name, d.status_label, d.num_surfaces, d.turn_count, d.open_goals.len(), commits
+        );
+    }
 
+    eprintln!("[4/4] calling LLM (codex)… this can take 1–5 minutes for a wide snapshot");
+    let t = std::time::Instant::now();
     let result = commands::summarize::run(digests, summarizer).await;
+    eprintln!("      → LLM done ({:.1}s)", t.elapsed().as_secs_f64());
+
     match result {
         CommandResult::SummarizeDone(path) => {
+            eprintln!("done: {}", path.display());
             println!("{}", path.display());
             Ok(())
         }
@@ -347,7 +384,7 @@ async fn run_app(
     )>(8);
 
     // Channel for `:command` results (e.g. :summarize completing).
-    let (command_tx, mut command_rx) = mpsc::channel::<crate::commands::CommandResult>(8);
+    let (_command_tx, mut command_rx) = mpsc::channel::<crate::commands::CommandResult>(8);
 
     // Channel for refresh-snapshot results. The refresh tick spawns a
     // background task that gathers cmux state + parses session logs, then
@@ -475,31 +512,15 @@ async fn run_app(
                                         let cmd = buffer.split_whitespace().next().unwrap_or("");
                                         match cmd {
                                             "summarize" => {
-                                                // Reject if another summarize is in flight.
-                                                let already_running = matches!(
-                                                    cl.status,
-                                                    Some(StatusLine::Running(_))
-                                                );
-                                                if already_running {
-                                                    cl.status = Some(StatusLine::Err(
-                                                        "summarize already running".into(),
-                                                    ));
-                                                } else {
-                                                    cl.status = Some(StatusLine::Running(
-                                                        "summarize…".into(),
-                                                    ));
-                                                    let digests = crate::commands::summarize::collect_digests(&app);
-                                                    let summarizer_opt = summarizer.clone();
-                                                    let tx = command_tx.clone();
-                                                    tokio::spawn(async move {
-                                                        let res = crate::commands::summarize::run(
-                                                            digests,
-                                                            summarizer_opt,
-                                                        )
-                                                        .await;
-                                                        let _ = tx.send(res).await;
-                                                    });
-                                                }
+                                                // Moved to the CLI — `mc summarize` from a
+                                                // shell. The TUI path was a non-primary
+                                                // interface and blocked the LLM call inside
+                                                // the event loop; the headless command
+                                                // streams progress and is the canonical
+                                                // surface now.
+                                                cl.status = Some(StatusLine::Err(
+                                                    "moved to CLI — run `mc summarize` from a shell".into(),
+                                                ));
                                             }
                                             other => {
                                                 cl.status = Some(StatusLine::Err(format!(

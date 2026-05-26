@@ -50,12 +50,15 @@ pub enum Command {
         #[arg(long)]
         session_file: Option<PathBuf>,
     },
-    /// One-shot cross-workspace summary, same as `:summarize` in the TUI.
+    /// One-shot cross-workspace daily summary.
     ///
-    /// Builds digests for every visible cmux workspace, asks the configured
-    /// summarizer (codex by default) for a single report, and writes it to
-    /// `~obsAgents/mc-workspaces-summaries/YYYY-MM-DD-HH-summary.md`. The
-    /// resulting path is printed to stdout on success.
+    /// Builds digests for every visible cmux workspace (status, surfaces,
+    /// trajectory.md Mission + Goals, recent commits), asks the configured
+    /// summarizer (codex by default) for a qualitative report, and writes
+    /// the result to
+    /// `~obsAgents/mc-workspaces-summaries/YYYY-MM-DD-HH-summary.md`.
+    /// The resulting path is printed to stdout on success; progress logs
+    /// stream to stderr.
     Summarize,
 }
 
