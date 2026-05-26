@@ -158,6 +158,65 @@ async fn main() -> Result<()> {
             surface_id,
             session_file,
         }) => cli::bind::run(&surface_id, session_file.as_deref()),
+        Some(config::Command::Summarize) => run_summarize_cli(&cli.tui).await,
+    }
+}
+
+/// Headless `:summarize` — same end state as the TUI's `:summarize` command
+/// but invoked from `mc summarize` with no terminal. Writes the report to
+/// `~obsAgents/mc-workspaces-summaries/YYYY-MM-DD-HH-summary.md` and prints
+/// the resulting path on stdout.
+async fn run_summarize_cli(config: &Config) -> Result<()> {
+    use crate::commands::{self, CommandResult};
+    use crate::llm::codex::CodexSummarizer;
+    use crate::llm::openai::OpenAISummarizer;
+    use anyhow::{Context, anyhow};
+
+    let cmux_client = CmuxClient::new(config.cmux_bin.clone(), config.cmux_socket.clone());
+
+    // Same picker as the TUI: Codex first (local auth, no API key), OpenAI
+    // as a fallback if explicitly configured.
+    let summarizer: Option<Arc<dyn Summarizer>> = if config.use_codex {
+        Some(Arc::new(CodexSummarizer::new(
+            config.codex_bin.clone(),
+            crate::config::SUMMARIZE_PROMPT.to_string(),
+            None,
+        )) as Arc<dyn Summarizer>)
+    } else {
+        config.openai_api_key.as_ref().map(|key| {
+            Arc::new(OpenAISummarizer::new(
+                key.clone(),
+                config.model.clone(),
+                crate::config::SUMMARIZE_PROMPT.to_string(),
+            )) as Arc<dyn Summarizer>
+        })
+    };
+
+    if summarizer.is_none() {
+        return Err(anyhow!(
+            "no LLM configured: set OPENAI_API_KEY or keep --use-codex true with codex installed"
+        ));
+    }
+
+    // Refresh workspace state from disk + cmux, then collect digests. We
+    // build a transient App rather than reimplementing digest assembly —
+    // this keeps the CLI path bit-for-bit identical to the TUI command.
+    let mut app = App::new();
+    let snap = crate::tui::app::gather_refresh_snapshot(&cmux_client, &config.histories_dir)
+        .await
+        .context("gather refresh snapshot")?;
+    app.apply_refresh_snapshot(snap);
+
+    let digests = commands::summarize::collect_digests(&app);
+    eprintln!("mc summarize: gathered {} workspace digest(s)", digests.len());
+
+    let result = commands::summarize::run(digests, summarizer).await;
+    match result {
+        CommandResult::SummarizeDone(path) => {
+            println!("{}", path.display());
+            Ok(())
+        }
+        CommandResult::Err(msg) => Err(anyhow!(msg)),
     }
 }
 

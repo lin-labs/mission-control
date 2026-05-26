@@ -50,6 +50,13 @@ pub enum Command {
         #[arg(long)]
         session_file: Option<PathBuf>,
     },
+    /// One-shot cross-workspace summary, same as `:summarize` in the TUI.
+    ///
+    /// Builds digests for every visible cmux workspace, asks the configured
+    /// summarizer (codex by default) for a single report, and writes it to
+    /// `~obsAgents/mc-workspaces-summaries/YYYY-MM-DD-HH-summary.md`. The
+    /// resulting path is printed to stdout on success.
+    Summarize,
 }
 
 /// Configuration for the TUI (all existing flags live here).
