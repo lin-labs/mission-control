@@ -107,6 +107,7 @@ mod tests {
 
     fn mk_entry(text: &str, sref: &str, kind: SurfaceKind) -> GoalEntry {
         GoalEntry {
+            id: None,
             text: text.to_string(),
             text_norm: crate::mc_data::goals_json::normalize_text(text),
             assigned_surface_ref: sref.to_string(),

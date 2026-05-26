@@ -5,6 +5,7 @@ pub mod openai;
 pub mod surface_summary;
 pub mod trajectory_regen;
 pub mod typesafe;
+pub mod xai;
 
 use anyhow::Result;
 use async_trait::async_trait;

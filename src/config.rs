@@ -97,6 +97,12 @@ pub struct TuiConfig {
     #[arg(long, env = "TYPESAFE_API_KEY", hide_env_values = true)]
     pub typesafe_api_key: Option<String>,
 
+    /// xAI API key (or set XAI_API_KEY env var). Used for short one-shot
+    /// generations like workspace goal-prefix codes (e.g. "MSC" for
+    /// `mission-control`). Falls back to a deterministic algorithm when absent.
+    #[arg(long, env = "XAI_API_KEY", hide_env_values = true)]
+    pub xai_api_key: Option<String>,
+
     /// Codex CLI binary path (used for summarization via `codex exec`).
     /// Defaults to "codex" — looked up on PATH.
     #[arg(long, default_value = "codex")]

@@ -41,6 +41,7 @@ fn main() {
     // Build a goals.json with one assignment per surface.
     let mut goals = GoalsFile::default();
     goals.goals.push(GoalEntry {
+        id: None,
         text: "Wire up T3 rendering".into(),
         text_norm: normalize_text("Wire up T3 rendering"),
         assigned_surface_ref: "surface:11".into(),
@@ -49,6 +50,7 @@ fn main() {
         completed_at: None,
     });
     goals.goals.push(GoalEntry {
+        id: None,
         text: "Investigate macOS hotkey regression".into(),
         text_norm: normalize_text("Investigate macOS hotkey regression"),
         assigned_surface_ref: "surface:22".into(),

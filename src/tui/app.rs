@@ -1034,6 +1034,10 @@ impl App {
         // while the user is in the middle of an unsaved edit. The peek case
         // matters because peek's screen-poll already mutates state at 1Hz and
         // we don't want to also rewrite trajectory.md under it.
+        // Track prefixes assigned earlier in this same refresh pass so two
+        // workspaces processed back-to-back don't both pick the same code
+        // (e.g. "MSC" for two repos that look alike).
+        let mut used_prefixes_this_pass: Vec<String> = Vec::new();
         for ws_state in self.workspaces.iter_mut() {
             if ws_state
                 .edit_state
@@ -1048,14 +1052,19 @@ impl App {
                 continue;
             };
 
-            // Load goals.json once for this workspace so we can decorate both
-            // surface rows (with `← goal:<short>` badges) and Goals & Progress
-            // rows (with `→ <glyph> <surface_ref>` badges). Missing file is
-            // not an error — `GoalsFile::load` returns the empty default and
-            // the badge helpers degrade to no-ops.
-            let goals = crate::mc_data::goals_json::GoalsFile::load(
+            // Load goals.json. Mutable because we may populate `prefix` /
+            // bump `next_seq` while assigning IDs to goal rows below.
+            let mut goals = crate::mc_data::goals_json::GoalsFile::load(
                 &ws_state.workspace.uuid,
             );
+            // Carry forward this workspace's prefix into the per-pass used
+            // list (and stash it for later prefix-assignment, which still
+            // needs to see the workspace's OWN prefix).
+            if let Some(ref existing) = goals.prefix {
+                if !used_prefixes_this_pass.iter().any(|p| p == existing) {
+                    used_prefixes_this_pass.push(existing.clone());
+                }
+            }
 
             // Build the new item list from the surfaces vec.
             // Each surface item uses the workspace ref_id as surface_id because
@@ -1103,12 +1112,11 @@ impl App {
                     .zip(surface_items.iter())
                     .all(|(a, b)| a.text == b.text && a.surface_id == b.surface_id);
 
-            // Re-decorate Goals & Progress rows with `→ <glyph> <ref>` badges.
-            // Strip any previously-applied badge first so the result is
-            // idempotent across refresh ticks even after an assignment is
-            // cleared. Skip this entire pass when goals.json is empty *and*
-            // no row currently carries a badge — preserves the "workspace
-            // with no goals.json renders unchanged" contract.
+            // Re-decorate Goals & Progress rows with `→ <glyph> <ref>` badges
+            // and `[<id>] ` prefixes. Strip any previously-applied badge AND
+            // `[<id>] ` prefix first so the rebuild is idempotent. Skip this
+            // entire pass when there's nothing to do — preserves the
+            // "workspace with no goals.json renders unchanged" contract.
             let goals_section_existing = doc
                 .section(crate::mc_data::trajectory::SECTION_GOALS)
                 .map(|s| s.items.clone())
@@ -1116,17 +1124,57 @@ impl App {
             let any_existing_badge = goals_section_existing
                 .iter()
                 .any(|i| i.text.contains("   → "));
-            let goals_need_rebuild = !goals.goals.is_empty() || any_existing_badge;
+            let any_missing_id = goals_section_existing
+                .iter()
+                .any(|i| !i.text.trim().is_empty()
+                    && !crate::mc_data::goals_json::has_id_prefix(&i.text));
+            // Generate a prefix lazily: the workspace earns one as soon as it
+            // has at least one non-empty goal row. Deterministic for now;
+            // xAI-driven nicer codes are a follow-up.
+            let needs_prefix = goals.prefix.is_none()
+                && goals_section_existing
+                    .iter()
+                    .any(|i| !i.text.trim().is_empty());
+            if needs_prefix {
+                let derived = crate::llm::xai::deterministic_prefix(
+                    &ws_state.workspace.name,
+                    &used_prefixes_this_pass,
+                );
+                goals.prefix = Some(derived.clone());
+                used_prefixes_this_pass.push(derived);
+            }
+            let goals_need_rebuild = !goals.goals.is_empty()
+                || any_existing_badge
+                || (goals.prefix.is_some() && any_missing_id);
+            let mut goals_mutated = needs_prefix;
 
             let (goals_unchanged, goals_items_opt) = if goals_need_rebuild {
                 let rebuilt: Vec<crate::mc_data::trajectory::Item> = goals_section_existing
                     .iter()
                     .map(|i| {
-                        let base =
-                            crate::mc_data::surface_render::strip_badge(&i.text).to_string();
-                        let mut text = base.clone();
+                        // Layered strip: first the trailing `→` badge, then
+                        // the leading `[<ID>] ` prefix. Both are idempotent.
+                        let no_badge =
+                            crate::mc_data::surface_render::strip_badge(&i.text);
+                        let (raw, existing_id) =
+                            crate::mc_data::goals_json::strip_id_prefix(no_badge);
+                        // Skip ID assignment for blank rows (placeholders).
+                        let id_to_use: Option<String> = if raw.trim().is_empty() {
+                            None
+                        } else if let Some(eid) = existing_id {
+                            Some(eid.to_string())
+                        } else if goals.prefix.is_some() {
+                            goals_mutated = true;
+                            goals.allocate_id()
+                        } else {
+                            None
+                        };
+                        let mut text = match &id_to_use {
+                            Some(id) => format!("[{}] {}", id, raw),
+                            None => raw.to_string(),
+                        };
                         if let Some(badge) =
-                            crate::mc_data::surface_render::format_goal_badge(&goals, &base)
+                            crate::mc_data::surface_render::format_goal_badge(&goals, raw)
                         {
                             text.push_str(&badge);
                         }
@@ -1147,6 +1195,16 @@ impl App {
             } else {
                 (true, None)
             };
+
+            // Persist goals.json if we set a prefix or allocated any IDs.
+            if goals_mutated {
+                if let Err(e) = goals.save(&ws_state.workspace.uuid) {
+                    eprintln!(
+                        "goals.json save ({}): {e:?}",
+                        ws_state.workspace.uuid
+                    );
+                }
+            }
 
             if surfaces_unchanged && goals_unchanged {
                 continue;

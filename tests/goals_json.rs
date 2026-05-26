@@ -182,6 +182,8 @@ fn save_stamps_version_one_even_if_struct_has_zero() {
         let uuid = "ver-stamp-uuid";
         let f = GoalsFile {
             version: 0,
+            prefix: None,
+            next_seq: 1,
             goals: vec![],
         };
         f.save(uuid).expect("save");
