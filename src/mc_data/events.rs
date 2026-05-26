@@ -72,6 +72,9 @@ impl Event {
         self
     }
 
+    // Exercised by tests/mc_data_events.rs against the lib target; the bin
+    // path doesn't currently set user_explanation directly.
+    #[allow(dead_code)]
     pub fn with_explanation(mut self, s: impl Into<String>) -> Self {
         self.user_explanation = Some(s.into());
         self

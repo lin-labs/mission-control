@@ -3,7 +3,7 @@
 //! The active state lives in `App::input_mode`. This module owns:
 //!  - `InputMode` (Normal vs Command)
 //!  - `CommandLine` (buffer + cursor + status)
-//!  - `StatusLine` (Running / Ok / Err)
+//!  - `StatusLine` (Ok / Err)
 //!  - the editing primitives the event loop calls into
 
 use crate::commands::{longest_common_prefix, matches};
@@ -12,12 +12,6 @@ use crate::commands::{longest_common_prefix, matches};
 pub enum InputMode {
     Normal,
     Command(CommandLine),
-}
-
-impl InputMode {
-    pub fn is_command(&self) -> bool {
-        matches!(self, InputMode::Command(_))
-    }
 }
 
 impl Default for InputMode {
@@ -38,7 +32,6 @@ pub struct CommandLine {
 
 #[derive(Debug, Clone)]
 pub enum StatusLine {
-    Running(String),
     Ok(String),
     Err(String),
 }

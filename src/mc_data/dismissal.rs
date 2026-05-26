@@ -5,8 +5,10 @@ use std::fs;
 use std::path::PathBuf;
 
 pub struct DismissalArtifacts {
-    pub local_archive: PathBuf,          // .archived/<date>-<name>/
-    pub obsidian_record: PathBuf,        // ~obsAgents/mc-workspaces/<date>-<name>.md
+    pub local_archive: PathBuf,   // .archived/<date>-<name>/
+    pub obsidian_record: PathBuf, // ~obsAgents/mc-workspaces/<date>-<name>.md
+    // Asserted by tests/dismissal.rs against the lib target; the bin doesn't read it.
+    #[allow(dead_code)]
     pub proposals_file: Option<PathBuf>, // ~obsAgents/Projects/<project>/prompts/proposals/...
 }
 

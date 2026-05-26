@@ -60,13 +60,6 @@ impl Default for RegenSchedulerState {
     }
 }
 
-/// Per-workspace state for shell surface summarization.
-#[derive(Debug, Clone, Default)]
-pub struct SurfaceSummaryState {
-    /// Number of new log lines accumulated since the last summary call.
-    pub lines_since_last_summary: u32,
-}
-
 /// Per-workspace dismissal tracking state.
 #[derive(Debug, Clone)]
 pub struct DismissalState {
@@ -1882,9 +1875,9 @@ impl App {
                         .unwrap_or_else(|| ws.workspace.ref_id.clone());
                     // Detect Agent vs Shell source using the two-step resolver.
                     // Per-workspace identity for a peek: agent kind + position
-                    // among same-kind surfaces. `index_in_pane` from cmux is
-                    // per-pane (two panes can both have idx=0), so we compute
-                    // a same-agent index over the workspace's flat surface list.
+                    // among same-kind surfaces over the workspace's flat surface
+                    // list (cmux's `index_in_pane` is per-pane so two panes can
+                    // both have idx=0; we don't use it here).
                     let surface_id_for_lookup = item
                         .and_then(|i| i.surface_id.as_deref())
                         .unwrap_or("");
@@ -2679,7 +2672,6 @@ workspace: test-ws
                 ref_id: "workspace:3".to_string(),
                 uuid: "test-uuid-1".to_string(),
                 name: "test-ws".to_string(),
-                selected: false,
                 description: None,
                 current_directory: None,
                 custom_color: None,

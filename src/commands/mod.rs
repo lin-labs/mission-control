@@ -8,13 +8,9 @@ pub mod summarize;
 /// A command the user can invoke from the `:command` bar.
 pub struct CommandSpec {
     pub name: &'static str,
-    pub help: &'static str,
 }
 
-pub const COMMANDS: &[CommandSpec] = &[CommandSpec {
-    name: "summarize",
-    help: "snapshot all workspaces to obsidian",
-}];
+pub const COMMANDS: &[CommandSpec] = &[CommandSpec { name: "summarize" }];
 
 /// All command names with `prefix` as a prefix (strict prefix, includes exact match).
 /// Returns names sorted alphabetically for stable UI ordering.

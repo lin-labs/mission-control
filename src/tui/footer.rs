@@ -91,12 +91,6 @@ pub fn render_command_bar(f: &mut Frame, area: Rect, cl: &CommandLine) {
     if let Some(ref status) = cl.status {
         spans.push(Span::raw("    "));
         match status {
-            StatusLine::Running(msg) => {
-                spans.push(Span::styled(
-                    msg.clone(),
-                    Style::default().fg(Color::Yellow),
-                ));
-            }
             StatusLine::Ok(msg) => {
                 spans.push(Span::styled(
                     format!("✓ {}", msg),

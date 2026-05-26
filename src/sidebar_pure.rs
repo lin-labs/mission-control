@@ -16,6 +16,9 @@ use ratatui::{
 /// - The result is indented by 2 spaces.
 /// - If the text (after indent) would exceed `sidebar_inner_width`, it is truncated with `…`.
 /// - Returns `None` when `description` is `None` or blank after trimming.
+// Exercised by tests/tui_sidebar_render.rs and module-local tests against the
+// lib target; the sidebar render path in the bin doesn't call it yet.
+#[allow(dead_code)]
 pub fn description_subtitle_line(
     description: Option<&str>,
     sidebar_inner_width: u16,

@@ -374,21 +374,18 @@ mod tests {
                 title: "claude".into(),
                 ref_id: "surface:92".into(),
                 tty: Some("ttys001".into()),
-                index_in_pane: 0,
                 kind: SurfaceKind::Claude,
             },
             SurfaceInfo {
                 title: "codex".into(),
                 ref_id: "surface:93".into(),
                 tty: Some("ttys002".into()),
-                index_in_pane: 1,
                 kind: SurfaceKind::Codex,
             },
             SurfaceInfo {
                 title: "shell".into(),
                 ref_id: "surface:94".into(),
                 tty: Some("ttys003".into()),
-                index_in_pane: 2,
                 kind: SurfaceKind::Shell,
             },
             // Browser-style surface (no tty) — should be filtered out.
@@ -396,7 +393,6 @@ mod tests {
                 title: "https://example.com".into(),
                 ref_id: "surface:95".into(),
                 tty: None,
-                index_in_pane: 3,
                 kind: SurfaceKind::Unknown,
             },
         ]

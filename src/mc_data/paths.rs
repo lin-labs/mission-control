@@ -51,6 +51,9 @@ pub fn display_symlink(unique_name: &str) -> PathBuf {
     data_root().join(unique_name)
 }
 
+// Asserted by tests/mc_data_paths.rs against the lib target; the bin reaches
+// archive paths via dismissal.rs without calling this helper directly.
+#[allow(dead_code)]
 pub fn archive_dir(date: &str, unique_name: &str) -> PathBuf {
     archive_root().join(format!("{date}-{unique_name}"))
 }

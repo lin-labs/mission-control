@@ -64,6 +64,8 @@ pub fn read_project(uuid: &str) -> Result<String> {
 
 /// Rename a workspace's display name. Moves the symlink only; the data dir
 /// (keyed by UUID) does not move. Rewrites the `name` file.
+// Exercised by tests/mc_data_workspace.rs; not yet wired into the TUI.
+#[allow(dead_code)]
 pub fn rename_workspace(uuid: &str, new_name: &str) -> Result<()> {
     let old_name = read_display_name(uuid)?;
     if old_name == new_name {

@@ -46,8 +46,6 @@ pub enum EditAction {
         before: String,
         after: String,
     },
-    /// A new item was inserted.
-    Add { section: String, after: String },
     /// An item was deleted.
     Delete { section: String, before: String },
     /// A checkbox was toggled on.
@@ -556,11 +554,6 @@ fn action_to_event(action: &EditAction, snapshot: u32) -> Event {
             .with_before(before.as_str())
             .with_after(after.as_str())
             .with_snapshot(snapshot),
-        EditAction::Add { section, after } => {
-            Event::new_now(Source::User, Kind::Add, section.as_str())
-                .with_after(after.as_str())
-                .with_snapshot(snapshot)
-        }
         EditAction::Delete { section, before } => {
             Event::new_now(Source::User, Kind::Delete, section.as_str())
                 .with_before(before.as_str())

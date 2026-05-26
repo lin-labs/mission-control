@@ -176,7 +176,6 @@ mod tests {
                 ref_id: "workspace:1".to_string(),
                 uuid: "workspace-1".to_string(),
                 name: name.to_string(),
-                selected: true,
                 description: Some("short description".to_string()),
                 current_directory: None,
                 custom_color: custom_color.map(str::to_string),

@@ -8,7 +8,6 @@ use tokio::sync::mpsc;
 pub struct AgentEvent {
     pub session_id: String,
     pub workspace_id: String,
-    pub tool_name: Option<String>,
     pub event_name: String,
 }
 
@@ -28,10 +27,6 @@ struct RawEvent {
 struct RawPayload {
     #[serde(default)]
     session_id: Option<String>,
-    #[serde(default)]
-    tool_name: Option<String>,
-    #[serde(default)]
-    hook_event_name: Option<String>,
     #[serde(default)]
     phase: Option<String>,
 }
@@ -97,7 +92,6 @@ pub async fn subscribe(
         let event = AgentEvent {
             session_id,
             workspace_id,
-            tool_name: payload.tool_name,
             event_name: raw.name.unwrap_or_default(),
         };
 

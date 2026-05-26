@@ -40,9 +40,6 @@ struct TreeSurface {
     title: String,
     #[serde(default)]
     tty: Option<String>,
-    /// Zero-based index of this surface within its containing pane.
-    #[serde(default)]
-    index_in_pane: usize,
 }
 
 // ── Transient JSON types for `cmux list-workspaces --json` ────────────────────
@@ -64,8 +61,6 @@ struct WorkspaceJson {
     title: String,
     #[serde(default)]
     description: Option<String>,
-    #[serde(default)]
-    selected: bool,
     /// Current working directory of the workspace's active pane, if reported by cmux.
     #[serde(default)]
     current_directory: Option<String>,
@@ -80,7 +75,6 @@ pub struct Workspace {
     pub ref_id: String, // e.g. "workspace:2"
     pub uuid: String,   // e.g. "32E47B1E-..."
     pub name: String,   // e.g. "gmail-labs"
-    pub selected: bool,
     /// The cmux workspace description (from `cmux workspace-action set-description`).
     /// Non-empty description is used to seed the Goal section of the trajectory doc.
     #[serde(default)]
@@ -103,8 +97,6 @@ pub struct SurfaceInfo {
     /// TTY device path, e.g. `"ttys030"`. Useful as a fingerprint for future
     /// per-surface `.session-path` pointer-file injection; unused this iteration.
     pub tty: Option<String>,
-    /// Zero-based index of this surface within its pane (from `index_in_pane`).
-    pub index_in_pane: usize,
     /// Detected kind of the foreground process on this surface's tty
     /// (Claude / Codex / Shell / …). `Unknown` when `tty` is `None` or
     /// detection failed. Populated by `surface_kind::detect`.
@@ -158,7 +150,6 @@ impl CmuxClient {
                 ref_id: w.ref_id,
                 uuid: w.uuid,
                 name: w.title,
-                selected: w.selected,
                 description: w.description,
                 current_directory: w.current_directory,
                 custom_color: w.custom_color,
@@ -287,8 +278,8 @@ impl CmuxClient {
     ///
     /// Returns a map from workspace ref (e.g. `"workspace:25"`) to the ordered
     /// list of surfaces in that workspace's panes. Each `SurfaceInfo` carries
-    /// the surface's own ref_id (e.g. `"surface:92"`), tty, and index_in_pane
-    /// so peek mode can distinguish surfaces within the same workspace.
+    /// the surface's own ref_id (e.g. `"surface:92"`) and tty so peek mode can
+    /// distinguish surfaces within the same workspace.
     pub async fn get_surfaces_json(&self) -> Result<HashMap<String, Vec<SurfaceInfo>>> {
         let output = self.cmd()
             .args(["tree", "--all", "--json"])
@@ -345,7 +336,6 @@ impl CmuxClient {
                             title: s.title,
                             ref_id: s.ref_id,
                             tty: s.tty,
-                            index_in_pane: s.index_in_pane,
                             kind,
                         }
                     })

@@ -79,10 +79,6 @@ pub fn rules_path(project: &str) -> PathBuf {
     project_prompts_dir(project).join("rules.md")
 }
 
-pub fn proposals_dir(project: &str) -> PathBuf {
-    project_prompts_dir(project).join("proposals")
-}
-
 // ---------------------------------------------------------------------------
 // rule_id: stable short hash of a pattern string
 // ---------------------------------------------------------------------------
