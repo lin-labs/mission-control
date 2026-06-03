@@ -228,12 +228,14 @@ fn derive_status_label(ws: &crate::tui::app::WorkspaceState) -> String {
 }
 
 /// Resolve the directory where mc writes summary reports.
-/// Always under the iCloud-synced Obsidian Agents vault.
+/// Under the Obsidian Agents vault, reached via $OBS_AGENTS or the stable
+/// ~/agents/Obsidian symlink — never a hardcoded iCloud path.
 pub fn output_dir() -> PathBuf {
+    if let Ok(v) = std::env::var("OBS_AGENTS") {
+        return PathBuf::from(v).join("mc-workspaces-summaries");
+    }
     let home = dirs::home_dir().unwrap_or_default();
-    home.join(
-        "Library/Mobile Documents/iCloud~md~obsidian/Documents/Agents/mc-workspaces-summaries",
-    )
+    home.join("agents/Obsidian/Agents/mc-workspaces-summaries")
 }
 
 /// Compute the report path for `now`, falling back to minute-/second-suffixed
