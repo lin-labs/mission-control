@@ -83,7 +83,7 @@ fn build_prompt_contains_workspace_name() {
 
 #[test]
 fn build_prompt_includes_recent_events() {
-    let event = Event::new_now(Source::User, Kind::Check, "Goals & Progress")
+    let event = Event::new_now(Source::User, Kind::Check, "Beads")
         .with_after("deploy to prod");
 
     let inputs = RegenInputs {
@@ -191,7 +191,7 @@ fn build_prompt_splits_into_system_and_user() {
 
 #[tokio::test]
 async fn regenerate_parses_valid_trajectory_response() {
-    let valid_trajectory = "---\nworkspace: test-ws\n---\n\n## Mission\n- Build a thing\n\n## Current surfaces\n\n## Goals & Progress\n- [ ] do the work\n";
+    let valid_trajectory = "---\nworkspace: test-ws\n---\n\n## Mission\n- Build a thing\n\n## Current surfaces\n\n## Beads\n- [ ] do the work\n";
 
     let summarizer: Arc<dyn Summarizer> = Arc::new(MockSummarizer {
         response: valid_trajectory.to_string(),

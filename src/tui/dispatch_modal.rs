@@ -1,6 +1,6 @@
 //! Goal dispatch modal (T4).
 //!
-//! When the user presses Enter on a populated goal row in `## Goals & Progress`
+//! When the user presses Enter on a populated goal row in `## Beads`
 //! the modal opens at the bottom of the detail pane and offers:
 //!
 //!   - numeric shortcuts (1..=9) for the existing terminal surfaces in the
@@ -188,12 +188,12 @@ impl DispatchModal {
             .filter(|o| matches!(o, DispatchOption::Existing { .. }))
             .collect();
         match existing.get(idx) {
-            Some(DispatchOption::Existing { surface_ref, kind, .. }) => {
-                DispatchOutcome::SelectExisting {
-                    surface_ref: surface_ref.clone(),
-                    kind: *kind,
-                }
-            }
+            Some(DispatchOption::Existing {
+                surface_ref, kind, ..
+            }) => DispatchOutcome::SelectExisting {
+                surface_ref: surface_ref.clone(),
+                kind: *kind,
+            },
             _ => DispatchOutcome::Handled,
         }
     }
@@ -259,7 +259,11 @@ fn render_pick_surface_lines(modal: &DispatchModal) -> Vec<Line<'_>> {
     let mut idx: usize = 0;
     for opt in &modal.options {
         match opt {
-            DispatchOption::Existing { surface_ref, kind, label } => {
+            DispatchOption::Existing {
+                surface_ref,
+                kind,
+                label,
+            } => {
                 let glyph = kind.glyph();
                 let kind_label = kind.label();
                 let trimmed_label = truncate(label, 24);
@@ -270,8 +274,7 @@ fn render_pick_surface_lines(modal: &DispatchModal) -> Vec<Line<'_>> {
                     ),
                     Span::styled(
                         format!("{} ", glyph),
-                        Style::default()
-                            .fg(super::trajectory_view::kind_color(*kind)),
+                        Style::default().fg(super::trajectory_view::kind_color(*kind)),
                     ),
                     Span::styled(
                         format!("{:7} ", kind_label),
@@ -281,10 +284,7 @@ fn render_pick_surface_lines(modal: &DispatchModal) -> Vec<Line<'_>> {
                         format!("{:24} ", trimmed_label),
                         Style::default().fg(Color::Gray),
                     ),
-                    Span::styled(
-                        surface_ref.clone(),
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(surface_ref.clone(), Style::default().fg(Color::DarkGray)),
                 ]));
                 idx += 1;
             }

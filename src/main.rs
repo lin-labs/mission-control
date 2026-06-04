@@ -216,7 +216,8 @@ async fn run_summarize_cli(config: &Config) -> Result<()> {
 
     eprintln!("[2/4] applying snapshot (loads trajectory.md per workspace)…");
     let t = std::time::Instant::now();
-    app.apply_refresh_snapshot(snap, config.xai_api_key.as_deref()).await;
+    app.apply_refresh_snapshot(snap, config.xai_api_key.as_deref())
+        .await;
     eprintln!("      → done ({:.1}s)", t.elapsed().as_secs_f64());
 
     eprintln!("[3/4] collecting digests + git log per workspace…");
@@ -237,8 +238,13 @@ async fn run_summarize_cli(config: &Config) -> Result<()> {
     for d in &digests {
         let commits = d.commits_24h.as_ref().map(|c| c.count).unwrap_or(0);
         eprintln!(
-            "        · {} ({}) — {} surfaces, {} turns, {} open goals, {} commits 24h",
-            d.name, d.status_label, d.num_surfaces, d.turn_count, d.open_goals.len(), commits
+            "        · {} ({}) — {} surfaces, {} turns, {} open beads, {} commits 24h",
+            d.name,
+            d.status_label,
+            d.num_surfaces,
+            d.turn_count,
+            d.open_goals.len(),
+            commits
         );
     }
 
@@ -1299,8 +1305,7 @@ fn handle_dispatch_outcome(
                         if uuid.is_empty() {
                             return;
                         }
-                        let mut goals =
-                            crate::mc_data::goals_json::GoalsFile::load(&uuid);
+                        let mut goals = crate::mc_data::goals_json::GoalsFile::load(&uuid);
                         goals.set_assignment(
                             &goal_text_owned,
                             &surface_ref_clone,
@@ -1332,11 +1337,8 @@ fn handle_dispatch_outcome(
                 .map(|ws| ws.workspace.uuid.clone())
                 .unwrap_or_default();
             tokio::spawn(async move {
-                use tokio::time::{sleep, Duration};
-                let new_ref = match cmux_new
-                    .new_surface(&workspace_ref_clone, "terminal")
-                    .await
-                {
+                use tokio::time::{Duration, sleep};
+                let new_ref = match cmux_new.new_surface(&workspace_ref_clone, "terminal").await {
                     Ok(r) => r,
                     Err(e) => {
                         eprintln!("dispatch: cmux new-surface failed: {e:?}");
@@ -1365,12 +1367,7 @@ fn handle_dispatch_outcome(
                     return;
                 }
                 let mut goals = crate::mc_data::goals_json::GoalsFile::load(&uuid);
-                goals.set_assignment(
-                    &goal_text_owned,
-                    &new_ref,
-                    kind,
-                    chrono::Utc::now(),
-                );
+                goals.set_assignment(&goal_text_owned, &new_ref, kind, chrono::Utc::now());
                 if let Err(e) = goals.save(&uuid) {
                     eprintln!("dispatch: goals.json save: {e:?}");
                 }

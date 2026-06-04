@@ -137,7 +137,7 @@ fn ensure_workspace_creates_skeleton_trajectory_on_first_run() {
         let content = std::fs::read_to_string(&traj_path).unwrap();
         assert!(content.contains("## Mission"));
         assert!(content.contains("## Current surfaces"));
-        assert!(content.contains("## Goals & Progress"));
+        assert!(content.contains("## Beads"));
     });
 }
 

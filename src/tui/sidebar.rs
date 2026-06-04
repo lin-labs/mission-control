@@ -42,10 +42,9 @@ pub fn render_sidebar(
                 .map(|h| format!(" [{}]", h))
                 .unwrap_or_default();
 
-            let accent_color = crate::sidebar_pure::workspace_accent_color(
-                ws.workspace.custom_color.as_deref(),
-            )
-            .unwrap_or(Color::DarkGray);
+            let accent_color =
+                crate::sidebar_pure::workspace_accent_color(ws.workspace.custom_color.as_deref())
+                    .unwrap_or(Color::DarkGray);
 
             // Truncate name to fit between a leading 1-space pad, leader, and
             // host_badge inside the body.
@@ -190,6 +189,7 @@ mod tests {
             classification: None,
             loading: false,
             summary: None,
+            beads: None,
             summarizing: false,
             trajectory: None,
             edit_state: None,

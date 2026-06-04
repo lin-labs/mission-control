@@ -4,23 +4,27 @@ use std::path::Path;
 
 pub const SECTION_MISSION: &str = "Mission";
 pub const SECTION_CURRENT_SURFACES: &str = "Current surfaces";
-pub const SECTION_GOALS: &str = "Goals & Progress";
+pub const SECTION_BEADS: &str = "Beads";
+/// Historical name kept as an API alias. The third trajectory section now
+/// renders Beads issues, replacing the old hand-maintained goal/progress list.
+pub const SECTION_GOALS: &str = SECTION_BEADS;
 
 /// Legacy section names accepted by the parser for back-compat. When we
 /// encounter these on read, they are normalized to the canonical new names so
-/// the rest of the codebase only sees `SECTION_MISSION` / `SECTION_GOALS`.
+/// the rest of the codebase only sees `SECTION_MISSION` / `SECTION_BEADS`.
 const LEGACY_SECTION_GOAL: &str = "Goal";
+const LEGACY_SECTION_GOALS_PROGRESS: &str = "Goals & Progress";
 const LEGACY_SECTION_TASKS: &str = "Tasks & Progress";
 
-pub const SECTIONS_IN_ORDER: &[&str] =
-    &[SECTION_MISSION, SECTION_CURRENT_SURFACES, SECTION_GOALS];
+pub const SECTIONS_IN_ORDER: &[&str] = &[SECTION_MISSION, SECTION_CURRENT_SURFACES, SECTION_GOALS];
 
 /// Normalize a section header from the trajectory.md to its canonical name,
 /// folding legacy headers (`Goal`, `Tasks & Progress`) onto the new taxonomy
-/// (`Mission`, `Goals & Progress`).
+/// (`Mission`, `Beads`).
 fn canonicalize_section_name(name: &str) -> String {
     match name {
         LEGACY_SECTION_GOAL => SECTION_MISSION.to_string(),
+        LEGACY_SECTION_GOALS_PROGRESS => SECTION_GOALS.to_string(),
         LEGACY_SECTION_TASKS => SECTION_GOALS.to_string(),
         other => other.to_string(),
     }

@@ -1,6 +1,6 @@
 use mission_control::mc_data::events::{self, Event, Kind, Source};
 use mission_control::mc_data::paths;
-use mission_control::mc_data::trajectory::{Item, Section, TrajectoryDoc, SECTION_GOALS};
+use mission_control::mc_data::trajectory::{Item, TrajectoryDoc, SECTION_GOALS};
 use mission_control::mc_data::user_intent::{
     UserIntent, apply_to_tasks, load_for_workspace, normalize_text,
 };

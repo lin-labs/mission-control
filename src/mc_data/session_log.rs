@@ -42,6 +42,12 @@ pub struct SessionTurn {
     pub content: String, // verbatim block content (excluding the heading line)
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConversationIntent {
+    pub overall_goal: Option<String>,
+    pub latest_ask: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Heading parser
 // ---------------------------------------------------------------------------
@@ -147,6 +153,30 @@ pub fn last_user_turn(text: &str) -> Option<String> {
         .map(|t| t.content)
 }
 
+/// Infer the durable goal and latest user ask from a full session log.
+///
+/// This intentionally stays deterministic: it extracts the first and latest
+/// user turns, prefers Codex goal `<objective>` payloads when present, normalizes
+/// whitespace, and truncates to a TUI-friendly single line.
+pub fn conversation_intent(text: &str) -> ConversationIntent {
+    let user_turns: Vec<String> = parse(text)
+        .into_iter()
+        .filter(|t| t.role == "boyan")
+        .filter_map(|t| summarize_user_turn(&t.content))
+        .collect();
+    ConversationIntent {
+        overall_goal: user_turns.first().cloned(),
+        latest_ask: user_turns.last().cloned(),
+    }
+}
+
+pub fn summarize_user_turn(text: &str) -> Option<String> {
+    if let Some(objective) = extract_between(text, "<objective>", "</objective>") {
+        return one_line_summary(objective);
+    }
+    one_line_summary(text)
+}
+
 /// Scan ~obsAgents/Sessions/*.md and return ALL matching session logs for the
 /// given workspace, using a two-tier algorithm.  Results are sorted by mtime
 /// descending (newest first).
@@ -214,18 +244,16 @@ pub fn matching_session_files_for_workspace(
             let mut tier1: Vec<&Candidate> = candidates
                 .iter()
                 .filter(|c| {
-                    let host_ok = c
-                        .fm
-                        .host
-                        .as_deref()
-                        .map(|h| hosts_match(h, ctx_host))
-                        .unwrap_or(false);
-                    let cwd_ok = c
-                        .fm
-                        .cwd
-                        .as_deref()
-                        .map(|fc| is_descendant(fc, ctx_cwd))
-                        .unwrap_or(false);
+                    let host_ok =
+                        c.fm.host
+                            .as_deref()
+                            .map(|h| hosts_match(h, ctx_host))
+                            .unwrap_or(false);
+                    let cwd_ok =
+                        c.fm.cwd
+                            .as_deref()
+                            .map(|fc| is_descendant(fc, ctx_cwd))
+                            .unwrap_or(false);
                     host_ok && cwd_ok
                 })
                 .collect();
@@ -412,4 +440,93 @@ fn cwd_is_too_shallow(cwd: &str) -> bool {
     // Depth heuristic: fewer than 3 path segments under root is too shallow
     // (e.g., `/Users`, `/Users/blin`).
     cwd_depth(trimmed) < 3
+}
+
+fn extract_between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str> {
+    let after_start = text.split_once(start)?.1;
+    Some(after_start.split_once(end)?.0)
+}
+
+fn one_line_summary(text: &str) -> Option<String> {
+    let mut cleaned = Vec::new();
+    let mut skipping_xml_block = false;
+    let mut skipping_agents_block = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if skipping_agents_block {
+            if line.contains("</INSTRUCTIONS>") {
+                skipping_agents_block = false;
+                if line
+                    .split_once("</INSTRUCTIONS>")
+                    .map(|(_, rest)| rest.trim_start().starts_with("<environment_context"))
+                    .unwrap_or(false)
+                {
+                    skipping_xml_block = true;
+                }
+            }
+            continue;
+        }
+        if line.starts_with("# AGENTS.md instructions") {
+            skipping_agents_block = true;
+            continue;
+        }
+        if line.starts_with("<codex_internal_context") || line.starts_with("<environment_context") {
+            skipping_xml_block = true;
+            continue;
+        }
+        if skipping_xml_block {
+            if line.starts_with("</codex_internal_context")
+                || line.starts_with("</environment_context")
+            {
+                skipping_xml_block = false;
+            }
+            continue;
+        }
+        if line.starts_with('<') && line.ends_with('>') {
+            continue;
+        }
+        if line.starts_with("Continuation behavior:")
+            || line.starts_with("Budget:")
+            || line.starts_with("Progress visibility:")
+            || line.starts_with("Fidelity:")
+            || line.starts_with("Completion audit:")
+            || line.starts_with("Blocked audit:")
+        {
+            break;
+        }
+        let line = line
+            .trim_start_matches(|c: char| c == '-' || c == '*' || c.is_ascii_digit() || c == '.')
+            .trim();
+        if !line.is_empty() {
+            cleaned.push(line);
+        }
+    }
+    if cleaned.is_empty() {
+        return None;
+    }
+    let compact = cleaned
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.is_empty() {
+        None
+    } else {
+        Some(truncate_chars(&compact, 110))
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in text.chars().enumerate() {
+        if idx >= max_chars {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+    }
+    out
 }

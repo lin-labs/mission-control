@@ -36,7 +36,7 @@ pub struct WorkspaceDigest {
     /// Mission section text from trajectory.md (one bullet per line, joined
     /// with `\n`). Empty when the file doesn't exist or has no Mission.
     pub mission: String,
-    /// Goals & Progress items, partitioned by checkbox state. Sourced from
+    /// Beads items, partitioned by checkbox state. Sourced from
     /// trajectory.md so they survive process restarts (unlike `last_summary`
     /// which only exists in the running TUI's in-memory state).
     pub open_goals: Vec<String>,
@@ -72,7 +72,7 @@ pub fn collect_digests(app: &App) -> Vec<WorkspaceDigest> {
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from);
 
-            // Pull Mission + Goals from trajectory.md — these are persisted
+            // Pull Mission + Beads from trajectory.md — these are persisted
             // to disk so a fresh `mc summarize` invocation still sees them
             // (unlike `ws.summary` which only exists in TUI memory).
             let (mission, open_goals, done_goals) = ws
@@ -168,9 +168,9 @@ pub async fn gather_commit_stats(digests: &mut [WorkspaceDigest]) {
     let mut handles = Vec::with_capacity(digests.len());
     for (idx, d) in digests.iter().enumerate() {
         if let Some(cwd) = d.cwd.clone() {
-            handles.push(tokio::spawn(async move {
-                (idx, commit_stats_for(&cwd).await)
-            }));
+            handles.push(tokio::spawn(
+                async move { (idx, commit_stats_for(&cwd).await) },
+            ));
         }
     }
     for h in handles {
@@ -203,11 +203,7 @@ async fn commit_stats_for(cwd: &Path) -> Option<CommitStats> {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let recent: Vec<String> = stdout
-        .lines()
-        .map(|l| l.to_string())
-        .take(5)
-        .collect();
+    let recent: Vec<String> = stdout.lines().map(|l| l.to_string()).take(5).collect();
     let count = stdout.lines().count();
     Some(CommitStats { count, recent })
 }
@@ -308,14 +304,14 @@ pub fn build_user_prompt(digests: &[WorkspaceDigest]) -> String {
             s.push_str("\n\n");
         }
         if !d.done_goals.is_empty() {
-            s.push_str("Goals done:\n");
+            s.push_str("Beads done:\n");
             for g in &d.done_goals {
                 s.push_str(&format!("- [x] {}\n", g));
             }
             s.push('\n');
         }
         if !d.open_goals.is_empty() {
-            s.push_str("Goals open:\n");
+            s.push_str("Beads open:\n");
             for g in &d.open_goals {
                 s.push_str(&format!("- [ ] {}\n", g));
             }
@@ -434,8 +430,8 @@ pub fn build_document(
             s.push_str(&format!("    agent_surfaces: {}\n", d.num_agent_surfaces));
             s.push_str(&format!("    turns: {}\n", d.turn_count));
             s.push_str(&format!("    tokens: {}\n", d.session_chars / 4));
-            s.push_str(&format!("    open_goals: {}\n", d.open_goals.len()));
-            s.push_str(&format!("    done_goals: {}\n", d.done_goals.len()));
+            s.push_str(&format!("    open_beads: {}\n", d.open_goals.len()));
+            s.push_str(&format!("    done_beads: {}\n", d.done_goals.len()));
             if let Some(ref c) = d.commits_24h {
                 s.push_str(&format!("    commits_24h: {}\n", c.count));
             }
@@ -446,10 +442,7 @@ pub fn build_document(
     // ── Statistics (deterministic, never LLM-generated) ──
     s.push_str("# Snapshot\n\n");
     s.push_str("## Statistics\n\n");
-    s.push_str(&format!(
-        "- **Workspaces**: {}\n",
-        stats.workspaces
-    ));
+    s.push_str(&format!("- **Workspaces**: {}\n", stats.workspaces));
     s.push_str(&format!(
         "- **Surfaces**: {} ({} running an agent)\n",
         stats.surfaces, stats.agent_surfaces
@@ -467,13 +460,13 @@ pub fn build_document(
     let goals_done: usize = digests.iter().map(|d| d.done_goals.len()).sum();
     let goals_open: usize = digests.iter().map(|d| d.open_goals.len()).sum();
     s.push_str(&format!(
-        "- **Goals**: {} done · {} open\n\n",
+        "- **Beads**: {} done · {} open\n\n",
         goals_done, goals_open
     ));
 
     // Per-workspace one-line stat table
     s.push_str("### Per-workspace numbers\n\n");
-    s.push_str("| workspace | status | surfaces (agent) | turns | tokens | goals done/open | commits 24h |\n");
+    s.push_str("| workspace | status | surfaces (agent) | turns | tokens | beads done/open | commits 24h |\n");
     s.push_str("|---|---|---|---|---|---|---|\n");
     for d in digests {
         let commits = d.commits_24h.as_ref().map(|c| c.count).unwrap_or(0);

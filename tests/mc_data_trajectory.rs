@@ -1,4 +1,4 @@
-use mission_control::mc_data::trajectory::{Item, Section, TrajectoryDoc, priority_of};
+use mission_control::mc_data::trajectory::{Item, TrajectoryDoc, priority_of};
 
 const SAMPLE: &str = "---
 workspace: predinvest
@@ -15,7 +15,7 @@ snapshot: 7
 - claude · mbp · working · writing CalibratedPlanStrategy tests              <!-- mc:surface:7f3a-sid -->
 - shell  · mbp · idle    · $ git log --oneline -10                            <!-- mc:surface:4d8e-sid -->
 
-## Goals & Progress
+## Beads
 - [x] sprint-01 composable foundation shipped
 - [ ] sprint-02: CalibratedPlanStrategy tests pass
 ";
@@ -34,7 +34,7 @@ fn parse_recognizes_three_sections_in_order() {
     assert_eq!(doc.sections.len(), 3);
     assert_eq!(doc.sections[0].name, "Mission");
     assert_eq!(doc.sections[1].name, "Current surfaces");
-    assert_eq!(doc.sections[2].name, "Goals & Progress");
+    assert_eq!(doc.sections[2].name, "Beads");
 }
 
 #[test]
@@ -95,7 +95,7 @@ fn parse_missing_section_returns_empty_section() {
 
 #[test]
 fn uppercase_checkbox_is_recognized_as_checked() {
-    let doc = TrajectoryDoc::parse("## Goals & Progress\n- [X] done\n").unwrap();
+    let doc = TrajectoryDoc::parse("## Beads\n- [X] done\n").unwrap();
     let item = &doc.sections[0].items[0];
     assert!(item.is_checkbox);
     assert_eq!(item.checked, Some(true));
@@ -104,12 +104,12 @@ fn uppercase_checkbox_is_recognized_as_checked() {
 
 #[test]
 fn ensure_sections_reorders_to_canonical_order() {
-    let doc_str = "## Goals & Progress\n- [x] done\n\n## Mission\n- thing\n";
+    let doc_str = "## Beads\n- [x] done\n\n## Mission\n- thing\n";
     let mut doc = TrajectoryDoc::parse(doc_str).unwrap();
     doc.ensure_sections();
     assert_eq!(doc.sections[0].name, "Mission");
     assert_eq!(doc.sections[1].name, "Current surfaces");
-    assert_eq!(doc.sections[2].name, "Goals & Progress");
+    assert_eq!(doc.sections[2].name, "Beads");
     // Items preserved through reorder.
     assert_eq!(doc.sections[0].items[0].text, "thing");
     assert_eq!(doc.sections[2].items[0].text, "done");
@@ -121,19 +121,27 @@ fn ensure_sections_reorders_to_canonical_order() {
 fn parser_accepts_legacy_goal_and_tasks_headers() {
     // Older trajectory.md files on disk still use `## Goal` / `## Tasks & Progress`.
     // The parser must canonicalize these to the new section names so the rest of
-    // the codebase only ever sees `Mission` and `Goals & Progress`.
+    // the codebase only ever sees `Mission` and `Beads`.
     let legacy = "---\nworkspace: x\n---\n\n## Goal\n- legacy mission item\n\n## Current surfaces\n\n## Tasks & Progress\n- [x] legacy done\n- [ ] legacy todo\n";
     let doc = TrajectoryDoc::parse(legacy).unwrap();
     assert_eq!(doc.sections.len(), 3);
     assert_eq!(doc.sections[0].name, "Mission",
         "legacy `## Goal` must be canonicalized to `Mission`");
-    assert_eq!(doc.sections[2].name, "Goals & Progress",
-        "legacy `## Tasks & Progress` must be canonicalized to `Goals & Progress`");
+    assert_eq!(doc.sections[2].name, "Beads",
+        "legacy `## Tasks & Progress` must be canonicalized to `Beads`");
     // Items survive the rename.
     assert_eq!(doc.section("Mission").unwrap().items[0].text, "legacy mission item");
-    let goals = doc.section("Goals & Progress").unwrap();
+    let goals = doc.section("Beads").unwrap();
     assert_eq!(goals.items.len(), 2);
     assert!(goals.items[0].is_checkbox && goals.items[0].checked == Some(true));
+}
+
+#[test]
+fn parser_accepts_legacy_goals_progress_header() {
+    let legacy = "---\nworkspace: x\n---\n\n## Mission\n- m\n\n## Current surfaces\n\n## Goals & Progress\n- [ ] old goal row\n";
+    let doc = TrajectoryDoc::parse(legacy).unwrap();
+    assert_eq!(doc.sections[2].name, "Beads");
+    assert_eq!(doc.section("Beads").unwrap().items[0].text, "old goal row");
 }
 
 #[test]
@@ -144,8 +152,8 @@ fn writer_emits_only_new_headers_after_loading_legacy() {
     let doc = TrajectoryDoc::parse(legacy).unwrap();
     let out = doc.to_markdown();
     assert!(out.contains("## Mission"), "writer must emit `## Mission`: {out}");
-    assert!(out.contains("## Goals & Progress"),
-        "writer must emit `## Goals & Progress`: {out}");
+    assert!(out.contains("## Beads"),
+        "writer must emit `## Beads`: {out}");
     // The literal old headers (as standalone section starters) must be gone.
     assert!(!out.contains("## Goal\n"),
         "writer must not emit `## Goal` after migration: {out}");
@@ -156,12 +164,12 @@ fn writer_emits_only_new_headers_after_loading_legacy() {
 #[test]
 fn parser_round_trips_already_new_headers_unchanged() {
     // Sanity: docs already using the new taxonomy round-trip identically.
-    let modern = "---\nworkspace: x\n---\n\n## Mission\n- m1\n\n## Current surfaces\n\n## Goals & Progress\n- [ ] g1\n";
+    let modern = "---\nworkspace: x\n---\n\n## Mission\n- m1\n\n## Current surfaces\n\n## Beads\n- [ ] g1\n";
     let doc = TrajectoryDoc::parse(modern).unwrap();
     assert_eq!(doc.sections[0].name, "Mission");
-    assert_eq!(doc.sections[2].name, "Goals & Progress");
+    assert_eq!(doc.sections[2].name, "Beads");
     let out = doc.to_markdown();
-    assert!(out.contains("## Mission") && out.contains("## Goals & Progress"));
+    assert!(out.contains("## Mission") && out.contains("## Beads"));
 }
 
 #[test]
@@ -200,8 +208,8 @@ fn write_then_parse_round_trips() {
     assert_eq!(orig_surface.surface_id, rep_surface.surface_id);
     assert_eq!(orig_surface.text, rep_surface.text);
 
-    let original_task = &doc.section("Goals & Progress").unwrap().items[0];
-    let rep_task = &reparsed.section("Goals & Progress").unwrap().items[0];
+    let original_task = &doc.section("Beads").unwrap().items[0];
+    let rep_task = &reparsed.section("Beads").unwrap().items[0];
     assert_eq!(original_task.text, rep_task.text);
     assert_eq!(original_task.checked, rep_task.checked);
 }
@@ -238,7 +246,7 @@ fn skeleton_has_all_three_canonical_sections_with_frontmatter() {
     assert_eq!(doc.frontmatter.snapshot, Some(0));
     assert!(doc.section("Mission").is_some());
     assert!(doc.section("Current surfaces").is_some());
-    assert!(doc.section("Goals & Progress").is_some());
+    assert!(doc.section("Beads").is_some());
 }
 
 #[test]

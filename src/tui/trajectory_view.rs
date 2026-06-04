@@ -1,9 +1,7 @@
 use std::collections::HashSet;
 
 use crate::mc_data::surface_kind::SurfaceKind;
-use crate::mc_data::trajectory::{
-    Section, TrajectoryDoc, SECTION_CURRENT_SURFACES, SECTION_GOALS,
-};
+use crate::mc_data::trajectory::{SECTION_CURRENT_SURFACES, SECTION_GOALS, Section, TrajectoryDoc};
 use crate::tui::peek_view::PeekState;
 use crate::tui::trajectory_edit::{EditMode, InsertFocus, TrajectoryEditState};
 use ratatui::{
@@ -46,11 +44,7 @@ fn glyph_kind(c: char) -> Option<SurfaceKind> {
 /// `{glyph} {label} · ` slice gets the kind color. When `dim` is set the
 /// glyph+label span carries `Modifier::DIM` so a "just-exited" agent
 /// surface still renders with the agent glyph but visually de-emphasized.
-fn surface_row_spans<'a>(
-    text: &'a str,
-    dim: bool,
-    base_style: Style,
-) -> Vec<Span<'a>> {
+fn surface_row_spans<'a>(text: &'a str, dim: bool, base_style: Style) -> Vec<Span<'a>> {
     // Find the first whitespace char (between glyph and label).
     let mut chars = text.chars();
     let first = chars.next();
@@ -59,12 +53,8 @@ fn surface_row_spans<'a>(
     let (head_end, badge_start) = {
         // head = `{glyph} {label} · ` if the row matches the format.
         // Find the FIRST " · " separator (between label and rest-of-title).
-        let head_end = text
-            .find(" · ")
-            .map(|i| i + " · ".len())
-            .unwrap_or(0);
-        // Badge = `   ← goal:…` if present.
-        let badge_start = text.find("   ← goal:").unwrap_or(text.len());
+        let head_end = text.find(" · ").map(|i| i + " · ".len()).unwrap_or(0);
+        let badge_start = surface_annotation_start(text);
         (head_end.min(badge_start), badge_start)
     };
 
@@ -89,7 +79,59 @@ fn surface_row_spans<'a>(
     spans
 }
 
-/// Build spans for a Goals & Progress row, splitting off any trailing
+fn surface_annotation_start(text: &str) -> usize {
+    ["   ← goal:", "   overall:", "   ask:"]
+        .iter()
+        .filter_map(|marker| text.find(marker))
+        .min()
+        .unwrap_or(text.len())
+}
+
+fn split_surface_intent(text: &str) -> (&str, Option<&str>, Option<&str>) {
+    let overall_marker = "   overall:";
+    let ask_marker = "   ask:";
+    let overall_idx = text.find(overall_marker);
+    let ask_idx = text.find(ask_marker);
+    let main_end = [overall_idx, ask_idx]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(text.len());
+
+    let overall = overall_idx.map(|idx| {
+        let start = idx + overall_marker.len();
+        let end = ask_idx.filter(|ask| *ask > start).unwrap_or(text.len());
+        text[start..end].trim()
+    });
+    let ask = ask_idx.map(|idx| {
+        let start = idx + ask_marker.len();
+        text[start..].trim()
+    });
+
+    (text[..main_end].trim_end(), overall, ask)
+}
+
+fn surface_item_lines<'a>(prefix: &str, text: &'a str, dim: bool, base: Style) -> Vec<Line<'a>> {
+    let (main, overall, ask) = split_surface_intent(text);
+    let mut first = vec![Span::styled(prefix.to_string(), base)];
+    first.extend(surface_row_spans(main, dim, base));
+    let mut lines = vec![Line::from(first)];
+    if let Some(goal) = overall.filter(|s| !s.is_empty()) {
+        lines.push(Line::from(vec![
+            Span::styled("    overall: ", base.fg(Color::DarkGray)),
+            Span::styled(goal, base.fg(Color::Gray)),
+        ]));
+    }
+    if let Some(ask) = ask.filter(|s| !s.is_empty()) {
+        lines.push(Line::from(vec![
+            Span::styled("    latest:  ", base.fg(Color::DarkGray)),
+            Span::styled(ask, base.fg(Color::Gray)),
+        ]));
+    }
+    lines
+}
+
+/// Build spans for a Beads row, splitting off any trailing
 /// `   → <glyph> <surface_ref>` badge so it can be DarkGray.
 fn goal_row_spans<'a>(text: &'a str, base_style: Style) -> Vec<Span<'a>> {
     let badge_start = text.find("   → ").unwrap_or(text.len());
@@ -276,6 +318,16 @@ pub fn render_with_hints(
                 } else {
                     Color::Gray
                 };
+                if section.name == SECTION_CURRENT_SURFACES && !is_cursor && !is_insert_cursor {
+                    let dim = item
+                        .surface_id
+                        .as_deref()
+                        .map(|sid| hints.dim_surface_refs.contains(sid))
+                        .unwrap_or(false);
+                    let base = Style::default().fg(text_color);
+                    lines.extend(surface_item_lines(prefix, display_text, dim, base));
+                    continue;
+                }
 
                 let line = if is_cursor && !in_insert {
                     // Nav mode cursor: highlight with Cyan background.
@@ -337,10 +389,7 @@ pub fn render_with_hints(
                         spans.extend(goal_row_spans(display_text, base));
                         Line::from(spans)
                     } else {
-                        Line::from(Span::styled(
-                            format!("{prefix}{display_text}"),
-                            base,
-                        ))
+                        Line::from(Span::styled(format!("{prefix}{display_text}"), base))
                     }
                 };
                 lines.push(line);
@@ -420,7 +469,7 @@ workspace: predinvest
 ## Current surfaces
 - claude · mbp · working · writing tests              <!-- mc:surface:sid-1 -->
 
-## Goals & Progress
+## Beads
 - [x] sprint-01 done
 - [ ] sprint-02
 ";
@@ -461,14 +510,67 @@ workspace: predinvest
             .unwrap();
         let dump = buf_dump(&terminal);
         assert!(dump.contains("Mission"), "missing Mission header: {dump}");
-        assert!(dump.contains("Current surfaces"), "missing Current surfaces header");
-        assert!(dump.contains("Goals & Progress"), "missing Goals header");
-        assert!(dump.contains("Build self-improvement"), "missing Mission item");
+        assert!(
+            dump.contains("Current surfaces"),
+            "missing Current surfaces header"
+        );
+        assert!(dump.contains("Beads"), "missing Beads header");
+        assert!(
+            dump.contains("Build self-improvement"),
+            "missing Mission item"
+        );
         assert!(dump.contains("writing tests"), "missing surface text");
         assert!(dump.contains("sprint-01 done"), "missing task text");
         assert!(
             !dump.contains("mc:surface:"),
             "leaked surface comment into UI"
+        );
+    }
+
+    #[test]
+    fn render_expands_surface_overall_and_latest_ask_lines() {
+        let doc = TrajectoryDoc::parse(
+            "---
+workspace: intent
+---
+
+## Mission
+- Demo
+
+## Current surfaces
+- ✻ claude · claude · mbp · working   overall:Build detail view   ask:Show Beads rows              <!-- mc:surface:surface:11 -->
+
+## Beads
+- [ ] repo-1 active issue
+",
+        )
+        .unwrap();
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    Rect::new(0, 0, 90, 20),
+                    Some(&doc),
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .unwrap();
+        let dump = buf_dump(&terminal);
+        assert!(dump.contains("overall:"), "missing overall line: {dump}");
+        assert!(
+            dump.contains("Build detail view"),
+            "missing goal text: {dump}"
+        );
+        assert!(dump.contains("latest:"), "missing latest line: {dump}");
+        assert!(
+            dump.contains("Show Beads rows"),
+            "missing latest ask: {dump}"
         );
     }
 
@@ -712,7 +814,7 @@ workspace: t3
 - ✻ claude · claude · mbp · working   ← goal:Wire up T3 rendering              <!-- mc:surface:surface:11 -->
 - ▲ codex · shell · mbp · idle              <!-- mc:surface:surface:22 -->
 
-## Goals & Progress
+## Beads
 - [ ] Wire up T3 rendering   → ✻ surface:11
 - [x] Land T0 rename
 ";
@@ -723,7 +825,10 @@ workspace: t3
         let buf = terminal.backend().buffer();
         for y in 0..buf.area.height {
             let row: String = (0..buf.area.width)
-                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().chars().next().unwrap_or(' ')))
+                .filter_map(|x| {
+                    buf.cell((x, y))
+                        .map(|c| c.symbol().chars().next().unwrap_or(' '))
+                })
                 .collect();
             if row.contains(needle) {
                 for x in 0..buf.area.width {
@@ -738,15 +843,14 @@ workspace: t3
         None
     }
 
-    fn cell_style(
-        terminal: &Terminal<TestBackend>,
-        needle: &str,
-        marker: char,
-    ) -> Option<Style> {
+    fn cell_style(terminal: &Terminal<TestBackend>, needle: &str, marker: char) -> Option<Style> {
         let buf = terminal.backend().buffer();
         for y in 0..buf.area.height {
             let row: String = (0..buf.area.width)
-                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().chars().next().unwrap_or(' ')))
+                .filter_map(|x| {
+                    buf.cell((x, y))
+                        .map(|c| c.symbol().chars().next().unwrap_or(' '))
+                })
                 .collect();
             if row.contains(needle) {
                 for x in 0..buf.area.width {
@@ -834,8 +938,8 @@ workspace: t3
         );
 
         // Sanity: the live Claude surface (not in dim set) is NOT dim.
-        let live = cell_style(&terminal, "claude · claude", '✻')
-            .expect("claude row should be present");
+        let live =
+            cell_style(&terminal, "claude · claude", '✻').expect("claude row should be present");
         assert!(
             !live.add_modifier.contains(Modifier::DIM),
             "live Claude glyph should not be DIM, got {:?}",
@@ -932,7 +1036,7 @@ workspace: bare
 
 ## Current surfaces
 
-## Goals & Progress
+## Beads
 - [ ] An ordinary goal
 ";
         let doc = TrajectoryDoc::parse(bare).unwrap();
@@ -969,7 +1073,10 @@ workspace: bare
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        assert!(!dump.contains("← goal:"), "no surface badge expected: {dump}");
+        assert!(
+            !dump.contains("← goal:"),
+            "no surface badge expected: {dump}"
+        );
         assert!(!dump.contains("   → "), "no goal badge expected: {dump}");
         assert!(dump.contains("An ordinary goal"), "goal text missing");
     }

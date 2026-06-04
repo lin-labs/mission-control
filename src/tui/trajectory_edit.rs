@@ -9,9 +9,7 @@ use crate::mc_data::events::{Event, Kind, Source};
 use crate::mc_data::inputs::{InputContext, write_input};
 use crate::mc_data::paths;
 use crate::mc_data::snapshots::{highest_snapshot, write_snapshot};
-use crate::mc_data::trajectory::{
-    Item, SECTION_CURRENT_SURFACES, SECTION_GOALS, TrajectoryDoc,
-};
+use crate::mc_data::trajectory::{Item, SECTION_CURRENT_SURFACES, SECTION_GOALS, TrajectoryDoc};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -226,7 +224,7 @@ fn handle_nav_key(
             if is_current_surfaces_row(state, doc) {
                 return actions;
             }
-            // On Goals & Progress: Enter opens a new item below (like `o`).
+            // On Beads: Enter opens a new item below (like `o`).
             // On Mission (and any other section): Enter edits the current item (like `i`).
             let on_tasks = doc
                 .sections
@@ -339,7 +337,7 @@ fn handle_insert_key(
                 }
             }
         }
-        // T4 Part B: Backspace on an empty goal in Goals & Progress collapses
+        // T4 Part B: Backspace on an empty goal in Beads collapses
         // the row into the previous one (intuitive Markdown editor behavior).
         // This branch MUST precede the plain-Backspace branch so the
         // empty-goal case wins. Only fires in the Item buffer (Tab-switched
@@ -661,7 +659,7 @@ fn move_cursor_up(state: &mut TrajectoryEditState, doc: &TrajectoryDoc) {
 
 fn toggle_checkbox(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> Option<EditAction> {
     let section = doc.sections.get_mut(state.cursor_section)?;
-    // Only Goals & Progress items have checkboxes (by convention).
+    // Only Beads items have checkboxes (by convention).
     if section.name != SECTION_GOALS {
         return None;
     }
@@ -868,7 +866,7 @@ workspace: test-ws
 ## Current surfaces
 - claude · mbp · working
 
-## Goals & Progress
+## Beads
 - [x] sprint-01 done
 - [ ] sprint-02
 - [ ] sprint-03
@@ -1227,11 +1225,11 @@ workspace: test-ws
         let mut doc = TrajectoryDoc::default();
         doc.ensure_sections();
         let mut state = TrajectoryEditState::default();
-        // section index for "Goals & Progress" is 2 in canonical order
+        // section index for "Beads" is 2 in canonical order
         state.cursor_section = 2;
         state.cursor_item = 0;
         handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
-        let tasks = doc.section("Goals & Progress").unwrap();
+        let tasks = doc.section("Beads").unwrap();
         assert_eq!(tasks.items.len(), 1);
         assert!(tasks.items[0].is_checkbox);
         assert_eq!(tasks.items[0].checked, Some(false));
@@ -1597,7 +1595,7 @@ workspace: test-ws
         let mut doc = TrajectoryDoc::default();
         doc.ensure_sections();
         let mut state = TrajectoryEditState::default();
-        state.cursor_section = 2; // Goals & Progress
+        state.cursor_section = 2; // Beads
         state.cursor_item = 0;
         handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
         assert!(matches!(state.mode, EditMode::Insert { .. }));
@@ -1642,7 +1640,7 @@ workspace: test-ws
         handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
         assert_eq!(state.cursor_section, 1);
         assert_eq!(state.cursor_item, 0);
-        // j → Goals & Progress
+        // j → Beads
         handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
         assert_eq!(state.cursor_section, 2);
         // j again clamps at last section
@@ -1771,10 +1769,17 @@ workspace: test-ws
         handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
         // cursor_col now at chars().count() == 23 (end of "hello world how are you")
         assert_eq!(state.cursor_col, 23);
-        let ev = crossterm::event::KeyEvent::new(KeyCode::Backspace, crossterm::event::KeyModifiers::ALT);
+        let ev = crossterm::event::KeyEvent::new(
+            KeyCode::Backspace,
+            crossterm::event::KeyModifiers::ALT,
+        );
         handle_key(&mut state, &mut doc, ev);
         // Should have deleted "you" — "hello world how are " remains
-        assert!(state.edit_buffer.ends_with("are "), "got: {:?}", state.edit_buffer);
+        assert!(
+            state.edit_buffer.ends_with("are "),
+            "got: {:?}",
+            state.edit_buffer
+        );
         assert_eq!(state.cursor_col, state.edit_buffer.chars().count());
     }
 
@@ -1791,7 +1796,10 @@ workspace: test-ws
         let mut state = TrajectoryEditState::default();
         handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
         state.cursor_col = 0;
-        let ev = crossterm::event::KeyEvent::new(KeyCode::Backspace, crossterm::event::KeyModifiers::ALT);
+        let ev = crossterm::event::KeyEvent::new(
+            KeyCode::Backspace,
+            crossterm::event::KeyModifiers::ALT,
+        );
         handle_key(&mut state, &mut doc, ev);
         assert_eq!(state.edit_buffer, "hello");
         assert_eq!(state.cursor_col, 0);
@@ -1813,7 +1821,10 @@ workspace: test-ws
         handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
         // cursor at end (3)
         assert_eq!(state.cursor_col, 3);
-        let ev = crossterm::event::KeyEvent::new(KeyCode::Char('a'), crossterm::event::KeyModifiers::CONTROL);
+        let ev = crossterm::event::KeyEvent::new(
+            KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
         handle_key(&mut state, &mut doc, ev);
         assert_eq!(state.cursor_col, 0);
     }
@@ -1831,7 +1842,10 @@ workspace: test-ws
         let mut state = TrajectoryEditState::default();
         handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
         state.cursor_col = 0; // jump to head manually
-        let ev = crossterm::event::KeyEvent::new(KeyCode::Char('e'), crossterm::event::KeyModifiers::CONTROL);
+        let ev = crossterm::event::KeyEvent::new(
+            KeyCode::Char('e'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
         handle_key(&mut state, &mut doc, ev);
         assert_eq!(state.cursor_col, 3);
     }
@@ -1850,7 +1864,7 @@ workspace: test-ws
             surface_id: None,
         });
         let mut state = TrajectoryEditState::default();
-        state.cursor_section = 2; // Goals & Progress
+        state.cursor_section = 2; // Beads
         state.cursor_item = 0;
         handle_key(&mut state, &mut doc, key(KeyCode::Enter));
         // A new item should exist below "first".
@@ -1885,7 +1899,7 @@ workspace: test-ws
     fn doc_with_goals(items: &[&str]) -> TrajectoryDoc {
         let mut doc = TrajectoryDoc::default();
         doc.ensure_sections();
-        // Goals & Progress is section 2 after ensure_sections.
+        // Beads is section 2 after ensure_sections.
         for t in items {
             doc.sections[2].items.push(Item {
                 text: t.to_string(),
@@ -1968,7 +1982,7 @@ workspace: test-ws
     #[test]
     fn backspace_on_empty_non_goal_section_is_plain_char_delete() {
         // Mission section (index 0): empty buffer + Backspace should NOT
-        // delete the item — the special-case only fires in Goals & Progress.
+        // delete the item — the special-case only fires in Beads.
         let mut doc = TrajectoryDoc::default();
         doc.ensure_sections();
         doc.sections[0].items.push(Item {
@@ -1989,7 +2003,7 @@ workspace: test-ws
         handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
         assert_eq!(state.edit_buffer, "");
         handle_key(&mut state, &mut doc, key(KeyCode::Backspace));
-        // Item was NOT removed (Mission isn't Goals & Progress).
+        // Item was NOT removed (Mission isn't Beads).
         assert_eq!(doc.sections[0].items.len(), 2);
         assert_eq!(state.cursor_item, 1);
     }

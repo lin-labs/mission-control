@@ -22,7 +22,7 @@ workspace: test-ws
 ## Current surfaces
 - claude · mbp · working
 
-## Goals & Progress
+## Beads
 - [x] sprint-01 done
 - [ ] sprint-02
 - [ ] sprint-03
@@ -187,7 +187,7 @@ fn checkbox_toggle_saves_check_event_and_updates_trajectory_md() {
         let after = format!("- [x] {}", item.text);
 
         let actions = vec![EditAction::Check {
-            section: "Goals & Progress".to_string(),
+            section: "Beads".to_string(),
             before: before.clone(),
             after: after.clone(),
         }];
@@ -280,7 +280,7 @@ fn delete_item_emits_delete_event() {
         doc.sections[2].items.remove(0);
 
         let actions = vec![EditAction::Delete {
-            section: "Goals & Progress".to_string(),
+            section: "Beads".to_string(),
             before: before.clone(),
         }];
         do_save(uuid, &mut doc, &actions, None);
@@ -314,7 +314,7 @@ fn add_new_item_emits_add_event() {
             });
 
         let actions = vec![EditAction::Add {
-            section: "Goals & Progress".to_string(),
+            section: "Beads".to_string(),
             after: after.clone(),
         }];
         do_save(uuid, &mut doc, &actions, None);

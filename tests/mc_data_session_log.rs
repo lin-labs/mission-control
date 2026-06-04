@@ -49,6 +49,64 @@ fn last_user_turn_returns_none_when_no_user_turn() {
 }
 
 #[test]
+fn conversation_intent_uses_first_and_latest_user_turns() {
+    let intent = session_log::conversation_intent(SAMPLE);
+    assert_eq!(
+        intent.overall_goal.as_deref(),
+        Some("first ask, with multiple lines of content that should all be captured")
+    );
+    assert_eq!(intent.latest_ask.as_deref(), Some("second ask"));
+}
+
+#[test]
+fn conversation_intent_prefers_codex_objective_payload() {
+    let s = r#"## 10:00 PT — boyan
+<codex_internal_context source="goal">
+<objective>
+Replace the workspace goal/progress pane with Beads and show latest asks.
+</objective>
+</codex_internal_context>
+
+---
+
+## 10:01 PT — codex
+working
+"#;
+    let intent = session_log::conversation_intent(s);
+    assert_eq!(
+        intent.latest_ask.as_deref(),
+        Some("Replace the workspace goal/progress pane with Beads and show latest asks.")
+    );
+}
+
+#[test]
+fn conversation_intent_skips_agents_instruction_preamble() {
+    let s = r#"## 10:00 PT — boyan
+# AGENTS.md instructions for /Users/blin/Tools/mission-control
+
+<INSTRUCTIONS>
+Do not show this as the conversation goal.
+</INSTRUCTIONS><environment_context>
+cwd: /Users/blin/Tools/mission-control
+</environment_context>
+
+---
+
+## 10:03 PT — boyan
+Show Beads and latest asks in Mission Control.
+"#;
+    let intent = session_log::conversation_intent(s);
+    assert_eq!(
+        intent.overall_goal.as_deref(),
+        Some("Show Beads and latest asks in Mission Control.")
+    );
+    assert_eq!(
+        intent.latest_ask.as_deref(),
+        Some("Show Beads and latest asks in Mission Control.")
+    );
+}
+
+#[test]
 fn parse_tolerates_regular_hyphen_in_heading() {
     let s = "## 17:30 PT - boyan\nhello\n";
     let turns = session_log::parse(s);

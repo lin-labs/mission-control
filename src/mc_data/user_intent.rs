@@ -3,7 +3,7 @@ use crate::mc_data::paths;
 use anyhow::Result;
 use std::collections::HashSet;
 
-/// What the user has explicitly done to Goals & Progress items.
+/// What the user has explicitly done to Beads/legacy goal items.
 /// Used to overrule agent regen output that would undo human intent.
 #[derive(Debug, Clone, Default)]
 pub struct UserIntent {
@@ -68,11 +68,12 @@ pub fn load_for_workspace(workspace_id: &str) -> Result<UserIntent> {
         if !is_user {
             continue;
         }
-        // Only events on the Goals & Progress section matter. Accept legacy
-        // "Tasks & Progress" events too — older events.jsonl entries on disk
-        // still use the pre-rename section label.
+        // Only events on the Beads section matter. Accept legacy
+        // "Goals & Progress" / "Tasks & Progress" events too — older
+        // events.jsonl entries on disk still use the pre-rename labels.
         let ev_section = ev.section.as_str();
         let is_goals_section = ev_section == crate::mc_data::trajectory::SECTION_GOALS
+            || ev_section == "Goals & Progress"
             || ev_section == "Tasks & Progress";
         if !is_goals_section {
             continue;

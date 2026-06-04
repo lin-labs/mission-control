@@ -1,8 +1,8 @@
 //! T3 live-verification probe.
 //!
 //! Builds an in-memory workspace with a Claude surface, a Shell surface that
-//! recently hosted Codex (last-agent file backed), and two goals — one
-//! assigned to the Claude surface, one to the Shell surface. Renders the
+//! recently hosted Codex (last-agent file backed), and two legacy assignment
+//! rows — one for Claude, one for Shell. Renders the
 //! resulting trajectory.md and prints it so a human (or the controller)
 //! can eyeball the glyphs and badges in real terminal output.
 
@@ -74,13 +74,19 @@ fn main() {
 
     let surface_items = vec![
         Item {
-            text: format_surface_text(s11_eff, "claude · mbp · working", &goals, "surface:11"),
+            text: format_surface_text(
+                s11_eff,
+                "claude · mbp · working",
+                &goals,
+                "surface:11",
+                None,
+            ),
             is_checkbox: false,
             checked: None,
             surface_id: Some("surface:11".into()),
         },
         Item {
-            text: format_surface_text(s22_eff, "shell · mbp · idle", &goals, "surface:22"),
+            text: format_surface_text(s22_eff, "shell · mbp · idle", &goals, "surface:22", None),
             is_checkbox: false,
             checked: None,
             surface_id: Some("surface:22".into()),
@@ -88,7 +94,7 @@ fn main() {
     ];
     doc.replace_section_items(SECTION_CURRENT_SURFACES, surface_items);
 
-    // Goals & Progress: append badges using format_goal_badge.
+    // Beads section: append legacy assignment badges using format_goal_badge.
     let goal_rows = [
         ("Wire up T3 rendering", false),
         ("Investigate macOS hotkey regression", false),
@@ -141,6 +147,7 @@ fn main() {
         "claude · mbp · working",
         &bare_goals,
         "surface:99",
+        None,
     );
     println!("── no-goals-no-change check ─────────────────────────────────");
     println!("{}", bare);
