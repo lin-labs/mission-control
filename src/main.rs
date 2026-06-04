@@ -475,8 +475,12 @@ async fn run_app(
     let (refresh_tx, mut refresh_rx) =
         mpsc::channel::<anyhow::Result<crate::tui::app::RefreshSnapshot>>(4);
     let mut refresh_inflight: bool = false;
+    let (beads_refresh_tx, mut beads_refresh_rx) =
+        mpsc::channel::<crate::tui::app::BeadsRefreshSnapshot>(4);
+    let mut beads_refresh_inflight: bool = false;
 
     let mut refresh_interval = interval(Duration::from_secs(30));
+    let mut beads_refresh_interval = interval(Duration::from_secs(5));
     let mut screen_interval = interval(Duration::from_secs(15));
     let mut regen_tick = interval(Duration::from_secs(30));
     let mut surface_summary_tick = interval(Duration::from_secs(60));
@@ -1027,7 +1031,7 @@ async fn run_app(
                 // comes back via `refresh_rx` below and gets applied on the
                 // main loop in a quick non-blocking pass. `refresh_inflight`
                 // de-dupes overlapping ticks.
-                if !refresh_inflight {
+                if !refresh_inflight && !beads_refresh_inflight {
                     refresh_inflight = true;
                     let client = cmux_client.clone();
                     let dir = config.histories_dir.clone();
@@ -1037,6 +1041,20 @@ async fn run_app(
                             crate::tui::app::gather_refresh_snapshot(&client, &dir).await;
                         let _ = tx.send(result).await;
                     });
+                }
+            }
+
+            _ = beads_refresh_interval.tick() => {
+                if !beads_refresh_inflight && !refresh_inflight {
+                    let targets = app.beads_refresh_targets();
+                    if !targets.is_empty() {
+                        beads_refresh_inflight = true;
+                        let tx = beads_refresh_tx.clone();
+                        tokio::spawn(async move {
+                            let snap = crate::tui::app::gather_beads_refresh_snapshot(targets).await;
+                            let _ = tx.send(snap).await;
+                        });
+                    }
                 }
             }
 
@@ -1071,6 +1089,11 @@ async fn run_app(
                         eprintln!("refresh: gather failed: {e:?}");
                     }
                 }
+            }
+
+            Some(beads_snap) = beads_refresh_rx.recv() => {
+                beads_refresh_inflight = false;
+                app.apply_beads_refresh_snapshot(beads_snap).await;
             }
 
             _ = screen_interval.tick() => {

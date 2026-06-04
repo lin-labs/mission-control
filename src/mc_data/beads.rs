@@ -202,6 +202,7 @@ fn sort_and_cap(issues: &mut Vec<BeadIssue>) {
         let b_key = issue_sort_key(b);
         a_key
             .cmp(&b_key)
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
             .then_with(|| a.id.cmp(&b.id))
             .then_with(|| a.title.cmp(&b.title))
     });
@@ -303,6 +304,37 @@ mod tests {
         assert_eq!(
             issues.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
             vec!["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn sorts_recent_updates_first_within_same_bucket() {
+        let mut issues = vec![
+            BeadIssue {
+                id: "old".to_string(),
+                title: "Old".to_string(),
+                status: "open".to_string(),
+                priority: Some(2),
+                issue_type: None,
+                assignee: None,
+                labels: vec![],
+                updated_at: Some("2026-06-04T18:00:00Z".to_string()),
+            },
+            BeadIssue {
+                id: "new".to_string(),
+                title: "New".to_string(),
+                status: "open".to_string(),
+                priority: Some(2),
+                issue_type: None,
+                assignee: None,
+                labels: vec![],
+                updated_at: Some("2026-06-04T19:00:00Z".to_string()),
+            },
+        ];
+        sort_and_cap(&mut issues);
+        assert_eq!(
+            issues.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            vec!["new", "old"]
         );
     }
 }

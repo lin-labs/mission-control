@@ -655,6 +655,7 @@ pub struct App {
     session_to_workspace: HashMap<String, String>,
     workspace_index: HashMap<String, usize>,
     bullet_hashes: HashMap<PathBuf, u64>,
+    beads_generation: u64,
     /// Workspace UUID awaiting the second `D` confirmation for dismissal.
     /// Set on first `D`; cleared on second `D` (executes dismissal) or any other key.
     pub pending_dismissal: Option<String>,
@@ -677,6 +678,20 @@ pub struct RefreshSnapshot {
         HashMap<String, HashMap<String, crate::mc_data::session_log::ConversationIntent>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct BeadsRefreshTarget {
+    pub generation: u64,
+    pub workspace_id: String,
+    pub repo_roots: Vec<PathBuf>,
+    pub repo_by_surface_ref: HashMap<String, PathBuf>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BeadsRefreshSnapshot {
+    pub generation: u64,
+    pub beads_by_ws_id: HashMap<String, crate::mc_data::beads::WorkspaceBeadsView>,
+}
+
 /// Gather everything a refresh needs WITHOUT touching App state.
 ///
 /// Runs as a free async function so it can be `tokio::spawn`-ed: the main
@@ -692,6 +707,50 @@ pub async fn gather_refresh_snapshot(
     histories_dir: &std::path::Path,
 ) -> Result<RefreshSnapshot> {
     gather_refresh_snapshot_inner(client, histories_dir, false).await
+}
+
+pub async fn gather_beads_refresh_snapshot(
+    targets: Vec<BeadsRefreshTarget>,
+) -> BeadsRefreshSnapshot {
+    tokio::task::spawn_blocking(move || {
+        let generation = targets
+            .first()
+            .map(|target| target.generation)
+            .unwrap_or_default();
+        let mut repo_cache: HashMap<PathBuf, crate::mc_data::beads::BeadsView> = HashMap::new();
+        let mut beads_by_ws_id = HashMap::new();
+
+        for target in targets {
+            let mut seen = std::collections::HashSet::new();
+            let mut repos = Vec::new();
+            for repo in target.repo_roots {
+                if !seen.insert(repo.clone()) || !repo.join(".beads").is_dir() {
+                    continue;
+                }
+                let view = repo_cache
+                    .entry(repo.clone())
+                    .or_insert_with(|| crate::mc_data::beads::load_for_repo_path(&repo))
+                    .clone();
+                repos.push(view);
+            }
+            if !repos.is_empty() {
+                beads_by_ws_id.insert(
+                    target.workspace_id,
+                    crate::mc_data::beads::WorkspaceBeadsView {
+                        repos,
+                        repo_by_surface_ref: target.repo_by_surface_ref,
+                    },
+                );
+            }
+        }
+
+        BeadsRefreshSnapshot {
+            generation,
+            beads_by_ws_id,
+        }
+    })
+    .await
+    .unwrap_or_default()
 }
 
 pub async fn gather_refresh_snapshot_strict(
@@ -938,6 +997,7 @@ impl App {
             session_to_workspace: HashMap::new(),
             workspace_index: HashMap::new(),
             bullet_hashes: HashMap::new(),
+            beads_generation: 0,
             pending_dismissal: None,
             input_mode: crate::tui::command::InputMode::Normal,
         }
@@ -952,6 +1012,78 @@ impl App {
         let snap = gather_refresh_snapshot(client, histories_dir).await?;
         self.apply_refresh_snapshot(snap, xai_api_key).await;
         Ok(())
+    }
+
+    pub fn beads_refresh_targets(&self) -> Vec<BeadsRefreshTarget> {
+        self.workspaces
+            .iter()
+            .filter_map(|ws| {
+                let beads = ws.beads.as_ref()?;
+                Some(BeadsRefreshTarget {
+                    generation: self.beads_generation,
+                    workspace_id: ws.workspace.uuid.clone(),
+                    repo_roots: beads
+                        .repos
+                        .iter()
+                        .map(|repo| repo.repo_path.clone())
+                        .collect(),
+                    repo_by_surface_ref: beads.repo_by_surface_ref.clone(),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn apply_beads_refresh_snapshot(&mut self, snap: BeadsRefreshSnapshot) {
+        self.apply_beads_refresh_snapshot_with_saver(snap, |uuid, doc| {
+            let traj_path = crate::mc_data::paths::trajectory_path(uuid);
+            if let Err(e) = doc.save_to_file(&traj_path) {
+                eprintln!("save trajectory after beads refresh ({uuid}): {e:?}");
+            }
+        });
+    }
+
+    fn apply_beads_refresh_snapshot_with_saver<F>(
+        &mut self,
+        snap: BeadsRefreshSnapshot,
+        mut save: F,
+    ) where
+        F: FnMut(&str, &crate::mc_data::trajectory::TrajectoryDoc),
+    {
+        if snap.generation != self.beads_generation {
+            return;
+        }
+        for ws_state in self.workspaces.iter_mut() {
+            let Some(beads) = snap.beads_by_ws_id.get(&ws_state.workspace.uuid).cloned() else {
+                continue;
+            };
+            ws_state.beads = Some(beads.clone());
+
+            let in_insert = ws_state
+                .edit_state
+                .as_ref()
+                .map(|s| matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. }))
+                .unwrap_or(false);
+            if in_insert || ws_state.peek_state.is_some() {
+                continue;
+            }
+
+            let highlighted_repo = highlighted_surface_id(ws_state)
+                .and_then(|surface_id| beads.repo_by_surface_ref.get(&surface_id).cloned());
+            let beads_items = beads_items_for_view(&beads, highlighted_repo.as_deref());
+            let Some(doc) = ws_state.trajectory.as_mut() else {
+                continue;
+            };
+            let existing_items = doc
+                .section(crate::mc_data::trajectory::SECTION_GOALS)
+                .map(|section| section.items.as_slice())
+                .unwrap_or(&[]);
+            if items_equal_for_projection(existing_items, &beads_items) {
+                continue;
+            }
+
+            doc.replace_section_items(crate::mc_data::trajectory::SECTION_GOALS, beads_items);
+            save(&ws_state.workspace.uuid, doc);
+        }
     }
 
     /// Apply a pre-gathered refresh snapshot to `self`. Pure mutation, no I/O
@@ -972,6 +1104,7 @@ impl App {
             mut beads_by_ws_id,
             surface_intents_by_ws_id,
         } = snap;
+        self.beads_generation = self.beads_generation.wrapping_add(1);
 
         let old_counts: HashMap<String, u32> = self
             .workspaces
@@ -3185,6 +3318,23 @@ workspace: test-ws
         app
     }
 
+    fn test_bead_issue(
+        id: &str,
+        title: &str,
+        updated_at: &str,
+    ) -> crate::mc_data::beads::BeadIssue {
+        crate::mc_data::beads::BeadIssue {
+            id: id.to_string(),
+            title: title.to_string(),
+            status: "open".to_string(),
+            priority: Some(2),
+            issue_type: Some("task".to_string()),
+            assignee: None,
+            labels: vec![],
+            updated_at: Some(updated_at.to_string()),
+        }
+    }
+
     #[test]
     fn bottom_info_shows_workspace_and_window_in_sidebar_focus() {
         let app = make_app(SAMPLE_WITH_SURFACE);
@@ -3282,6 +3432,145 @@ workspace: test-ws
                 .contains("Show Beads in mission control")
         );
         assert_eq!(beads.items[0].checked, Some(false));
+    }
+
+    #[test]
+    fn beads_refresh_targets_collect_visible_beads_repos() {
+        let repo_a = std::path::PathBuf::from("/tmp/repo-a");
+        let repo_b = std::path::PathBuf::from("/tmp/repo-b");
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let mut repo_by_surface_ref = HashMap::new();
+        repo_by_surface_ref.insert("sid-42".to_string(), repo_b.clone());
+        app.workspaces[0].beads = Some(crate::mc_data::beads::WorkspaceBeadsView {
+            repos: vec![
+                crate::mc_data::beads::BeadsView {
+                    repo_path: repo_a.clone(),
+                    source: crate::mc_data::beads::BeadsSource::BdList,
+                    issues: vec![],
+                },
+                crate::mc_data::beads::BeadsView {
+                    repo_path: repo_b.clone(),
+                    source: crate::mc_data::beads::BeadsSource::BdList,
+                    issues: vec![],
+                },
+            ],
+            repo_by_surface_ref: repo_by_surface_ref.clone(),
+        });
+
+        let targets = app.beads_refresh_targets();
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].generation, app.beads_generation);
+        assert_eq!(targets[0].workspace_id, "test-uuid-1");
+        assert_eq!(targets[0].repo_roots, vec![repo_a, repo_b]);
+        assert_eq!(targets[0].repo_by_surface_ref, repo_by_surface_ref);
+    }
+
+    #[tokio::test]
+    async fn beads_refresh_snapshot_updates_beads_section_without_full_refresh() {
+        let repo = std::path::PathBuf::from("/tmp/repo-live");
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.workspaces[0].beads = Some(crate::mc_data::beads::WorkspaceBeadsView {
+            repos: vec![crate::mc_data::beads::BeadsView {
+                repo_path: repo.clone(),
+                source: crate::mc_data::beads::BeadsSource::BdList,
+                issues: vec![test_bead_issue(
+                    "old-1",
+                    "Old issue",
+                    "2026-06-04T18:00:00Z",
+                )],
+            }],
+            repo_by_surface_ref: HashMap::new(),
+        });
+
+        let mut beads_by_ws_id = HashMap::new();
+        beads_by_ws_id.insert(
+            "test-uuid-1".to_string(),
+            crate::mc_data::beads::WorkspaceBeadsView {
+                repos: vec![crate::mc_data::beads::BeadsView {
+                    repo_path: repo,
+                    source: crate::mc_data::beads::BeadsSource::BdList,
+                    issues: vec![test_bead_issue(
+                        "new-1",
+                        "Newly created issue",
+                        "2026-06-04T19:00:00Z",
+                    )],
+                }],
+                repo_by_surface_ref: HashMap::new(),
+            },
+        );
+
+        app.apply_beads_refresh_snapshot_with_saver(
+            BeadsRefreshSnapshot {
+                generation: app.beads_generation,
+                beads_by_ws_id,
+            },
+            |_, _| {},
+        );
+
+        let beads = app.workspaces[0]
+            .trajectory
+            .as_ref()
+            .unwrap()
+            .section(crate::mc_data::trajectory::SECTION_GOALS)
+            .unwrap();
+        assert_eq!(beads.items.len(), 1);
+        assert!(beads.items[0].text.contains("new-1"));
+        assert!(beads.items[0].text.contains("Newly created issue"));
+        assert!(!beads.items[0].text.contains("old-1"));
+    }
+
+    #[tokio::test]
+    async fn beads_refresh_snapshot_ignores_stale_generation() {
+        let repo = std::path::PathBuf::from("/tmp/repo-live");
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.workspaces[0].beads = Some(crate::mc_data::beads::WorkspaceBeadsView {
+            repos: vec![crate::mc_data::beads::BeadsView {
+                repo_path: repo.clone(),
+                source: crate::mc_data::beads::BeadsSource::BdList,
+                issues: vec![test_bead_issue(
+                    "old-1",
+                    "Old issue",
+                    "2026-06-04T18:00:00Z",
+                )],
+            }],
+            repo_by_surface_ref: HashMap::new(),
+        });
+        let stale_generation = app.beads_generation;
+        app.beads_generation = app.beads_generation.wrapping_add(1);
+
+        let mut beads_by_ws_id = HashMap::new();
+        beads_by_ws_id.insert(
+            "test-uuid-1".to_string(),
+            crate::mc_data::beads::WorkspaceBeadsView {
+                repos: vec![crate::mc_data::beads::BeadsView {
+                    repo_path: repo,
+                    source: crate::mc_data::beads::BeadsSource::BdList,
+                    issues: vec![test_bead_issue(
+                        "new-1",
+                        "Stale issue should not apply",
+                        "2026-06-04T19:00:00Z",
+                    )],
+                }],
+                repo_by_surface_ref: HashMap::new(),
+            },
+        );
+
+        app.apply_beads_refresh_snapshot(BeadsRefreshSnapshot {
+            generation: stale_generation,
+            beads_by_ws_id,
+        })
+        .await;
+
+        let beads = app.workspaces[0]
+            .trajectory
+            .as_ref()
+            .unwrap()
+            .section(crate::mc_data::trajectory::SECTION_GOALS)
+            .unwrap();
+        assert_eq!(beads.items[0].text, "sprint-01");
+        let active_beads = app.workspaces[0].beads.as_ref().unwrap();
+        assert_eq!(active_beads.repos[0].issues[0].id, "old-1");
     }
 
     #[cfg(unix)]
