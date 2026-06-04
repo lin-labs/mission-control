@@ -1,0 +1,3 @@
+project: mission-control
+primary_stack: rust
+validate_profile: .agents/validate.md
