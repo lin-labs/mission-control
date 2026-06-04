@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -18,6 +19,12 @@ pub struct BeadsView {
     pub repo_path: PathBuf,
     pub source: BeadsSource,
     pub issues: Vec<BeadIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceBeadsView {
+    pub repos: Vec<BeadsView>,
+    pub repo_by_surface_ref: HashMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,61 +105,55 @@ impl RawIssue {
     }
 }
 
-pub fn load_for_cwd(cwd: Option<&str>) -> Option<BeadsView> {
-    let cwd = cwd?;
-    let repo = find_repo_with_beads(&expand_home(cwd))?;
-
+pub fn load_for_repo_path(repo: &Path) -> BeadsView {
     if let Some(mut issues) = load_bd_list(&repo) {
         sort_and_cap(&mut issues);
-        return Some(BeadsView {
-            repo_path: repo,
+        return BeadsView {
+            repo_path: repo.to_path_buf(),
             source: BeadsSource::BdList,
             issues,
-        });
+        };
     }
 
     if let Some(mut issues) = load_jsonl(&repo) {
         sort_and_cap(&mut issues);
-        return Some(BeadsView {
-            repo_path: repo,
+        return BeadsView {
+            repo_path: repo.to_path_buf(),
             source: BeadsSource::Jsonl,
             issues,
-        });
+        };
     }
 
-    Some(BeadsView {
-        repo_path: repo,
+    BeadsView {
+        repo_path: repo.to_path_buf(),
         source: BeadsSource::Unavailable,
         issues: Vec::new(),
-    })
+    }
 }
 
-pub fn find_repo_with_beads(start: &Path) -> Option<PathBuf> {
-    let mut cur = if start.is_file() {
-        start.parent()?.to_path_buf()
+pub fn workspace_view_for_repos(
+    ordered_repo_roots: &[PathBuf],
+    repo_by_surface_ref: HashMap<String, PathBuf>,
+) -> Option<WorkspaceBeadsView> {
+    let mut seen = HashSet::new();
+    let mut repos = Vec::new();
+    for repo in ordered_repo_roots {
+        let repo = repo.clone();
+        if !seen.insert(repo.clone()) {
+            continue;
+        }
+        if repo.join(".beads").is_dir() {
+            repos.push(load_for_repo_path(&repo));
+        }
+    }
+    if repos.is_empty() {
+        None
     } else {
-        start.to_path_buf()
-    };
-    loop {
-        if cur.join(".beads").is_dir() {
-            return Some(cur);
-        }
-        if !cur.pop() {
-            return None;
-        }
+        Some(WorkspaceBeadsView {
+            repos,
+            repo_by_surface_ref,
+        })
     }
-}
-
-fn expand_home(path: &str) -> PathBuf {
-    if path == "~" {
-        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(path)
 }
 
 fn load_jsonl(repo: &Path) -> Option<Vec<BeadIssue>> {
@@ -257,7 +258,7 @@ mod tests {
         )
         .unwrap();
 
-        let view = load_for_cwd(tmp.path().to_str()).expect("view");
+        let view = load_for_repo_path(tmp.path());
         assert_eq!(view.source, BeadsSource::Jsonl);
         assert_eq!(view.issues.len(), 1);
         assert_eq!(view.issues[0].id, "repo-1");

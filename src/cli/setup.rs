@@ -18,10 +18,14 @@ pub fn run() -> Result<()> {
         created.push(format!("Created {}", archive.display()));
     }
 
-    // Histories symlinks: point each tool's history dir at the canonical
-    // ~obsAgents/Sessions/ so all agents write to and read from the same place.
-    let sessions_dir = crate::mc_data::prompts::obsagents_root().join("Sessions");
-    std::fs::create_dir_all(&sessions_dir).with_context(|| format!("create {sessions_dir:?}"))?;
+    // Histories symlinks: keep the stable access path at
+    // ~/agents/histories, backed by ~/data/Sessions on fresh installs. Do not
+    // route live session logs through the Obsidian vault.
+    let sessions_target = crate::mc_data::paths::session_logs_dir();
+    std::fs::create_dir_all(&sessions_target)
+        .with_context(|| format!("create {sessions_target:?}"))?;
+    let sessions_dir = crate::mc_data::paths::agent_histories_dir();
+    install_history_symlink(&sessions_dir, &sessions_target, &mut created)?;
 
     let home = dirs::home_dir().expect("home dir");
     for tool_history in [
@@ -111,11 +115,15 @@ fn install_history_symlink(
         if existing == sessions_dir {
             return Ok(()); // already correct
         }
-        eprintln!(
-            "warn: {} already symlinked to {:?}; leaving as-is",
+        std::fs::remove_file(tool_history)
+            .with_context(|| format!("remove stale symlink {tool_history:?} -> {existing:?}"))?;
+        symlink(sessions_dir, tool_history)
+            .with_context(|| format!("symlink {tool_history:?} -> {sessions_dir:?}"))?;
+        created.push(format!(
+            "Updated symlink {} -> {}",
             tool_history.display(),
-            existing
-        );
+            sessions_dir.display()
+        ));
         return Ok(());
     }
     if tool_history.exists() {

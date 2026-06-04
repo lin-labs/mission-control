@@ -1,5 +1,5 @@
-use anyhow::Result;
-use std::path::PathBuf;
+use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -32,6 +32,12 @@ pub struct Frontmatter {
     /// "match any agent" so they don't silently drop those files.
     #[serde(default)]
     pub agent: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionResolution {
+    pub path: PathBuf,
+    pub frontmatter: Frontmatter,
 }
 
 #[derive(Debug, Clone)]
@@ -177,43 +183,66 @@ pub fn summarize_user_turn(text: &str) -> Option<String> {
     one_line_summary(text)
 }
 
-/// Scan ~obsAgents/Sessions/*.md and return ALL matching session logs for the
-/// given workspace, using a two-tier algorithm.  Results are sorted by mtime
-/// descending (newest first).
-///
-/// **Tier 1 (host + cwd match -- strongest signal)**
-/// Filter candidates where:
-/// - `fm_host` matches `ctx.host` (case-insensitive)
-/// - `fm_cwd` is a descendant of (or equal to) `ctx.cwd` via path-prefix match
-///
-/// Among tier-1 candidates, sort by most-specific cwd (deepest) first, then
-/// by newest mtime as a tie-breaker.
-///
-/// **Tier 2 (workspace_id fallback -- backward compat)**
-/// If tier 1 yields nothing AND `workspace_id` is non-empty, filter by
-/// `fm_workspace_id == workspace_id`. Sort newest-first by mtime.
-///
-/// Returns `Ok(vec![])` if no matching files are found.
-pub fn matching_session_files_for_workspace(
-    workspace_id: &str,
-    ctx: &WorkspaceContext,
-) -> Result<Vec<PathBuf>> {
-    let sessions_dir = crate::mc_data::prompts::obsagents_root().join("Sessions");
-
-    if !sessions_dir.exists() {
-        return Ok(Vec::new());
+pub fn validate_histories_dir(histories_dir: &Path) -> Result<()> {
+    if !histories_dir.is_dir() {
+        anyhow::bail!(
+            "histories dir {} does not exist or is not a directory",
+            histories_dir.display()
+        );
     }
-
-    // Build candidate list.
-    struct Candidate {
-        path: PathBuf,
-        mtime: std::time::SystemTime,
-        fm: Frontmatter,
+    std::fs::read_dir(histories_dir)
+        .with_context(|| format!("read histories dir {}", histories_dir.display()))?;
+    let default_histories = crate::mc_data::paths::agent_histories_dir();
+    if histories_dir == default_histories.as_path() {
+        let expected = crate::mc_data::paths::session_logs_dir();
+        let meta = std::fs::symlink_metadata(histories_dir)
+            .with_context(|| format!("stat histories dir {}", histories_dir.display()))?;
+        if !meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "{} must be a symlink to {}",
+                histories_dir.display(),
+                expected.display()
+            );
+        }
+        let target = std::fs::read_link(histories_dir)
+            .with_context(|| format!("readlink {}", histories_dir.display()))?;
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            histories_dir
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(target)
+        };
+        let resolved = std::fs::canonicalize(&resolved)
+            .with_context(|| format!("canonicalize histories target {}", resolved.display()))?;
+        let expected = std::fs::canonicalize(&expected).with_context(|| {
+            format!(
+                "canonicalize expected histories target {}",
+                expected.display()
+            )
+        })?;
+        if resolved != expected {
+            anyhow::bail!(
+                "{} points to {}, expected {}",
+                histories_dir.display(),
+                resolved.display(),
+                expected.display()
+            );
+        }
     }
+    Ok(())
+}
 
-    let mut candidates: Vec<Candidate> = Vec::new();
+struct SessionCandidate {
+    path: PathBuf,
+    mtime: std::time::SystemTime,
+    fm: Frontmatter,
+}
 
-    let entries = std::fs::read_dir(&sessions_dir)?;
+fn collect_session_candidates(sessions_dir: &Path) -> Result<Vec<SessionCandidate>> {
+    let mut candidates = Vec::new();
+    let entries = std::fs::read_dir(sessions_dir)?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
@@ -231,8 +260,50 @@ pub fn matching_session_files_for_workspace(
         };
 
         let fm = parse_frontmatter(&text);
-        candidates.push(Candidate { path, mtime, fm });
+        candidates.push(SessionCandidate { path, mtime, fm });
     }
+    Ok(candidates)
+}
+
+/// Scan `~/agents/histories/*.md` and return ALL matching session logs for the
+/// given workspace, using a two-tier algorithm.  Results are sorted by mtime
+/// descending (newest first).
+///
+/// **Tier 1 (host + cwd match -- strongest signal)**
+/// Filter candidates where:
+/// - `fm_host` matches `ctx.host` (case-insensitive)
+/// - `fm_cwd` is a descendant of (or equal to) `ctx.cwd` via path-prefix match
+///
+/// Among tier-1 candidates, sort by most-specific cwd (deepest) first, then
+/// by newest mtime as a tie-breaker.
+///
+/// **Tier 2 (workspace_id fallback -- backward compat)**
+/// If tier 1 yields nothing AND `workspace_id` is non-empty, filter by
+/// `fm_workspace_id == workspace_id`. Sort newest-first by mtime.
+///
+/// Returns `Ok(vec![])` if no matching files are found.
+#[allow(dead_code)]
+pub fn matching_session_files_for_workspace(
+    workspace_id: &str,
+    ctx: &WorkspaceContext,
+) -> Result<Vec<PathBuf>> {
+    matching_session_files_for_workspace_in_dir(
+        &crate::mc_data::paths::agent_histories_dir(),
+        workspace_id,
+        ctx,
+    )
+}
+
+pub fn matching_session_files_for_workspace_in_dir(
+    sessions_dir: &Path,
+    workspace_id: &str,
+    ctx: &WorkspaceContext,
+) -> Result<Vec<PathBuf>> {
+    if !sessions_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let candidates = collect_session_candidates(sessions_dir)?;
 
     // Tier 1: host + cwd match.
     // Only active when ctx has both host and cwd set AND ctx.cwd is specific
@@ -241,7 +312,7 @@ pub fn matching_session_files_for_workspace(
     // let tier-2 (workspace_id match) decide.
     if let (Some(ctx_host), Some(ctx_cwd)) = (&ctx.host, &ctx.cwd) {
         if !cwd_is_too_shallow(ctx_cwd) {
-            let mut tier1: Vec<&Candidate> = candidates
+            let mut tier1: Vec<&SessionCandidate> = candidates
                 .iter()
                 .filter(|c| {
                     let host_ok =
@@ -274,7 +345,7 @@ pub fn matching_session_files_for_workspace(
     // host/cwd tags).  We intentionally do NOT require a host match here so that
     // logs written before host tagging was introduced continue to work.
     if !workspace_id.is_empty() {
-        let mut tier2: Vec<&Candidate> = candidates
+        let mut tier2: Vec<&SessionCandidate> = candidates
             .iter()
             .filter(|c| c.fm.workspace_id.as_deref() == Some(workspace_id))
             .collect();
@@ -287,7 +358,34 @@ pub fn matching_session_files_for_workspace(
     Ok(Vec::new())
 }
 
-/// Scan ~obsAgents/Sessions/*.md and return the path of the best-matching
+pub fn matching_surface_session_files_for_workspace_in_dir(
+    sessions_dir: &Path,
+    workspace_id: &str,
+    ctx: &WorkspaceContext,
+) -> Result<Vec<PathBuf>> {
+    if !sessions_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let candidates = collect_session_candidates(sessions_dir)?;
+    if !workspace_id.is_empty() {
+        let mut workspace_matches: Vec<&SessionCandidate> = candidates
+            .iter()
+            .filter(|c| c.fm.workspace_id.as_deref() == Some(workspace_id))
+            .collect();
+        if !workspace_matches.is_empty() {
+            workspace_matches.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+            return Ok(workspace_matches
+                .into_iter()
+                .map(|c| c.path.clone())
+                .collect());
+        }
+    }
+
+    matching_session_files_for_workspace_in_dir(sessions_dir, workspace_id, ctx)
+}
+
+/// Scan `~/agents/histories/*.md` and return the path of the best-matching
 /// session log for the given workspace.  This is a convenience wrapper around
 /// [`matching_session_files_for_workspace`] that returns only the first (newest)
 /// match.
@@ -297,9 +395,23 @@ pub fn latest_session_file_for_workspace(
     workspace_id: &str,
     ctx: &WorkspaceContext,
 ) -> Result<Option<PathBuf>> {
-    Ok(matching_session_files_for_workspace(workspace_id, ctx)?
-        .into_iter()
-        .next())
+    latest_session_file_for_workspace_in_dir(
+        &crate::mc_data::paths::agent_histories_dir(),
+        workspace_id,
+        ctx,
+    )
+}
+
+pub fn latest_session_file_for_workspace_in_dir(
+    sessions_dir: &Path,
+    workspace_id: &str,
+    ctx: &WorkspaceContext,
+) -> Result<Option<PathBuf>> {
+    Ok(
+        matching_session_files_for_workspace_in_dir(sessions_dir, workspace_id, ctx)?
+            .into_iter()
+            .next(),
+    )
 }
 
 /// Resolve the session-log file for a given workspace surface.
@@ -328,18 +440,42 @@ pub fn resolve_session_log_for_surface(
     agent_label: Option<&str>,
     same_agent_index: usize,
 ) -> Result<Option<PathBuf>> {
+    Ok(resolve_session_log_for_surface_in_dir(
+        &crate::mc_data::paths::agent_histories_dir(),
+        workspace_uuid,
+        surface_id,
+        ctx,
+        agent_label,
+        same_agent_index,
+    )?
+    .map(|resolution| resolution.path))
+}
+
+pub fn resolve_session_log_for_surface_in_dir(
+    sessions_dir: &Path,
+    workspace_uuid: &str,
+    surface_id: &str,
+    ctx: &WorkspaceContext,
+    agent_label: Option<&str>,
+    same_agent_index: usize,
+) -> Result<Option<SessionResolution>> {
     // Step 1: per-surface pointer file (works for any surface kind).
     let pointer = crate::mc_data::paths::surfaces_dir(workspace_uuid)
         .join(format!("{surface_id}.session-path"));
     if let Ok(content) = std::fs::read_to_string(&pointer) {
         let p = PathBuf::from(content.trim());
         if p.exists() {
-            return Ok(Some(p));
+            let text = std::fs::read_to_string(&p).unwrap_or_default();
+            return Ok(Some(SessionResolution {
+                path: p,
+                frontmatter: parse_frontmatter(&text),
+            }));
         }
     }
 
     // Step 2: collect matches, optionally filter by agent, then index.
-    let matches = matching_session_files_for_workspace(workspace_uuid, ctx)?;
+    let matches =
+        matching_surface_session_files_for_workspace_in_dir(sessions_dir, workspace_uuid, ctx)?;
     if matches.is_empty() {
         return Ok(None);
     }
@@ -367,11 +503,16 @@ pub fn resolve_session_log_for_surface(
     if candidates.is_empty() {
         return Ok(None);
     }
-    if same_agent_index < candidates.len() {
-        Ok(Some(candidates[same_agent_index].clone()))
+    let path = if same_agent_index < candidates.len() {
+        candidates[same_agent_index].clone()
     } else {
-        Ok(candidates.into_iter().last())
-    }
+        candidates.into_iter().last().expect("checked non-empty")
+    };
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    Ok(Some(SessionResolution {
+        path,
+        frontmatter: parse_frontmatter(&text),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +521,11 @@ pub fn resolve_session_log_for_surface(
 
 /// Parse the YAML frontmatter of a session log file into a `Frontmatter` struct.
 /// Returns a default (all-None) `Frontmatter` on any parse failure.
+#[allow(dead_code)]
+pub fn frontmatter_from_text(text: &str) -> Frontmatter {
+    parse_frontmatter(text)
+}
+
 fn parse_frontmatter(text: &str) -> Frontmatter {
     let (fm, _) = split_frontmatter(text);
     if fm.is_empty() {

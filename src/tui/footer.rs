@@ -9,7 +9,8 @@ use ratatui::{
 };
 
 /// Render the keyboard-shortcut footer line.
-pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus) {
+pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus, info: Option<&str>) {
+    let content_area = render_info_layer(f, area, info);
     let key_style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
@@ -52,14 +53,15 @@ pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus) {
     }
 
     let paragraph = Paragraph::new(Line::from(spans));
-    f.render_widget(paragraph, area);
+    f.render_widget(paragraph, content_area);
 }
 
 /// Render the `:command` bar in place of the keybind footer.
 ///
 /// Layout: `:<buffer><cursor><ghost-dim>    <status>`
 /// Status is appended after a 4-space gap when present.
-pub fn render_command_bar(f: &mut Frame, area: Rect, cl: &CommandLine) {
+pub fn render_command_bar(f: &mut Frame, area: Rect, cl: &CommandLine, info: Option<&str>) {
+    let content_area = render_info_layer(f, area, info);
     let prompt_style = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
@@ -107,5 +109,61 @@ pub fn render_command_bar(f: &mut Frame, area: Rect, cl: &CommandLine) {
     }
 
     let paragraph = Paragraph::new(Line::from(spans));
-    f.render_widget(paragraph, area);
+    f.render_widget(paragraph, content_area);
+}
+
+fn render_info_layer(f: &mut Frame, area: Rect, info: Option<&str>) -> Rect {
+    let Some(info) = info.filter(|s| !s.trim().is_empty()) else {
+        return area;
+    };
+    if area.width == 0 {
+        return area;
+    }
+
+    let text = truncate_left(info, area.width as usize);
+    let width = text.chars().count().min(area.width as usize) as u16;
+    let info_area = Rect {
+        x: area.x + area.width.saturating_sub(width),
+        y: area.y,
+        width,
+        height: area.height,
+    };
+    let content_width = area.width.saturating_sub(width.saturating_add(1));
+    let content_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: content_width,
+        height: area.height,
+    };
+    let style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    f.render_widget(Paragraph::new(text).style(style), info_area);
+    content_area
+}
+
+fn truncate_left(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 3 {
+        return text
+            .chars()
+            .rev()
+            .take(max_chars)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+    }
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(max_chars - 3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("...{tail}")
 }

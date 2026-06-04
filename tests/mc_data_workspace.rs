@@ -142,6 +142,18 @@ fn ensure_workspace_creates_skeleton_trajectory_on_first_run() {
 }
 
 #[test]
+fn ensure_workspace_handles_names_with_slashes() {
+    with_tmp_home(|home| {
+        workspace::ensure_workspace("uuid-slash", "~/Boyan", "~/Boyan").unwrap();
+        assert!(paths::workspace_dir("uuid-slash").is_dir());
+        assert_eq!(
+            std::fs::read_link(home.join("data/mission-control/__Boyan")).unwrap(),
+            std::path::PathBuf::from(".data").join("uuid-slash")
+        );
+    });
+}
+
+#[test]
 fn ensure_workspace_does_not_overwrite_existing_trajectory() {
     with_tmp_home(|_| {
         workspace::ensure_workspace("uuid-b2", "beta", "beta").unwrap();

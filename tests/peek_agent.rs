@@ -1,7 +1,7 @@
 /// Integration tests for the agent-source peek mode.
 ///
 /// Tests cover:
-/// - `resolve_session_log_for_surface` step 2 (workspace-level fallback via OBS_AGENTS).
+/// - `resolve_session_log_for_surface_in_dir` step 2 (workspace-level fallback).
 /// - `resolve_session_log_for_surface` step 3: returns None when no session log exists.
 /// - Session log content parsing used as peek buffer input.
 ///
@@ -25,83 +25,58 @@ fn make_session_log(workspace_id: &str, user_text: &str, assistant_text: &str) -
 #[test]
 fn resolve_falls_back_to_workspace_log_when_no_pointer() {
     let tmp = tempfile::tempdir().unwrap();
-    let obs = tmp.path().join("obs");
-    fs::create_dir_all(obs.join("Sessions")).unwrap();
+    let histories = tmp.path().join("histories");
+    fs::create_dir_all(&histories).unwrap();
 
     // Use a UUID that certainly has no pointer file in the real data dir.
     let uuid = "peek-agent-test-uuid-fallback-99999";
     let log = make_session_log(uuid, "fallback-question", "fallback-answer");
-    fs::write(obs.join("Sessions/2026-05-23-fallback.md"), &log).unwrap();
+    fs::write(histories.join("2026-05-23-fallback.md"), &log).unwrap();
 
-    let prior_obs = std::env::var_os("OBS_AGENTS");
-    // SAFETY: test runs with --test-threads=1
-    unsafe {
-        std::env::set_var("OBS_AGENTS", &obs);
-    }
-
-    let result = std::panic::catch_unwind(|| {
-        // No pointer file will exist for this UUID (it's a made-up UUID).
-        // The resolver should fall through to workspace-level lookup.
-        // Empty ctx → tier 1 skipped → tier 2 (uuid match) applies.
-        let ctx = WorkspaceContext::default();
-        let resolved = session_log::resolve_session_log_for_surface(uuid, "sid-no-pointer", &ctx, Some("claude"), 0)
-            .expect("resolve should not error");
-        assert!(
-            resolved.is_some(),
-            "expected Some from workspace-level fallback"
-        );
-        let text = fs::read_to_string(resolved.unwrap()).unwrap();
-        assert!(
-            text.contains("fallback-question"),
-            "session log content mismatch"
-        );
-    });
-
-    match prior_obs {
-        Some(v) => unsafe { std::env::set_var("OBS_AGENTS", v) },
-        None => unsafe { std::env::remove_var("OBS_AGENTS") },
-    }
-    if let Err(e) = result {
-        std::panic::resume_unwind(e);
-    }
+    // No pointer file will exist for this UUID (it's a made-up UUID).
+    // The resolver should fall through to workspace-level lookup.
+    // Empty ctx -> tier 1 skipped -> tier 2 (uuid match) applies.
+    let ctx = WorkspaceContext::default();
+    let resolved = session_log::resolve_session_log_for_surface_in_dir(
+        &histories,
+        uuid,
+        "sid-no-pointer",
+        &ctx,
+        Some("claude"),
+        0,
+    )
+    .expect("resolve should not error");
+    assert!(
+        resolved.is_some(),
+        "expected Some from workspace-level fallback"
+    );
+    let text = fs::read_to_string(resolved.unwrap().path).unwrap();
+    assert!(
+        text.contains("fallback-question"),
+        "session log content mismatch"
+    );
 }
 
 /// Step 3: when no pointer file AND no workspace session log → returns None (Shell source).
 #[test]
 fn resolve_returns_none_when_no_log_exists() {
     let tmp = tempfile::tempdir().unwrap();
-    let obs = tmp.path().join("obs-empty");
-    // Don't create a Sessions dir — latest_session_file_for_workspace should return None.
+    let histories = tmp.path().join("histories-empty");
 
-    let prior_obs = std::env::var_os("OBS_AGENTS");
-    // SAFETY: test runs with --test-threads=1
-    unsafe {
-        std::env::set_var("OBS_AGENTS", &obs);
-    }
-
-    let result = std::panic::catch_unwind(|| {
-        let ctx = WorkspaceContext::default();
-        let resolved = session_log::resolve_session_log_for_surface(
-            "peek-agent-test-no-log-uuid",
-            "sid-none",
-            &ctx,
-            Some("claude"),
-            0,
-        )
-        .expect("resolve should not error");
-        assert!(
-            resolved.is_none(),
-            "expected None → Shell source when no session log"
-        );
-    });
-
-    match prior_obs {
-        Some(v) => unsafe { std::env::set_var("OBS_AGENTS", v) },
-        None => unsafe { std::env::remove_var("OBS_AGENTS") },
-    }
-    if let Err(e) = result {
-        std::panic::resume_unwind(e);
-    }
+    let ctx = WorkspaceContext::default();
+    let resolved = session_log::resolve_session_log_for_surface_in_dir(
+        &histories,
+        "peek-agent-test-no-log-uuid",
+        "sid-none",
+        &ctx,
+        Some("claude"),
+        0,
+    )
+    .expect("resolve should not error");
+    assert!(
+        resolved.is_none(),
+        "expected None -> Shell source when no session log"
+    );
 }
 
 // ── Session log parsing used by agent peek buffer ────────────────────────────
@@ -135,40 +110,32 @@ fn agent_peek_session_log_parse_returns_correct_turns() {
 #[test]
 fn resolve_returns_most_recent_session_log() {
     let tmp = tempfile::tempdir().unwrap();
-    let obs = tmp.path().join("obs");
-    fs::create_dir_all(obs.join("Sessions")).unwrap();
+    let histories = tmp.path().join("histories");
+    fs::create_dir_all(&histories).unwrap();
 
     let uuid = "peek-agent-test-uuid-most-recent-88888";
     let log_old = make_session_log(uuid, "old-question", "old-answer");
     let log_new = make_session_log(uuid, "new-question", "new-answer");
 
-    fs::write(obs.join("Sessions/2026-05-23-old.md"), &log_old).unwrap();
+    fs::write(histories.join("2026-05-23-old.md"), &log_old).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(20));
-    fs::write(obs.join("Sessions/2026-05-23-new.md"), &log_new).unwrap();
+    fs::write(histories.join("2026-05-23-new.md"), &log_new).unwrap();
 
-    let prior_obs = std::env::var_os("OBS_AGENTS");
-    // SAFETY: test runs with --test-threads=1
-    unsafe {
-        std::env::set_var("OBS_AGENTS", &obs);
-    }
-
-    let result = std::panic::catch_unwind(|| {
-        let ctx = WorkspaceContext::default();
-        let resolved = session_log::resolve_session_log_for_surface(uuid, "sid-mr", &ctx, Some("claude"), 0)
-            .expect("resolve should not error")
-            .expect("expected Some from workspace-level fallback");
-        let text = fs::read_to_string(&resolved).unwrap();
-        assert!(
-            text.contains("new-question"),
-            "should pick the most recent log, got: {resolved:?}"
-        );
-    });
-
-    match prior_obs {
-        Some(v) => unsafe { std::env::set_var("OBS_AGENTS", v) },
-        None => unsafe { std::env::remove_var("OBS_AGENTS") },
-    }
-    if let Err(e) = result {
-        std::panic::resume_unwind(e);
-    }
+    let ctx = WorkspaceContext::default();
+    let resolved = session_log::resolve_session_log_for_surface_in_dir(
+        &histories,
+        uuid,
+        "sid-mr",
+        &ctx,
+        Some("claude"),
+        0,
+    )
+    .expect("resolve should not error")
+    .expect("expected Some from workspace-level fallback")
+    .path;
+    let text = fs::read_to_string(&resolved).unwrap();
+    assert!(
+        text.contains("new-question"),
+        "should pick the most recent log, got: {resolved:?}"
+    );
 }

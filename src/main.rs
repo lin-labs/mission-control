@@ -159,7 +159,79 @@ async fn main() -> Result<()> {
             session_file,
         }) => cli::bind::run(&surface_id, session_file.as_deref()),
         Some(config::Command::Summarize) => run_summarize_cli(&cli.tui).await,
+        Some(config::Command::BackfillWindow) => run_backfill_window_cli(&cli.tui).await,
     }
+}
+
+/// Headless one-shot registry refresh for the active cmux window. This is the
+/// maintainable version of "open the TUI once so it writes window.json".
+async fn run_backfill_window_cli(config: &Config) -> Result<()> {
+    use anyhow::{Context, anyhow};
+
+    let cmux_client = CmuxClient::new(config.cmux_bin.clone(), config.cmux_socket.clone());
+    let snap = crate::tui::app::gather_refresh_snapshot_strict(&cmux_client, &config.histories_dir)
+        .await
+        .context("gather refresh snapshot")?;
+
+    let window_id = snap
+        .workspaces
+        .iter()
+        .find_map(|ws| ws.window_id.clone())
+        .ok_or_else(|| anyhow!("cmux did not report a current window id"))?;
+    let registry_dir = crate::mc_data::paths::window_dir(&window_id);
+    let surface_count: usize = snap.surfaces_map.values().map(Vec::len).sum();
+    for ws in &snap.workspaces {
+        crate::mc_data::workspace::ensure_workspace(&ws.uuid, &ws.name, &ws.name)
+            .with_context(|| format!("provision workspace state {}", ws.uuid))?;
+    }
+    let registry_path = registry_dir.join("window.json");
+    let registry_bytes = std::fs::read(&registry_path)
+        .with_context(|| format!("read generated registry {}", registry_path.display()))?;
+    let registry_json: serde_json::Value = serde_json::from_slice(&registry_bytes)
+        .with_context(|| format!("parse generated registry {}", registry_path.display()))?;
+    if registry_json.get("window_id").and_then(|v| v.as_str()) != Some(window_id.as_str()) {
+        return Err(anyhow!(
+            "generated registry window_id did not match current window {window_id}"
+        ));
+    }
+    if registry_json
+        .get("histories_valid")
+        .and_then(|v| v.as_bool())
+        != Some(true)
+    {
+        return Err(anyhow!(
+            "generated registry did not validate histories for current window"
+        ));
+    }
+    if registry_json
+        .get("workspaces")
+        .and_then(|v| v.as_array())
+        .map(Vec::len)
+        != Some(snap.workspaces.len())
+    {
+        return Err(anyhow!("generated registry workspace count mismatch"));
+    }
+    if registry_json
+        .get("surfaces")
+        .and_then(|v| v.as_array())
+        .map(Vec::len)
+        != Some(surface_count)
+    {
+        return Err(anyhow!("generated registry surface count mismatch"));
+    }
+
+    println!("window_id: {window_id}");
+    if let Some(window_ref) = snap
+        .workspaces
+        .iter()
+        .find_map(|ws| ws.window_ref.as_deref())
+    {
+        println!("window_ref: {window_ref}");
+    }
+    println!("workspaces: {}", snap.workspaces.len());
+    println!("surfaces: {surface_count}");
+    println!("registry: {}", registry_dir.display());
+    Ok(())
 }
 
 /// Headless `:summarize` — same end state as the TUI's `:summarize` command
@@ -469,12 +541,13 @@ async fn run_app(
                 app.detail_scroll,
                 !sidebar_focused,
             );
+            let bottom_info = app.bottom_info();
             match &app.input_mode {
                 crate::tui::command::InputMode::Command(cl) => {
-                    tui::footer::render_command_bar(f, vchunks[1], cl);
+                    tui::footer::render_command_bar(f, vchunks[1], cl, bottom_info.as_deref());
                 }
                 crate::tui::command::InputMode::Normal => {
-                    tui::footer::render_footer(f, vchunks[1], app.focus);
+                    tui::footer::render_footer(f, vchunks[1], app.focus, bottom_info.as_deref());
                 }
             }
         })?;

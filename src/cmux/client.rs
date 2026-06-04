@@ -15,6 +15,14 @@ struct TreeJson {
 
 #[derive(Deserialize)]
 struct TreeWindow {
+    #[serde(rename = "ref")]
+    ref_id: String,
+    #[serde(default)]
+    current: bool,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    key: bool,
     workspaces: Vec<TreeWorkspace>,
 }
 
@@ -37,15 +45,33 @@ struct TreeSurface {
     #[serde(rename = "ref")]
     ref_id: String,
     #[serde(default)]
+    pane_ref: Option<String>,
+    #[serde(default)]
     title: String,
     #[serde(default)]
     tty: Option<String>,
+    #[serde(default)]
+    selected: bool,
+    #[serde(default)]
+    focused: bool,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    index: Option<u32>,
+    #[serde(default)]
+    index_in_pane: Option<u32>,
+    #[serde(default, rename = "type")]
+    surface_type: Option<String>,
 }
 
 // ── Transient JSON types for `cmux list-workspaces --json` ────────────────────
 
 #[derive(Deserialize)]
 struct WorkspacesJson {
+    #[serde(default)]
+    window_id: Option<String>,
+    #[serde(default)]
+    window_ref: Option<String>,
     workspaces: Vec<WorkspaceJson>,
 }
 
@@ -74,7 +100,13 @@ struct WorkspaceJson {
 pub struct Workspace {
     pub ref_id: String, // e.g. "workspace:2"
     pub uuid: String,   // e.g. "32E47B1E-..."
-    pub name: String,   // e.g. "gmail-labs"
+    /// cmux window UUID containing this workspace.
+    #[serde(default)]
+    pub window_id: Option<String>,
+    /// cmux window ref containing this workspace, e.g. `"window:1"`.
+    #[serde(default)]
+    pub window_ref: Option<String>,
+    pub name: String, // e.g. "gmail-labs"
     /// The cmux workspace description (from `cmux workspace-action set-description`).
     /// Non-empty description is used to seed the Goal section of the trajectory doc.
     #[serde(default)]
@@ -94,6 +126,8 @@ pub struct SurfaceInfo {
     pub title: String,
     /// cmux ref for this surface, e.g. `"surface:92"`.
     pub ref_id: String,
+    /// cmux pane ref for this surface, e.g. `"pane:6"`.
+    pub pane_ref: Option<String>,
     /// TTY device path, e.g. `"ttys030"`. Useful as a fingerprint for future
     /// per-surface `.session-path` pointer-file injection; unused this iteration.
     pub tty: Option<String>,
@@ -101,6 +135,12 @@ pub struct SurfaceInfo {
     /// (Claude / Codex / Shell / …). `Unknown` when `tty` is `None` or
     /// detection failed. Populated by `surface_kind::detect`.
     pub kind: SurfaceKind,
+    pub selected: bool,
+    pub focused: bool,
+    pub active: bool,
+    pub index: Option<u32>,
+    pub index_in_pane: Option<u32>,
+    pub surface_type: Option<String>,
 }
 
 #[derive(Clone)]
@@ -142,6 +182,8 @@ impl CmuxClient {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let parsed: WorkspacesJson = serde_json::from_str(&stdout)
             .context("failed to parse cmux list-workspaces --json output")?;
+        let window_id = parsed.window_id.clone();
+        let window_ref = parsed.window_ref.clone();
 
         let workspaces = parsed
             .workspaces
@@ -149,6 +191,8 @@ impl CmuxClient {
             .map(|w| Workspace {
                 ref_id: w.ref_id,
                 uuid: w.uuid,
+                window_id: window_id.clone(),
+                window_ref: window_ref.clone(),
                 name: w.title,
                 description: w.description,
                 current_directory: w.current_directory,
@@ -231,10 +275,7 @@ impl CmuxClient {
     pub async fn read_surface_text(&self, surface_ref: &str, lines: u32) -> Result<String> {
         // Build the JSON params: {"surface_id": <ref>, "lines": N}. Escape
         // is unnecessary because surface refs are `surface:<digits>`.
-        let params = format!(
-            r#"{{"surface_id":"{}","lines":{}}}"#,
-            surface_ref, lines
-        );
+        let params = format!(r#"{{"surface_id":"{}","lines":{}}}"#, surface_ref, lines);
         let output = self
             .cmd()
             .args(["rpc", "surface.read_text", &params])
@@ -254,13 +295,12 @@ impl CmuxClient {
             text: String,
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: Response = serde_json::from_str(&stdout)
-            .with_context(|| {
-                format!(
-                    "failed to parse cmux rpc surface.read_text output for {}",
-                    surface_ref
-                )
-            })?;
+        let parsed: Response = serde_json::from_str(&stdout).with_context(|| {
+            format!(
+                "failed to parse cmux rpc surface.read_text output for {}",
+                surface_ref
+            )
+        })?;
         Ok(parsed.text)
     }
 
@@ -280,8 +320,17 @@ impl CmuxClient {
     /// list of surfaces in that workspace's panes. Each `SurfaceInfo` carries
     /// the surface's own ref_id (e.g. `"surface:92"`) and tty so peek mode can
     /// distinguish surfaces within the same workspace.
+    #[allow(dead_code)]
     pub async fn get_surfaces_json(&self) -> Result<HashMap<String, Vec<SurfaceInfo>>> {
-        let output = self.cmd()
+        self.get_surfaces_json_for_window(None).await
+    }
+
+    pub async fn get_surfaces_json_for_window(
+        &self,
+        expected_window_ref: Option<&str>,
+    ) -> Result<HashMap<String, Vec<SurfaceInfo>>> {
+        let output = self
+            .cmd()
             .args(["tree", "--all", "--json"])
             .output()
             .await
@@ -302,7 +351,12 @@ impl CmuxClient {
         // one — the difference shows up as roughly 1.5%→~0.3% steady-state CPU
         // on a sidebar with ~30 surfaces.
         let mut ttys: Vec<&str> = Vec::new();
-        for window in &parsed.windows {
+        let current_window_ref = current_window_ref(&parsed, expected_window_ref)?;
+        for window in parsed
+            .windows
+            .iter()
+            .filter(|window| Some(window.ref_id.as_str()) == current_window_ref.as_deref())
+        {
             for ws in &window.workspaces {
                 for pane in &ws.panes {
                     for s in &pane.surfaces {
@@ -318,7 +372,11 @@ impl CmuxClient {
         let kinds_by_tty = surface_kind::detect_all(&ttys);
 
         let mut result: HashMap<String, Vec<SurfaceInfo>> = HashMap::new();
-        for window in parsed.windows {
+        for window in parsed
+            .windows
+            .into_iter()
+            .filter(|window| Some(window.ref_id.as_str()) == current_window_ref.as_deref())
+        {
             for ws in window.workspaces {
                 let surfaces: Vec<SurfaceInfo> = ws
                     .panes
@@ -335,8 +393,15 @@ impl CmuxClient {
                         SurfaceInfo {
                             title: s.title,
                             ref_id: s.ref_id,
+                            pane_ref: s.pane_ref,
                             tty: s.tty,
                             kind,
+                            selected: s.selected,
+                            focused: s.focused,
+                            active: s.active,
+                            index: s.index,
+                            index_in_pane: s.index_in_pane,
+                            surface_type: s.surface_type,
                         }
                     })
                     .collect();
@@ -353,9 +418,17 @@ impl CmuxClient {
     ///
     /// Kept for backwards-compatibility. New callers should use `get_surfaces_json`
     /// which provides per-surface ref_id and tty in addition to title.
+    #[allow(dead_code)]
     pub async fn get_surfaces(&self) -> Result<HashMap<String, Vec<SurfaceInfo>>> {
         // Delegate to the JSON parser which is strictly more accurate.
         self.get_surfaces_json().await
+    }
+
+    pub async fn get_surfaces_for_window(
+        &self,
+        expected_window_ref: Option<&str>,
+    ) -> Result<HashMap<String, Vec<SurfaceInfo>>> {
+        self.get_surfaces_json_for_window(expected_window_ref).await
     }
 
     /// Send raw text to a cmux surface (terminal only).
@@ -403,11 +476,7 @@ impl CmuxClient {
     /// and return it. (Verified live on 2026-05-24.)
     ///
     /// On failure cmux prints `Error: <kind>: <message>` on stderr.
-    pub async fn new_surface(
-        &self,
-        workspace_ref: &str,
-        surface_type: &str,
-    ) -> Result<String> {
+    pub async fn new_surface(&self, workspace_ref: &str, surface_type: &str) -> Result<String> {
         let output = self
             .cmd()
             .args([
@@ -440,3 +509,24 @@ impl CmuxClient {
     }
 }
 
+fn current_window_ref(
+    parsed: &TreeJson,
+    expected_window_ref: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(expected) = expected_window_ref {
+        if parsed
+            .windows
+            .iter()
+            .any(|window| window.ref_id == expected)
+        {
+            return Ok(Some(expected.to_string()));
+        }
+        anyhow::bail!("cmux tree did not contain expected window ref {expected}");
+    }
+    Ok(parsed
+        .windows
+        .iter()
+        .find(|window| window.current || window.active || window.key)
+        .or_else(|| parsed.windows.first())
+        .map(|window| window.ref_id.clone()))
+}

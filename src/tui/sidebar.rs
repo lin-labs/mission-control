@@ -172,6 +172,8 @@ mod tests {
     fn test_workspace_state(name: &str, custom_color: Option<&str>) -> WorkspaceState {
         WorkspaceState {
             workspace: Workspace {
+                window_id: Some("window-test".to_string()),
+                window_ref: Some("window:1".to_string()),
                 ref_id: "workspace:1".to_string(),
                 uuid: "workspace-1".to_string(),
                 name: name.to_string(),

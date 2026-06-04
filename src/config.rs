@@ -60,6 +60,8 @@ pub enum Command {
     /// The resulting path is printed to stdout on success; progress logs
     /// stream to stderr.
     Summarize,
+    /// Backfill the registry JSON for the active cmux window and exit.
+    BackfillWindow,
 }
 
 /// Configuration for the TUI (all existing flags live here).
