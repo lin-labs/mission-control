@@ -1527,9 +1527,16 @@ async fn run_app(
         // Check for peek yield (Enter pressed in peek mode) after every select!
         // iteration. This is async but resolves immediately (no I/O in the
         // hot path) and keeps the redraw path unblocked.
-        if let Some(workspace_ref) = app.take_peek_yield() {
+        if let Some((workspace_ref, surface_ref)) = app.take_peek_yield() {
             if let Err(e) = cmux_client.select_workspace(&workspace_ref).await {
                 eprintln!("peek-yield select_workspace({workspace_ref}): {e:?}");
+            }
+            // Focus the exact surface so a split-pane workspace lands on the
+            // right pane. Skip when the peek had no specific surface.
+            if surface_ref != workspace_ref {
+                if let Err(e) = cmux_client.focus_surface(&surface_ref).await {
+                    eprintln!("peek-yield focus_surface({surface_ref}): {e:?}");
+                }
             }
         }
 

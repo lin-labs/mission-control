@@ -2662,23 +2662,24 @@ impl App {
     }
 
     /// Called from the event loop to check whether a peek-yield is pending for
-    /// the selected workspace. Clears the flag and returns the WORKSPACE ref
-    /// to pass to `cmux select-workspace`. (Passing a surface ref would error
-    /// "Workspace not found" — cmux's select-workspace only accepts workspace
-    /// refs.)
-    pub fn take_peek_yield(&mut self) -> Option<String> {
+    /// the selected workspace. Clears the flag and returns
+    /// `(workspace_ref, surface_ref)`: select the workspace, then focus the
+    /// surface so a split-pane workspace lands on the RIGHT pane (not just the
+    /// workspace's last-focused pane). `surface_ref` equals `workspace_ref` when
+    /// the peek had no specific surface — the caller skips the surface focus then.
+    pub fn take_peek_yield(&mut self) -> Option<(String, String)> {
         let idx = self.selected;
         let ws = self.workspaces.get_mut(idx)?;
         if ws.peek_yield_pending {
             ws.peek_yield_pending = false;
             // After yielding, clear peek state (the user is going to work there).
-            let ref_id = ws
+            let (ws_ref, surface_ref) = ws
                 .peek_state
                 .as_ref()
-                .map(|p| p.workspace_ref.clone())
-                .unwrap_or_else(|| ws.workspace.ref_id.clone());
+                .map(|p| (p.workspace_ref.clone(), p.surface_ref.clone()))
+                .unwrap_or_else(|| (ws.workspace.ref_id.clone(), ws.workspace.ref_id.clone()));
             ws.peek_state = None;
-            Some(ref_id)
+            Some((ws_ref, surface_ref))
         } else {
             None
         }
@@ -4207,12 +4208,12 @@ workspace: test-ws
         ));
         app.workspaces[0].peek_yield_pending = true;
 
-        let ref_id = app.take_peek_yield();
+        let yielded = app.take_peek_yield();
 
         assert_eq!(
-            ref_id,
-            Some("workspace:7".to_string()),
-            "yield must return the workspace_ref (not the surface_ref) so cmux select-workspace works"
+            yielded,
+            Some(("workspace:7".to_string(), "surface:42".to_string())),
+            "yield returns (workspace_ref, surface_ref): select the workspace, then focus the surface's pane"
         );
         assert!(
             app.workspaces[0].peek_state.is_none(),

@@ -241,6 +241,27 @@ impl CmuxClient {
         Ok(set)
     }
 
+    /// Focus a specific surface (by ref or UUID) — reveals its window /
+    /// workspace / **pane** / tab. Call after `select_workspace` so "go to
+    /// surface" lands on the right split pane, not the workspace's last-focused
+    /// one. Uses `surface.focus`, which resolves the surface's pane itself.
+    pub async fn focus_surface(&self, surface_ref: &str) -> Result<()> {
+        let params = format!(r#"{{"surface_id":"{surface_ref}"}}"#);
+        let output = self
+            .cmd()
+            .args(["rpc", "surface.focus", &params])
+            .output()
+            .await
+            .context("failed to run cmux rpc surface.focus")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "cmux rpc surface.focus failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
     /// Set (or clear) the cmux workspace description for the given workspace ref.
     ///
     /// This is used to push the Goal section of the trajectory back to cmux so
