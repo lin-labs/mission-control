@@ -3196,9 +3196,15 @@ fn surface_intent_summary(
         return None;
     }
 
+    // The workspace-level session + on-screen prompt are scraped from the
+    // workspace's FOCUSED pane, so they describe exactly one surface. Only that
+    // focused surface may borrow them — otherwise every agent surface in the
+    // workspace (including exited/never-started panes kept alive by
+    // effective_kind) would render the same prompt. A non-focused surface shows
+    // intent only from its OWN resolved session.
     let mut intent = resolved_intent.cloned();
 
-    if intent.is_none() {
+    if intent.is_none() && surface.focused {
         intent = workspace_session.and_then(|session| read_intent_from_session_path(&session.path));
     }
 
@@ -3208,7 +3214,7 @@ fn surface_intent_summary(
             intent.overall_goal = crate::mc_data::session_log::summarize_user_turn(&goal.text);
         }
     }
-    if intent.latest_ask.is_none() {
+    if intent.latest_ask.is_none() && surface.focused {
         intent.latest_ask =
             screen_latest_ask.and_then(crate::mc_data::session_log::summarize_user_turn);
     }
@@ -4398,5 +4404,49 @@ workspace: test-ws
         assert!(!is_bead_row("ship the feature"));
         assert!(!is_bead_row("[Plan] outline the work"));
         assert!(!is_bead_row(""));
+    }
+
+    #[test]
+    fn intent_not_broadcast_to_nonfocused_surfaces() {
+        use crate::cmux::client::SurfaceInfo;
+        use crate::mc_data::surface_kind::SurfaceKind;
+        let mk = |focused: bool| SurfaceInfo {
+            title: "Claude Code".to_string(),
+            ref_id: "surface:99".to_string(),
+            pane_ref: None,
+            tty: None,
+            kind: SurfaceKind::Claude,
+            selected: false,
+            focused,
+            active: false,
+            index: None,
+            index_in_pane: None,
+            surface_type: None,
+        };
+        let goals = crate::mc_data::goals_json::GoalsFile::default();
+        // A non-focused agent surface with no resolved intent must NOT borrow
+        // the workspace-level on-screen prompt (that's another surface's).
+        let nf = surface_intent_summary(
+            None,
+            None,
+            Some("update arcmux to support native LLMs"),
+            &mk(false),
+            SurfaceKind::Claude,
+            &goals,
+        );
+        assert!(nf.is_none(), "non-focused surface borrowed a prompt: {nf:?}");
+        // The focused surface does pick it up.
+        let f = surface_intent_summary(
+            None,
+            None,
+            Some("update arcmux to support native LLMs"),
+            &mk(true),
+            SurfaceKind::Claude,
+            &goals,
+        );
+        assert!(
+            f.and_then(|i| i.latest_ask).is_some(),
+            "focused surface should adopt the on-screen prompt"
+        );
     }
 }
