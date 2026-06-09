@@ -5,6 +5,7 @@ pub mod events;
 pub mod frame_merge;
 pub mod goals_json;
 pub mod inputs;
+pub mod overall_cache;
 pub mod paths;
 pub mod prompts;
 pub mod remote_intent;

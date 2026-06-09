@@ -488,9 +488,6 @@ async fn run_app(
     // Channel for xAI-inferred remote-surface intents (overall/latest).
     let (remote_intent_tx, mut remote_intent_rx) =
         mpsc::unbounded_channel::<crate::tui::app::RemoteIntentUpdate>();
-    // Channel for xAI "overall" session summaries (generated on detail open).
-    let (overall_tx, mut overall_rx) =
-        mpsc::unbounded_channel::<crate::tui::app::OverallSummaryUpdate>();
 
     // Kick off initial screen capture for the selected workspace
     app.spawn_load_screen_preview(cmux_client.clone(), classifier.cloned(), screen_tx.clone());
@@ -913,7 +910,7 @@ async fn run_app(
                                     // xAI "overall" summary for this workspace's bound
                                     // agent surfaces (change-gated).
                                     if let Some(key) = config.xai_api_key.clone() {
-                                        app.spawn_overall_summaries(key, overall_tx.clone());
+                                        app.spawn_overall_summaries(key);
                                     }
                                 } else {
                                     // In detail focus, Enter switches to the workspace in cmux (fire-and-forget)
@@ -1167,7 +1164,7 @@ async fn run_app(
                         // key-transition trigger, which can fire before the first
                         // refresh populates surfaces.
                         if let Some(key) = config.xai_api_key.clone() {
-                            app.spawn_overall_summaries(key, overall_tx.clone());
+                            app.spawn_overall_summaries(key);
                         }
                         // After applying, diff surface counts to detect
                         // detachments (cmux doesn't yet emit
@@ -1248,9 +1245,6 @@ async fn run_app(
                 app.apply_remote_intent(update);
             }
 
-            Some(update) = overall_rx.recv() => {
-                app.apply_overall_summary(update);
-            }
 
             _ = peek_tick.tick() => {
                 if let Some((uuid, surface_ref)) = app.peek_needs_poll() {
