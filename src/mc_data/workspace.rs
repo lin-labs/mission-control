@@ -49,7 +49,7 @@ pub fn ensure_workspace(uuid: &str, unique_name: &str, project: &str) -> Result<
     }
     // Relative target so the symlink resolves regardless of cwd.
     let link = paths::display_symlink(unique_name);
-    let target: PathBuf = PathBuf::from(".data").join(uuid);
+    let target: PathBuf = PathBuf::from("active").join(uuid);
     if let Ok(existing) = fs::read_link(&link) {
         if existing == target {
             return Ok(()); // already in the right state
@@ -62,6 +62,66 @@ pub fn ensure_workspace(uuid: &str, unique_name: &str, project: &str) -> Result<
     }
     symlink(&target, &link).with_context(|| format!("symlink {link:?} -> {target:?}"))?;
     Ok(())
+}
+
+/// Migrate the legacy `.data/` open-workspaces root to `active/`. Idempotent:
+/// moves each `<uuid>` dir into `active/` (skipping any that already exist
+/// there), then removes the empty `.data/`. Safe no-op when `.data/` is absent.
+pub fn migrate_data_to_active() {
+    let legacy = paths::data_root().join(".data");
+    if !legacy.is_dir() {
+        return;
+    }
+    let active = paths::active_root();
+    let _ = fs::create_dir_all(&active);
+    if let Ok(entries) = fs::read_dir(&legacy) {
+        for entry in entries.flatten() {
+            let from = entry.path();
+            let dest = active.join(entry.file_name());
+            if dest.exists() {
+                continue; // already migrated; leave the legacy copy for manual review
+            }
+            let _ = fs::rename(&from, &dest);
+        }
+    }
+    // Remove .data only if now empty (rename failures leave it intact).
+    let _ = fs::remove_dir(&legacy);
+}
+
+/// Move workspaces whose UUID is no longer live (not in any cmux window) from
+/// `active/` to `archived/`. `live_uuids` MUST be the full set across all
+/// windows; an empty set is treated as "unknown" and skips archival so we never
+/// archive everything when the cmux query fails. Returns the count moved.
+pub fn archive_closed_workspaces(live_uuids: &std::collections::HashSet<String>) -> usize {
+    if live_uuids.is_empty() {
+        return 0;
+    }
+    let active = paths::active_root();
+    let archived = paths::archived_root();
+    let mut moved = 0;
+    let Ok(entries) = fs::read_dir(&active) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let uuid = entry.file_name().to_string_lossy().into_owned();
+        if live_uuids.contains(&uuid) {
+            continue;
+        }
+        let _ = fs::create_dir_all(&archived);
+        let dest = archived.join(&uuid);
+        // If an archived copy already exists, drop the newer-but-closed one's
+        // path uniqueness by replacing it (keep the latest closed state).
+        if dest.exists() {
+            let _ = fs::remove_dir_all(&dest);
+        }
+        if fs::rename(entry.path(), &dest).is_ok() {
+            moved += 1;
+        }
+    }
+    moved
 }
 
 pub fn read_display_name(uuid: &str) -> Result<String> {

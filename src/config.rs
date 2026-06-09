@@ -62,6 +62,10 @@ pub enum Command {
     Summarize,
     /// Backfill the registry JSON for the active cmux window and exit.
     BackfillWindow,
+    /// Run the workspace state lifecycle once and exit: migrate legacy `.data/`
+    /// → `active/`, then move workspaces no longer in any live cmux window from
+    /// `active/` → `archived/`. Prints what changed.
+    ArchiveClosed,
     /// Probe the local overall-summary path for a bound surface (by UUID):
     /// resolve its cmux binding → read the transcript's user turns → xAI
     /// summarize → write the persistent overall-summary cache. Prints the

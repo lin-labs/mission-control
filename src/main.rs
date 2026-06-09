@@ -168,7 +168,29 @@ async fn main() -> Result<()> {
         Some(config::Command::OverallProbe { surface_uuid }) => {
             run_overall_probe(&cli.tui, &surface_uuid).await
         }
+        Some(config::Command::ArchiveClosed) => run_archive_closed(&cli.tui).await,
     }
+}
+
+/// Headless run of the workspace state lifecycle: migrate `.data/` → `active/`,
+/// then archive workspaces no longer in any live cmux window.
+async fn run_archive_closed(config: &Config) -> Result<()> {
+    crate::mc_data::workspace::migrate_data_to_active();
+    let active_before = std::fs::read_dir(crate::mc_data::paths::active_root())
+        .map(|d| d.flatten().filter(|e| e.path().is_dir()).count())
+        .unwrap_or(0);
+    let client = CmuxClient::new(config.cmux_bin.clone(), config.cmux_socket.clone());
+    let live = client.all_workspace_uuids().await?;
+    println!("live workspaces (all windows): {}", live.len());
+    if live.is_empty() {
+        anyhow::bail!("refusing to archive: cmux reported zero live workspaces");
+    }
+    let moved = crate::mc_data::workspace::archive_closed_workspaces(&live);
+    let active_after = std::fs::read_dir(crate::mc_data::paths::active_root())
+        .map(|d| d.flatten().filter(|e| e.path().is_dir()).count())
+        .unwrap_or(0);
+    println!("active workspaces: {active_before} -> {active_after} (archived {moved})");
+    Ok(())
 }
 
 /// Validate the local overall-summary path end-to-end for one bound surface.
@@ -442,6 +464,14 @@ async fn run_tui(_tui_config: Config) -> Result<()> {
         // changes (e.g. OPENAI_API_KEY) — matches pre-subcommand behavior.
         let config = config::Cli::parse().tui;
         let cmux_client = CmuxClient::new(config.cmux_bin.clone(), config.cmux_socket.clone());
+
+        // State lifecycle: migrate the legacy `.data/` root to `active/`, then
+        // archive any workspace dirs whose UUID is no longer in a live cmux
+        // window (active/ -> archived/). Skipped if the live set is empty.
+        crate::mc_data::workspace::migrate_data_to_active();
+        if let Ok(live) = cmux_client.all_workspace_uuids().await {
+            crate::mc_data::workspace::archive_closed_workspaces(&live);
+        }
 
         // Prefer Codex (local auth, no API key) when use_codex is set,
         // fall back to OpenAI if explicitly requested or as a backup.
@@ -1153,6 +1183,19 @@ async fn run_app(
             }
 
             _ = refresh_interval.tick() => {
+                // Archive workspaces that closed since the last tick (active/ ->
+                // archived/), off the main loop. Independent of the snapshot.
+                {
+                    let client = cmux_client.clone();
+                    tokio::spawn(async move {
+                        if let Ok(live) = client.all_workspace_uuids().await {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                crate::mc_data::workspace::archive_closed_workspaces(&live)
+                            })
+                            .await;
+                        }
+                    });
+                }
                 // Kick refresh off as a background task — never block the main
                 // event loop on the cmux + 999-session-file gather. The result
                 // comes back via `refresh_rx` below and gets applied on the

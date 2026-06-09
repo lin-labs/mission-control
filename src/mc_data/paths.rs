@@ -14,10 +14,29 @@ pub fn agent_histories_dir() -> PathBuf {
         .join("histories")
 }
 
-pub fn data_subroot() -> PathBuf {
-    data_root().join(".data")
+/// Root for OPEN workspaces' runtime state (one dir per workspace UUID).
+/// Formerly `.data`; renamed to `active` so the open/closed lifecycle reads
+/// directly off the directory names.
+pub fn active_root() -> PathBuf {
+    data_root().join("active")
 }
 
+/// Back-compat alias for the open-workspaces root.
+pub fn data_subroot() -> PathBuf {
+    active_root()
+}
+
+/// Root for CLOSED workspaces' state, moved here when their UUID is no longer
+/// in any live cmux window. Keyed by workspace UUID, same layout as `active/`.
+pub fn archived_root() -> PathBuf {
+    data_root().join("archived")
+}
+
+pub fn archived_workspace_dir(uuid: &str) -> PathBuf {
+    archived_root().join(uuid)
+}
+
+/// Hidden dismissal/Obsidian-publish archive (distinct from `archived/`).
 pub fn archive_root() -> PathBuf {
     data_root().join(".archived")
 }
@@ -31,7 +50,7 @@ pub fn window_dir(window_id: &str) -> PathBuf {
 }
 
 pub fn workspace_dir(uuid: &str) -> PathBuf {
-    data_subroot().join(uuid)
+    active_root().join(uuid)
 }
 
 pub fn name_path(uuid: &str) -> PathBuf {

@@ -30,6 +30,10 @@ struct TreeWindow {
 struct TreeWorkspace {
     #[serde(rename = "ref")]
     ref_id: String,
+    /// cmux workspace UUID (with `--id-format both`). Used to collect the full
+    /// live workspace set for active/archived lifecycle decisions.
+    #[serde(default, rename = "id")]
+    uuid: Option<String>,
     #[serde(default)]
     panes: Vec<TreePane>,
 }
@@ -208,6 +212,33 @@ impl CmuxClient {
             .collect();
 
         Ok(workspaces)
+    }
+
+    /// Full set of live workspace UUIDs across ALL cmux windows (via
+    /// `tree --all`). Used to decide which `active/` workspace dirs are now
+    /// closed and should be archived. Errors / empty are surfaced as-is so the
+    /// caller can refuse to archive on an unreliable (empty) result.
+    pub async fn all_workspace_uuids(&self) -> Result<std::collections::HashSet<String>> {
+        let out = self
+            .cmd()
+            .args(["tree", "--all", "--json", "--id-format", "both"])
+            .output()
+            .await
+            .context("failed to run cmux tree --all for workspace uuids")?;
+        if !out.status.success() {
+            anyhow::bail!("cmux tree --all failed");
+        }
+        let tree: TreeJson = serde_json::from_slice(&out.stdout)
+            .context("failed to parse cmux tree --all for workspace uuids")?;
+        let mut set = std::collections::HashSet::new();
+        for w in tree.windows {
+            for ws in w.workspaces {
+                if let Some(id) = ws.uuid {
+                    set.insert(id);
+                }
+            }
+        }
+        Ok(set)
     }
 
     /// Set (or clear) the cmux workspace description for the given workspace ref.
