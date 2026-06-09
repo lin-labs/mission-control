@@ -1505,6 +1505,18 @@ impl App {
                 let unchanged = items_equal_for_projection(&goals_section_existing, &beads_items);
                 (unchanged, Some(beads_items))
             } else {
+                // Strip mc-injected bead rows left over from a repo a surface no
+                // longer resolves to (e.g. gmail-triage kept showing elonco's
+                // beads after its codex left the elonco checkout). They are not
+                // this project's goals; drop them so the section clears rather
+                // than showing another project's issues.
+                let dropped_beads = goals_section_existing.iter().any(|i| is_bead_row(&i.text));
+                let goals_section_existing: Vec<crate::mc_data::trajectory::Item> =
+                    goals_section_existing
+                        .iter()
+                        .filter(|i| !is_bead_row(&i.text))
+                        .cloned()
+                        .collect();
                 let any_existing_badge = goals_section_existing
                     .iter()
                     .any(|i| i.text.contains("   → "));
@@ -1603,6 +1615,11 @@ impl App {
                         .collect();
                     let unchanged = items_equal_for_projection(&goals_section_existing, &rebuilt);
                     (unchanged, Some(rebuilt))
+                } else if dropped_beads {
+                    // Removed stale bead rows with nothing to rebuild — write the
+                    // cleaned (goals-only, possibly empty) section so the stale
+                    // beads actually disappear.
+                    (false, Some(goals_section_existing))
                 } else {
                     (true, None)
                 }
@@ -3124,6 +3141,24 @@ fn repo_display_name(repo_path: &std::path::Path) -> &str {
         .unwrap_or("repo")
 }
 
+/// Does this `## Beads` section line look like an mc-injected bead row (a real
+/// issue `[P0] id status · title`, or a `repo:` / `No active beads` / `Beads
+/// unavailable` header) rather than a user/legacy goal? Used to drop stale
+/// beads when a workspace no longer resolves to a beads repo.
+fn is_bead_row(text: &str) -> bool {
+    let t = text.trim_start();
+    if let Some(rest) = t.strip_prefix("[P") {
+        if let Some((label, _)) = rest.split_once("] ") {
+            if !label.is_empty() && label.chars().all(|c| c.is_ascii_digit() || c == '?') {
+                return true;
+            }
+        }
+    }
+    t.starts_with("repo: ")
+        || t.starts_with("No active beads")
+        || t.starts_with("Beads unavailable")
+}
+
 fn bead_issue_line(issue: &crate::mc_data::beads::BeadIssue) -> String {
     let title = crate::mc_data::beads::compact_issue_title(&issue.title, 74);
     let status = issue.status.replace('_', "-");
@@ -4348,5 +4383,20 @@ workspace: test-ws
         let mut app = App::new();
         // No workspaces — should not panic.
         app.force_regen_selected_workspace();
+    }
+
+    #[test]
+    fn is_bead_row_distinguishes_beads_from_goals() {
+        // mc-injected bead rows + headers.
+        assert!(is_bead_row("[P0] GTR-1 open · elonco send delivers brief"));
+        assert!(is_bead_row("[P?] foo-1 in-progress · bar"));
+        assert!(is_bead_row("repo: elonco"));
+        assert!(is_bead_row("No active beads in gmail-triage"));
+        assert!(is_bead_row("Beads unavailable in foo (bd list failed)"));
+        // Local/legacy goal rows must NOT be treated as beads.
+        assert!(!is_bead_row("[MSC-1] build the thing"));
+        assert!(!is_bead_row("ship the feature"));
+        assert!(!is_bead_row("[Plan] outline the work"));
+        assert!(!is_bead_row(""));
     }
 }
