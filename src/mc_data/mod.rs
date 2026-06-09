@@ -1,4 +1,5 @@
 pub mod beads;
+pub mod cmux_sessions;
 pub mod dismissal;
 pub mod events;
 pub mod frame_merge;

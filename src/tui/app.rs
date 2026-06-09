@@ -4413,6 +4413,7 @@ workspace: test-ws
         let mk = |focused: bool| SurfaceInfo {
             title: "Claude Code".to_string(),
             ref_id: "surface:99".to_string(),
+            uuid: None,
             pane_ref: None,
             tty: None,
             kind: SurfaceKind::Claude,

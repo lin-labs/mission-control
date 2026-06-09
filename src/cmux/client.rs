@@ -44,6 +44,10 @@ struct TreePane {
 struct TreeSurface {
     #[serde(rename = "ref")]
     ref_id: String,
+    /// cmux surface UUID (the `id` field, present with `--id-format both`).
+    /// Used to key into the cmux hook-session binding registry.
+    #[serde(default, rename = "id")]
+    uuid: Option<String>,
     #[serde(default)]
     pane_ref: Option<String>,
     #[serde(default)]
@@ -126,6 +130,9 @@ pub struct SurfaceInfo {
     pub title: String,
     /// cmux ref for this surface, e.g. `"surface:92"`.
     pub ref_id: String,
+    /// cmux surface UUID (`id`), used to key into the hook-session binding
+    /// registry (`cmux_sessions`). `None` if cmux didn't report it.
+    pub uuid: Option<String>,
     /// cmux pane ref for this surface, e.g. `"pane:6"`.
     pub pane_ref: Option<String>,
     /// TTY device path, e.g. `"ttys030"`. Useful as a fingerprint for future
@@ -331,7 +338,7 @@ impl CmuxClient {
     ) -> Result<HashMap<String, Vec<SurfaceInfo>>> {
         let output = self
             .cmd()
-            .args(["tree", "--all", "--json"])
+            .args(["tree", "--all", "--json", "--id-format", "both"])
             .output()
             .await
             .context("failed to run cmux tree --all --json")?;
@@ -393,6 +400,7 @@ impl CmuxClient {
                         SurfaceInfo {
                             title: s.title,
                             ref_id: s.ref_id,
+                            uuid: s.uuid,
                             pane_ref: s.pane_ref,
                             tty: s.tty,
                             kind,

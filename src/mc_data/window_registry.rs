@@ -92,6 +92,11 @@ pub fn build_registry(
     let mut repo_roots_by_ws_id = HashMap::new();
     let mut repo_by_surface_by_ws_id = HashMap::new();
 
+    // cmux's authoritative per-surface agent binding (surface UUID -> bound
+    // session cwd/transcript). The highest-priority repo source: it reflects
+    // where the agent actually is, not a fuzzy session-log match.
+    let bound_by_surface = crate::mc_data::cmux_sessions::load_by_surface();
+
     for ws in workspaces {
         let workspace_repo = ws
             .current_directory
@@ -108,8 +113,16 @@ pub fn build_registry(
         for surface in &surfaces {
             surface_refs.push(surface.ref_id.clone());
             let session_record = session_records.and_then(|records| records.get(&surface.ref_id));
-            let (repo_root, repo_source) =
-                infer_surface_repo(surface, session_record, workspace_repo.as_ref());
+            let bound = surface
+                .uuid
+                .as_deref()
+                .and_then(|id| bound_by_surface.get(id));
+            let (repo_root, repo_source) = infer_surface_repo(
+                surface,
+                session_record,
+                workspace_repo.as_ref(),
+                bound.and_then(|b| b.cwd.as_deref()),
+            );
             if let Some(repo) = repo_root.as_ref() {
                 repo_by_surface.insert(surface.ref_id.clone(), repo.clone());
                 if seen_repos.insert(repo.clone()) {
@@ -221,7 +234,14 @@ fn infer_surface_repo(
     surface: &SurfaceInfo,
     session_record: Option<&SurfaceSessionRecord>,
     workspace_repo: Option<&PathBuf>,
+    bound_cwd: Option<&Path>,
 ) -> (Option<PathBuf>, Option<String>) {
+    // Highest priority: cmux's per-surface binding (where the agent actually
+    // is). This authoritatively scopes the surface's repo and stops a stale
+    // session-log cwd or a sibling surface from leaking another project in.
+    if let Some(repo) = bound_cwd.and_then(git_root_for_path) {
+        return (Some(repo), Some("cmux_bind".to_string()));
+    }
     if let Some(repo) = session_record
         .and_then(|record| record.frontmatter.cwd.as_deref())
         .and_then(path_from_str)
@@ -357,6 +377,7 @@ mod tests {
         SurfaceInfo {
             title,
             ref_id: ref_id.to_string(),
+            uuid: None,
             pane_ref: Some("pane:1".to_string()),
             tty: Some("ttys001".to_string()),
             kind: SurfaceKind::Claude,

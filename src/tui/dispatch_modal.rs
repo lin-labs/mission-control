@@ -373,6 +373,7 @@ mod tests {
             SurfaceInfo {
                 title: "claude".into(),
                 ref_id: "surface:92".into(),
+                uuid: None,
                 pane_ref: Some("pane:1".into()),
                 tty: Some("ttys001".into()),
                 kind: SurfaceKind::Claude,
@@ -386,6 +387,7 @@ mod tests {
             SurfaceInfo {
                 title: "codex".into(),
                 ref_id: "surface:93".into(),
+                uuid: None,
                 pane_ref: Some("pane:1".into()),
                 tty: Some("ttys002".into()),
                 kind: SurfaceKind::Codex,
@@ -399,6 +401,7 @@ mod tests {
             SurfaceInfo {
                 title: "shell".into(),
                 ref_id: "surface:94".into(),
+                uuid: None,
                 pane_ref: Some("pane:2".into()),
                 tty: Some("ttys003".into()),
                 kind: SurfaceKind::Shell,
@@ -413,6 +416,7 @@ mod tests {
             SurfaceInfo {
                 title: "https://example.com".into(),
                 ref_id: "surface:95".into(),
+                uuid: None,
                 pane_ref: Some("pane:3".into()),
                 tty: None,
                 kind: SurfaceKind::Unknown,
