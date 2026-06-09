@@ -62,6 +62,14 @@ pub enum Command {
     Summarize,
     /// Backfill the registry JSON for the active cmux window and exit.
     BackfillWindow,
+    /// Probe the local overall-summary path for a bound surface (by UUID):
+    /// resolve its cmux binding → read the transcript's user turns → xAI
+    /// summarize → write the persistent overall-summary cache. Prints the
+    /// result. Validates the path headlessly without driving the TUI.
+    OverallProbe {
+        /// cmux surface UUID (the `id` from `cmux tree --id-format both`).
+        surface_uuid: String,
+    },
     /// Probe the remote screen-grab + frame-merge loop against one surface.
     ///
     /// Repeatedly captures a surface, merges overlapping frames, and prints the

@@ -165,7 +165,39 @@ async fn main() -> Result<()> {
             iters,
             interval,
         }) => run_remote_grab_probe(&cli.tui, &surface_ref, iters, interval).await,
+        Some(config::Command::OverallProbe { surface_uuid }) => {
+            run_overall_probe(&cli.tui, &surface_uuid).await
+        }
     }
+}
+
+/// Validate the local overall-summary path end-to-end for one bound surface.
+async fn run_overall_probe(config: &Config, surface_uuid: &str) -> Result<()> {
+    let bound = crate::mc_data::cmux_sessions::load_by_surface();
+    let Some(b) = bound.get(surface_uuid) else {
+        anyhow::bail!("no cmux binding for surface uuid {surface_uuid}");
+    };
+    let Some(tp) = b.transcript_path.as_deref() else {
+        anyhow::bail!("binding has no transcript_path");
+    };
+    println!("agent={:?} transcript={}", b.agent, tp.display());
+    let users = crate::mc_data::transcript::user_turns(b.agent, tp);
+    println!("user turns: {}", users.len());
+    if let Some(first) = users.first() {
+        println!("  first: {}", first.chars().take(70).collect::<String>());
+    }
+    if let Some(last) = users.last() {
+        println!("  last:  {}", last.chars().take(70).collect::<String>());
+    }
+    let Some(key) = config.xai_api_key.clone() else {
+        anyhow::bail!("XAI_API_KEY not set");
+    };
+    let summary = crate::llm::xai::summarize_overall(&key, &users).await?;
+    println!("\n── xAI overall summary ──\n  {summary}");
+    crate::mc_data::overall_cache::put(tp, &summary, users.len())?;
+    let cached = crate::mc_data::overall_cache::get(tp);
+    println!("\ncached to disk: {:?}", cached.map(|(s, n)| (s, n)));
+    Ok(())
 }
 
 /// Probe the remote screen-grab + frame-merge loop against a single surface.
