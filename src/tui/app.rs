@@ -881,6 +881,10 @@ async fn gather_refresh_snapshot_inner(
                 HashMap<String, crate::mc_data::window_registry::SurfaceSessionRecord>,
             > = HashMap::new();
             let host = hostname_short();
+            // cmux's authoritative per-surface binding: surface UUID -> the
+            // agent's native transcript. Read once; used as the top-priority
+            // intent source so each surface shows ITS OWN overall/latest.
+            let bound_by_surface = crate::mc_data::cmux_sessions::load_by_surface();
             for ws in workspaces_for_surface_sessions {
                 let surfaces = surfaces_map_for_surface_sessions
                     .get(&ws.ref_id)
@@ -899,6 +903,30 @@ async fn gather_refresh_snapshot_inner(
                     );
                     if !eff.is_agent() {
                         continue;
+                    }
+                    // Top priority: cmux binding → the agent's native transcript.
+                    // Exact per surface, so two panes can't share a prompt and an
+                    // unstarted/exited pane shows nothing of its own.
+                    let bound = surface
+                        .uuid
+                        .as_deref()
+                        .and_then(|id| bound_by_surface.get(id));
+                    if let Some(b) = bound {
+                        if let Some(tp) = b.transcript_path.as_deref() {
+                            let intent =
+                                crate::mc_data::transcript::intent_from_transcript(b.agent, tp);
+                            if intent.overall_goal.is_some() || intent.latest_ask.is_some() {
+                                by_surface.insert(
+                                    surface.ref_id.clone(),
+                                    crate::mc_data::window_registry::SurfaceSessionRecord {
+                                        path: tp.to_path_buf(),
+                                        frontmatter: Default::default(),
+                                        intent,
+                                    },
+                                );
+                                continue; // binding wins; skip fuzzy markdown match
+                            }
+                        }
                     }
                     let same_agent_index = surfaces[..surface_idx]
                         .iter()
