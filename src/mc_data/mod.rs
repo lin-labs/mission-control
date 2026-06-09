@@ -1,10 +1,12 @@
 pub mod beads;
 pub mod dismissal;
 pub mod events;
+pub mod frame_merge;
 pub mod goals_json;
 pub mod inputs;
 pub mod paths;
 pub mod prompts;
+pub mod remote_intent;
 pub mod session_log;
 pub mod snapshots;
 pub mod surface_kind;

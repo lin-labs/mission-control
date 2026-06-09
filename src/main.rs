@@ -160,7 +160,61 @@ async fn main() -> Result<()> {
         }) => cli::bind::run(&surface_id, session_file.as_deref()),
         Some(config::Command::Summarize) => run_summarize_cli(&cli.tui).await,
         Some(config::Command::BackfillWindow) => run_backfill_window_cli(&cli.tui).await,
+        Some(config::Command::RemoteGrabProbe {
+            surface_ref,
+            iters,
+            interval,
+        }) => run_remote_grab_probe(&cli.tui, &surface_ref, iters, interval).await,
     }
+}
+
+/// Probe the remote screen-grab + frame-merge loop against a single surface.
+/// Read-only: captures `iters` times every `interval`s, feeds the frame merger,
+/// and prints what it learned. Validates remote-surface intent on a live pane.
+async fn run_remote_grab_probe(
+    config: &Config,
+    surface_ref: &str,
+    iters: u32,
+    interval: u64,
+) -> Result<()> {
+    use crate::mc_data::remote_intent::RemoteWatch;
+    use tokio::time::{Duration, sleep, timeout};
+
+    let client = CmuxClient::new(config.cmux_bin.clone(), config.cmux_socket.clone());
+    let mut watch = RemoteWatch::without_dump();
+
+    println!("probing {surface_ref}: {iters} captures every {interval}s");
+    for i in 0..iters {
+        let raw = timeout(Duration::from_secs(4), client.read_surface_text(surface_ref, 200))
+            .await
+            .ok()
+            .and_then(|r| r.ok());
+        match raw {
+            Some(text) => {
+                let out = watch.apply("probe", surface_ref, &text);
+                println!(
+                    "  [{:>2}] +{} new lines | transcript={} | status={}",
+                    i + 1,
+                    out.new_lines,
+                    out.transcript_len,
+                    out.status.as_deref().unwrap_or("-")
+                );
+            }
+            None => println!("  [{:>2}] capture failed/timed out", i + 1),
+        }
+        if i + 1 < iters {
+            sleep(Duration::from_secs(interval)).await;
+        }
+    }
+
+    if let Some(transcript) = watch.transcript(surface_ref) {
+        println!("\n── merged transcript tail ──");
+        let start = transcript.len().saturating_sub(20);
+        for line in &transcript[start..] {
+            println!("  {line}");
+        }
+    }
+    Ok(())
 }
 
 /// Headless one-shot registry refresh for the active cmux window. This is the
@@ -415,15 +469,33 @@ async fn run_app(
     // Channel for async screen-capture results (per-workspace, parallel)
     let (screen_tx, mut screen_rx) = mpsc::unbounded_channel::<crate::tui::app::ScreenUpdate>();
 
+    // Channel for remote (mosh/ssh) surface screen grabs (per-surface).
+    let (remote_tx, mut remote_rx) =
+        mpsc::unbounded_channel::<crate::tui::app::RemoteGrabUpdate>();
+
     // Kick off initial screen capture for the selected workspace
     app.spawn_load_screen_preview(cmux_client.clone(), classifier.cloned(), screen_tx.clone());
 
-    // Spawn cmux event stream subscriber
+    // Spawn cmux event stream subscriber. subscribe() returns only when the
+    // child process dies or the stream closes; hook updates are the primary
+    // agent-state signal, so we must reconnect rather than going silently
+    // blind. Capped exponential backoff prevents spinning on a down daemon; a
+    // healthy run (>60s) resets the backoff so transient blips recover fast.
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let cmux_bin = config.cmux_bin.clone();
     let cmux_socket = config.cmux_socket.clone();
     tokio::spawn(async move {
-        let _ = events::subscribe(&cmux_bin, &cmux_socket, event_tx).await;
+        use std::time::{Duration, Instant};
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            let started = Instant::now();
+            let _ = events::subscribe(&cmux_bin, &cmux_socket, event_tx.clone()).await;
+            if started.elapsed() > Duration::from_secs(60) {
+                backoff = Duration::from_secs(1);
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
     });
 
     // Create session file watcher
@@ -482,6 +554,7 @@ async fn run_app(
     let mut refresh_interval = interval(Duration::from_secs(30));
     let mut beads_refresh_interval = interval(Duration::from_secs(5));
     let mut screen_interval = interval(Duration::from_secs(15));
+    let mut remote_grab_interval = interval(Duration::from_secs(5));
     let mut regen_tick = interval(Duration::from_secs(30));
     let mut surface_summary_tick = interval(Duration::from_secs(60));
     let mut dismiss_tick = interval(Duration::from_secs(30));
@@ -1108,6 +1181,16 @@ async fn run_app(
 
             Some(update) = screen_rx.recv() => {
                 app.apply_screen_update(update);
+            }
+
+            _ = remote_grab_interval.tick() => {
+                // Capture + merge any remote (mosh/ssh) surfaces; results flow
+                // back via remote_rx. Read-only; never blocks the main loop.
+                app.spawn_remote_grabs(cmux_client.clone(), remote_tx.clone());
+            }
+
+            Some(update) = remote_rx.recv() => {
+                app.apply_remote_grab(update);
             }
 
             _ = peek_tick.tick() => {

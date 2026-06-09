@@ -1,0 +1,200 @@
+
+● Bash(cd /home/blin/Projects/elonco
+      echo "=== code that constructs an OBS-vault elonco/<profile> path or company/crons ==="…)
+  ⎿  === code that constructs an OBS-vault elonco/<profile> path or company/crons ===
+     src/elonco/profile_rename.py:238:        return vault / "elonco" / profile
+     src/elonco/profile_rename.py:240:        return paths.vault_root() / "elonco" / profile
+     … +34 lines (ctrl+o to expand)
+
+● The lead is disposable.py — app-server turns set their cwd to for_profile(profile, vault=vault_root).vault_root = <obs_vault>/elonco/<profile>, creating that
+  scaffolding. During the 10:15–10:18 respawn window the stale .env still mapped the channel to test-elonco, so a turn ran with cwd <obs>/elonco/test-elonco.
+  Let me confirm vault_root resolves to the obs vault and that turns now target lab-elonco:
+
+● Bash(cd /home/blin/Projects/elonco
+      echo "=== disposable.py vault_root resolution (155-165, 480-490) ==="…)
+  ⎿  === disposable.py vault_root resolution (155-165, 480-490) ===
+         paths.validate_project(profile)
+         role_name = _role_for_target(target)
+     … +25 lines (ctrl+o to expand)
+
+● Confirmed: it's a one-time artifact. The mechanism — disposable.py:484 sets each turn's cwd to for_profile(profile, vault=vault_root).vault_root =
+  <obs_vault>/elonco/<profile>. During the 10:15–10:18 respawn window the stale .env still mapped the channel to test-elonco, so a turn ran with cwd
+  <obs>/elonco/test-elonco and codex created the scaffolding. It hasn't been touched since the 10:18:55 restart (find confirms zero writes after) — turns now
+  target lab-elonco. Let me confirm it's empty scaffolding, remove it, and do a final both-trees sweep:
+
+● Bash(echo "=== is the leftover just empty scaffolding? (any real files?) ==="
+      find /home/blin/agents/obs/Agents/elonco/test-elonco -type f 2>/dev/null | sed 's/^/  f…)
+  ⎿  === is the leftover just empty scaffolding? (any real files?) ===
+       (no files above = empty scaffolding, safe to remove)
+     === remove the leftover vault folder ===
+     … +8 lines (ctrl+o to expand)
+
+● Resolved. The leftover was empty scaffolding (no real files), so I removed it. Both trees are now clean — no test-elonco directory in either ~/data/elonco/
+  or the vault.
+
+  What happened with the vault folder
+
+  It was a one-time artifact from the gateway-respawn window, not an ongoing leak:
+
+  - App-server turns set their working dir to <obs_vault>/elonco/<profile> (disposable.py:484).
+  - Between ~10:15 and the 10:18:55 restart, the Restart=always service kept respawning the gateway faster than I could hold it down, and during that gap the
+  .env still mapped the channel to test-elonco. A turn fired in that window → ran with cwd <vault>/elonco/test-elonco → codex created the arcmux/ +
+  company/crons/ scaffolding there (10:17:39).
+  - find -newermt 10:19:00 confirmed zero writes after the restart — once the gateway came back with the lab-elonco mapping, turns target lab-elonco, and the
+  stale folder just sat there empty until now.
+● Write(docs/retros/2026-06-08-profile-rename-cutover.md)
+  ⎿  Wrote 42 lines to docs/retros/2026-06-08-profile-rename-cutover.md
+      2 # Retro — first live profile rename cutover (`test-elonco` → `lab-elonco`)
+      3 Date: 2026-06-08. Feature: `elonco profile rename` (commit 1733afa) + first live cutover.
+      317 +def rewrite_hermes_profile_config(hermes_home: Path, old: str, new: str) -> dict[str, int]:                                                  
+      318 +    """Repoint a Hermes profile's config from ``old`` → ``new``.                                                                             
+      319 +                                                                                                                                             
+      320 +    Rewrites the routing-critical, NON-narrative config: ``.env`` (the                                                                       
+      321 +    ELONCO_HERMES_DISCORD_CHANNELS channel→profile map + identity aliases),                                                                  
+      322 +    ``cron/jobs.json`` (workdirs/args), the ``scripts/`` + ``.prompts/`` the                                                                 
+      323 +    crons run, and the codex trust path. Skips logs/sessions/run-output/caches/                                                              
+      324 +    snapshots. These files are structured config (not prose), so a global                                                                    
+      325 +    token replace is safe. Returns {file: occurrences}.                                                                                      
+      326 +    """                                                                                                                                      
+      327 +    targets: list[Path] = []                                                                                                                 
+      328 +    for rel in _HERMES_CONFIG_FILES:                                                                                                         
+      329 +        p = hermes_home / rel                                                                                                                
+      330 +        if p.is_file():                                                                                                                      
+      331 +            targets.append(p)                                                                                                                
+      332 +    for d in _HERMES_CONFIG_DIRS:                                                                                                            
+      333 +        dd = hermes_home / d                                                                                                                 
+      334 +        if dd.is_dir():                                                                                                                      
+      335 +            targets += [                                                                                                                     
+      336 +                f for f in dd.rglob("*")                                                                                                     
+      337 +                if f.is_file() and not (set(f.relative_to(dd).parts) & _HERMES_SKIP_PARTS)                                                   
+      338 +            ]                                                                                                                                
+      339 +    changed: dict[str, int] = {}                                                                                                             
+      340 +    for p in targets:                                                                                                                        
+      341 +        try:                                                                                                                                 
+      342 +            text = p.read_text(encoding="utf-8")                                                                                             
+      343 +        except (UnicodeDecodeError, OSError):                                                                                                
+      344 +            continue                                                                                                                         
+      345 +        if old not in text:                                                                                                                  
+      346 +            continue                                                                                                                         
+      347 +        try:                                                                                                                                 
+      348 +            p.write_text(text.replace(old, new), encoding="utf-8")                                                                           
+      349 +            changed[str(p)] = text.count(old)                                                                                                
+      350 +        except OSError:                                                                                                                      
+      351 +            pass                                                                                                                             
+      352 +    return changed                                                                                                                           
+      353 +                                                                                                                                             
+      354 +                                                                                                                                             
+      355  def _rewrite_json_config(path: Path, old: str, new: str) -> dict[str, str]:
+      356      """Rewrite known profile-bearing string fields in a JSON config file."""
+      357      if not path.exists():
+
+● Now wire the content-rewrite + verification into rename() (post-move, best-effort, outside the atomic block):
+
+      66 +                f"({', '.join(live[:4])}…)"                                                                                                   
+      67              )
+      68 +        if gw:                                                                                                                                
+      69 +            blockers.append(                                                                                                                  
+      70 +                f"a live gateway for Hermes profile {args.hermes_profile!r} "                                                                 
+      71 +                f"(pid {', '.join(gw)}) — stop it first "                                                                                     
+      72 +                f"(`systemctl --user stop hermes-gateway-{args.hermes_profile}.service`)"                                                     
+      73 +            )                                                                                                                                 
+      74 +        if blockers:                                                                                                                          
+      75 +            msg = ("rename blocked: " + "; ".join(blockers)                                                                                   
+      76 +                   + ". Quiesce these (rename between sprints, gateway stopped) "                                                             
+      77 +                     "or pass --force.")                                                                                                      
+      78              if args.json:
+      79                  emit_json({"success": False, "error": msg})
+      80              else:
+     ...
+       92              print(f"error: {exc}")
+       93          return 2
+       94  
+       95 +    # Repoint the Hermes profile config (.env channel map + identities, cron                                                                 
+       96 +    # jobs.json, scripts/.prompts, codex trust) — the routing-resurrection                                                                   
+       97 +    # vector. Without this the gateway re-creates the old profile on the next                                                                
+       98 +    # inbound event.                                                                                                                         
+       99 +    if args.hermes_profile and not args.dry_run:                                                                                             
+      100 +        hhome = Path(f"~/.hermes/profiles/{args.hermes_profile}").expanduser()                                                               
+      101 +        if hhome.is_dir():                                                                                                                   
+      102 +            result.hermes_config_rewrites = profile_rename.rewrite_hermes_profile_config(                                                    
+      103 +                hhome, old, new                                                                                                              
+      104 +            )                                                                                                                                
+      105 +            result.remaining_steps = [                                                                                                       
+      106 +                s for s in result.remaining_steps                                                                                            
+      107 +                if not s.startswith(("Hermes profile .env", "Hermes cron jobs"))                                                             
+      108 +            ]                                                                                                                                
+      109 +        else:                                                                                                                                
+      110 +            result.remaining_steps.insert(                                                                                                   
+      111 +                0, f"Hermes profile dir not found: {hhome} — update its config manually."                                                    
+      112 +            )                                                                                                                                
+      151 +        tot = sum(result.hermes_config_rewrites.values())                                                                                    
+      152 +        print(f"  hermes config rewritten: {tot} ref(s) in {len(result.hermes_config_rewrites)} file(s)")                                    
+      153      if result.channel_renamed:
+      154          print(f"  discord channel {result.channel_renamed[0]} → #{result.channel_renamed[1]}")
+      287 +    assert "elonco/co2/o" in txt          # our profile rewritten                                                                            
+      288 +    assert "elonco/co-other/o" in txt     # the overlapping one left intact                 "                                                 
+      289 +                                                                                                                                             
+      290 +                                                                                                                                             
+      291 +def test_rewrite_hermes_profile_config(tmp_path):                                                                                            
+      292 +    """Hermes config (.env map+identities, jobs.json, scripts, codex trust) is                                                               
+      293 +    repointed; logs/sessions/run-output are skipped."""                                                                                      
+      294 +    h = tmp_path / "hprofile"                                                                                                                
+      295 +    (h / "cron").mkdir(parents=True)                                                                                                         
+      296 +    (h / "scripts").mkdir()                                                                                                                  
+      297 +    (h / "home" / ".codex").mkdir(parents=True)                                                                                              
+      298 +    (h / "logs").mkdir()                                                                                                                     
+      299 +    (h / "cron" / "output").mkdir()                                                                                                          
+      300 +    (h / ".env").write_text(                                                                                                                 
+      279 -        new_text, n = text, 0                                                                                                                
+      280 -        for rx, repl in patterns:                                                                                                            
+      281 -            new_text, c = rx.subn(repl, new_text)                                                                                            
+      282 -            n += c                                                                                                                           
+      283 -        if n:                                                                                                                                
+      288 +        if old not in text:                                                                                                                  
+      289 +            continue                                                                                                                         
+      290 +        if patterns is not None:                                                                                                             
+      291 +            new_text, n = text, 0                                                                                                            
+      292 +            for rx, repl in patterns:                                                                                                        
+      293 +                new_text, c = rx.subn(repl, new_text)                                                                                        
+      294 +                n += c                                                                                                                       
+      295 +        else:                                                                                                                                
+      296 +            n = text.count(old)                                                                                                              
+      297 +            new_text = text.replace(old, new)                                                                                                
+      298 +        if n and new_text != text:                                                                                                           
+      299              try:
+      300                  p.write_text(new_text, encoding="utf-8")
+      301                  changed[str(p)] = n
+     ...
+      304      return changed
+      305  
+      306  
+      292 -def _scan_lingering(root: Path, patterns) -> list[str]:                                                                                      
+      293 -    """Files that STILL contain a machine-reference token after rewrite — the                                                                
+      294 -    verification that proves the rename is clean (should be empty)."""                                                                       
+      307 +def _scan_lingering(root: Path, old: str) -> list[str]:                                                                                      
+      308 +    """Operational files that STILL contain the old name after rewrite — the                                                                 
+      309 +    honest verification that the rename is clean (should be empty). Dated                                                                    
+      310 +    narrative history is excluded (it legitimately keeps the old name)."""                                                                   
+      311      hits: list[str] = []
+      312      for p in _iter_text_files(root):
+      313          try:
+      314              text = p.read_text(encoding="utf-8")
+      315          except (UnicodeDecodeError, OSError):
+      316              continue
+      301 -        if any(rx.search(text) for rx, _ in patterns):                                                                                       
+      317 +        if old in text:                                                                                                                      
+      318              hits.append(str(p))
+      319      return hits
+      320  
+
+● Now update rename() to use the new helpers:
+
+* Evaporating… (9m 44s · ↓ 44.8k tokens)
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯  
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt                                                                      Remote Control active
+
+[claude-170:claude-1780818375133799182*                                                                                 "⠂ Set up Hermes elonc" 10:46 08-Jun-26
+[44] 0:tmux*                                                                                                            "[blin-labs] tmux -L a" 10:46 08-Jun-26

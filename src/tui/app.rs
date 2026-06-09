@@ -17,12 +17,6 @@ pub fn notes_dir() -> PathBuf {
         .join(".config/mission-control/notes")
 }
 
-/// Directory for hook-written status files.
-pub fn status_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".config/mission-control/status")
-}
 
 /// Slugify a workspace name for use as a filename.
 fn workspace_slug(name: &str) -> String {
@@ -466,6 +460,14 @@ pub struct ScreenUpdate {
     pub classification: Option<ScreenClassification>,
 }
 
+/// One captured frame from a remote (mosh/ssh) surface, flowing back from a
+/// background grab task to [`App::apply_remote_grab`].
+pub struct RemoteGrabUpdate {
+    pub workspace_uuid: String,
+    pub surface_ref: String,
+    pub raw: String,
+}
+
 impl WorkspaceState {
     /// Whether this workspace has an AI agent surface (Claude Code, Codex, etc.)
     /// Checks screen insights (full capture), surface titles, and screen preview.
@@ -479,6 +481,16 @@ impl WorkspaceState {
             let t = s.title.to_lowercase();
             t.contains("claude") || t.contains("codex") || t.contains("opencode")
         })
+    }
+
+    /// Whether this workspace is a window onto a remote host: any surface has a
+    /// mosh/ssh client in the foreground. Remote agents have no cmux hook bridge,
+    /// so they get no hook events — this gates the typesafe classifier, which we
+    /// only spend on remote workspaces (local agents are covered by hooks).
+    pub fn is_remote(&self) -> bool {
+        self.surfaces
+            .iter()
+            .any(|s| s.kind == crate::mc_data::surface_kind::SurfaceKind::Remote)
     }
 
     /// Derive the agent name from session, screen insights, or surface titles.
@@ -533,20 +545,19 @@ impl WorkspaceState {
     /// Derive the agent state: is it baking or waiting for me?
     /// Priority: hook status (if fresh) > session frontmatter > screen activity > surface detection.
     pub fn agent_state(&self) -> AgentState {
-        // Hook-written status (instant, from Claude Code hooks)
-        // Only trust if less than 60 seconds old
-        if let Some((ref state, ts)) = self.hook_status {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            if now.saturating_sub(ts) < 60 {
-                return match state.as_str() {
-                    "working" => AgentState::Working,
-                    "waiting" => AgentState::NeedsMe,
-                    _ => AgentState::Idle,
-                };
-            }
+        // Hook-written status (instant, from agent hook events via cmux).
+        // No freshness window on purpose: agent state only transitions when a
+        // hook event fires (PreToolUse→working, Stop→waiting, …), so the
+        // absence of new events means the state genuinely hasn't changed. The
+        // last hook verdict stays authoritative until the next event supersedes
+        // it. (Remote agents have no hook bridge, so hook_status is None for
+        // them and they fall through to the typesafe path below.)
+        if let Some((ref state, _ts)) = self.hook_status {
+            return match state.as_str() {
+                "working" => AgentState::Working,
+                "waiting" => AgentState::NeedsMe,
+                _ => AgentState::Idle,
+            };
         }
 
         // TypeSafe AI classification (sub-100ms, high confidence)
@@ -661,6 +672,10 @@ pub struct App {
     pub pending_dismissal: Option<String>,
     /// vim-like input mode for the `:command` bar.
     pub input_mode: crate::tui::command::InputMode,
+    /// Per-surface screen-grab/merge state for remote (mosh/ssh) surfaces.
+    remote_watch: crate::mc_data::remote_intent::RemoteWatch,
+    /// Monotonic counter incremented each remote-grab tick (drives backoff).
+    remote_grab_tick: u64,
 }
 
 /// Pre-gathered data for one refresh cycle. Produced off the main loop by
@@ -1000,6 +1015,8 @@ impl App {
             beads_generation: 0,
             pending_dismissal: None,
             input_mode: crate::tui::command::InputMode::Normal,
+            remote_watch: crate::mc_data::remote_intent::RemoteWatch::new(),
+            remote_grab_tick: 0,
         }
     }
 
@@ -1155,6 +1172,16 @@ impl App {
             .iter()
             .map(|ws| (ws.workspace.uuid.clone(), ws.dismissal.clone()))
             .collect();
+        // Preserve hook-derived agent status across refreshes. hook_status is
+        // written in-memory by handle_agent_event from the cmux event stream;
+        // it must survive the workspace rebuild or every refresh tick would
+        // wipe the last hook verdict. (This replaces the old file-based
+        // load_hook_status, whose status dir nothing writes anymore.)
+        let old_hook_statuses: HashMap<String, Option<(String, u64)>> = self
+            .workspaces
+            .iter()
+            .map(|ws| (ws.workspace.uuid.clone(), ws.hook_status.clone()))
+            .collect();
         // Preserve the in-memory trajectory across refreshes so we can REUSE
         // it (instead of reloading from disk) when the user is actively
         // editing or peeking. Reloading mid-edit would clobber the
@@ -1224,7 +1251,7 @@ impl App {
                     }
                 };
                 let notes = load_workspace_notes(&ws.name);
-                let hook_status = load_hook_status(&ws.uuid);
+                let hook_status = old_hook_statuses.get(&ws.uuid).cloned().flatten();
                 let summary = old_summaries.get(&ws.uuid).cloned().flatten();
                 let edit_state = old_edit_states.get(&ws.uuid).cloned().flatten();
                 let peek_state = old_peek_states.get(&ws.uuid).cloned().flatten();
@@ -1724,6 +1751,9 @@ impl App {
         let idx = self.selected;
         if let Some(ws) = self.workspaces.get_mut(idx) {
             ws.loading = true;
+            // Typesafe only earns its keep on remote workspaces; local agents
+            // are classified by hook events, not vision.
+            let classifier = if ws.is_remote() { classifier } else { None };
             spawn_screen_task(
                 ws.workspace.uuid.clone(),
                 ws.workspace.ref_id.clone(),
@@ -1744,14 +1774,92 @@ impl App {
     ) {
         for ws in &mut self.workspaces {
             ws.loading = true;
+            // Remote-only: skip the typesafe call for local (hook-covered) ones.
+            let ws_classifier = if ws.is_remote() {
+                classifier.clone()
+            } else {
+                None
+            };
             spawn_screen_task(
                 ws.workspace.uuid.clone(),
                 ws.workspace.ref_id.clone(),
                 client.clone(),
-                classifier.clone(),
+                ws_classifier,
                 tx.clone(),
             );
         }
+    }
+
+    /// Fire off background captures for every remote (mosh/ssh) surface that's
+    /// due this tick, feeding results back via `tx`. Detection (`ps -A`) and the
+    /// captures run off the main loop so the UI never blocks.
+    ///
+    /// Phase 2: this maintains the per-surface frame mergers + a debug
+    /// transcript dump. Rendering the inferred two lines is wired in phase 3.
+    pub fn spawn_remote_grabs(
+        &mut self,
+        client: CmuxClient,
+        tx: tokio::sync::mpsc::UnboundedSender<RemoteGrabUpdate>,
+    ) {
+        self.remote_grab_tick = self.remote_grab_tick.wrapping_add(1);
+        let tick = self.remote_grab_tick;
+
+        // (workspace_uuid, surface_ref, tty) for every surface that has a tty
+        // and is due this tick (backoff). Non-remote surfaces are filtered out
+        // in the task once detection runs.
+        let mut candidates: Vec<(String, String, String)> = Vec::new();
+        let mut live_refs: Vec<String> = Vec::new();
+        for ws in &self.workspaces {
+            for s in &ws.surfaces {
+                live_refs.push(s.ref_id.clone());
+                if let Some(tty) = &s.tty {
+                    if self.remote_watch.due(&s.ref_id, tick) {
+                        candidates.push((ws.workspace.uuid.clone(), s.ref_id.clone(), tty.clone()));
+                    }
+                }
+            }
+        }
+        // Drop mergers for surfaces that no longer exist.
+        self.remote_watch.retain(&live_refs);
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        tokio::spawn(async move {
+            use tokio::time::{Duration, timeout};
+            // Detect which candidates are remote (mosh/ssh) in one `ps -A`.
+            let ttys: Vec<&str> = candidates.iter().map(|(_, _, t)| t.as_str()).collect();
+            let remote = crate::mc_data::surface_kind::detect_remote_all(&ttys);
+
+            for (ws_uuid, surface_ref, tty) in &candidates {
+                if remote.get(tty.as_str()).copied() != Some(true) {
+                    continue;
+                }
+                let raw = timeout(
+                    Duration::from_secs(4),
+                    client.read_surface_text(surface_ref, 200),
+                )
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .filter(|s| !s.trim().is_empty());
+                if let Some(raw) = raw {
+                    let _ = tx.send(RemoteGrabUpdate {
+                        workspace_uuid: ws_uuid.clone(),
+                        surface_ref: surface_ref.clone(),
+                        raw,
+                    });
+                }
+            }
+        });
+    }
+
+    /// Apply a remote-surface capture: feed the frame merger (dedup + status
+    /// peel) and persist the debug transcript.
+    pub fn apply_remote_grab(&mut self, update: RemoteGrabUpdate) {
+        self.remote_watch
+            .apply(&update.workspace_uuid, &update.surface_ref, &update.raw);
     }
 
     /// Apply a screen update message arriving from a background task.
@@ -2843,29 +2951,6 @@ fn spawn_screen_task(
             classification,
         });
     });
-}
-
-/// Load hook-written status for a workspace.
-/// Returns (state_string, unix_timestamp) if the file exists and is valid JSON.
-fn load_hook_status(workspace_uuid: &str) -> Option<(String, u64)> {
-    let path = status_dir().join(format!("{}.json", workspace_uuid));
-    let content = std::fs::read_to_string(path).ok()?;
-    // Minimal JSON parsing: {"state":"working","ts":"2026-05-17T15:50:00Z"}
-    let state = content
-        .split("\"state\"")
-        .nth(1)?
-        .split('"')
-        .nth(1)?
-        .to_string();
-    // Use file mtime as timestamp (simpler than parsing ISO 8601)
-    let mtime = std::fs::metadata(status_dir().join(format!("{}.json", workspace_uuid)))
-        .ok()?
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    Some((state, mtime))
 }
 
 /// Load notes for a workspace from the notes directory.

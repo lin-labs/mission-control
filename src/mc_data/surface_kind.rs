@@ -34,6 +34,10 @@ pub enum SurfaceKind {
     Codex,
     OtherAgent,
     Shell,
+    /// Foreground process is a remote-shell client (mosh/ssh/…). The real agent
+    /// (if any) runs on another host with no cmux hook bridge, so this surface's
+    /// state can't come from hook events — it's the typesafe / frame-merge path.
+    Remote,
     Unknown,
 }
 
@@ -49,6 +53,7 @@ impl SurfaceKind {
             Self::Codex => '▲',
             Self::OtherAgent => '◆',
             Self::Shell => '$',
+            Self::Remote => '⇅',
             Self::Unknown => '·',
         }
     }
@@ -60,6 +65,7 @@ impl SurfaceKind {
             Self::Codex => "codex",
             Self::OtherAgent => "agent",
             Self::Shell => "shell",
+            Self::Remote => "remote",
             Self::Unknown => "?",
         }
     }
@@ -69,6 +75,11 @@ impl SurfaceKind {
     /// path with a leading dash (`-/bin/zsh`). Strip path components and any
     /// leading dash before matching.
     pub fn from_comm(comm: &str) -> Self {
+        // A mosh/ssh client in the foreground means this surface is a window
+        // onto another host — classify it Remote before anything else.
+        if is_remote_comm(comm) {
+            return Self::Remote;
+        }
         let trimmed = comm.trim();
         // Drop login-shell leading '-' (e.g. "-/bin/zsh" or "-zsh").
         let no_dash = trimmed.strip_prefix('-').unwrap_or(trimmed);
@@ -188,18 +199,41 @@ pub fn detect_all(ttys: &[&str]) -> HashMap<String, SurfaceKind> {
         return result;
     }
 
-    let ps = std::process::Command::new("ps")
-        .args(["-A", "-o", "tty=,stat=,comm="])
-        .output();
-    let Ok(ps) = ps else { return result };
-    if !ps.status.success() {
-        return result;
+    let (fg_by_short, last_by_short) = match collect_fg_last_comms() {
+        Some(maps) => maps,
+        None => return result,
+    };
+
+    for tty in ttys {
+        // `ps -A -o tty=` emits the full short tty name (e.g. `ttys001`) on
+        // macOS — same form cmux already gives us. We only need to strip a
+        // leading `/dev/` if a caller passed the full device path.
+        let key = tty.trim_start_matches("/dev/");
+        let comm = fg_by_short
+            .get(key)
+            .or_else(|| last_by_short.get(key));
+        if let Some(comm) = comm {
+            // Strip leading `-` that `ps` prepends for login shells
+            // (e.g. `-/bin/zsh` is the login shell form of `zsh`).
+            let trimmed = comm.trim_start_matches('-');
+            result.insert(tty.to_string(), SurfaceKind::from_comm(trimmed));
+        }
     }
 
-    // macOS `ps` prints tty without the `tty` prefix (e.g. `s030` for
-    // `/dev/ttys030`). Build a map from the SHORT form to the foreground
-    // process's `comm`. STAT containing `+` marks the foreground process
-    // group — the one driving the terminal.
+    result
+}
+
+/// One `ps -A` pass → (foreground-comm-by-tty, last-comm-by-tty), keyed by the
+/// short tty name macOS prints (e.g. `ttys030`). Shared by [`detect_all`] and
+/// [`detect_remote_all`] so a refresh tick spawns one `ps`, not two.
+fn collect_fg_last_comms() -> Option<(HashMap<String, String>, HashMap<String, String>)> {
+    let ps = std::process::Command::new("ps")
+        .args(["-A", "-o", "tty=,stat=,comm="])
+        .output()
+        .ok()?;
+    if !ps.status.success() {
+        return None;
+    }
     let stdout = String::from_utf8_lossy(&ps.stdout);
     let mut fg_by_short: HashMap<String, String> = HashMap::new();
     let mut last_by_short: HashMap<String, String> = HashMap::new();
@@ -222,23 +256,39 @@ pub fn detect_all(ttys: &[&str]) -> HashMap<String, SurfaceKind> {
         }
         last_by_short.insert(tty, comm);
     }
+    Some((fg_by_short, last_by_short))
+}
 
+/// Is this foreground `comm` a remote-shell client (mosh/ssh/…)? Such a surface
+/// runs an agent on another host (tmux, no cmux), so its intent can only be
+/// learned by watching the screen — see `frame_merge` / the remote grab loop.
+pub fn is_remote_comm(comm: &str) -> bool {
+    let no_dash = comm.trim().strip_prefix('-').unwrap_or(comm.trim());
+    let basename = no_dash.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    matches!(
+        basename,
+        "mosh-client" | "mosh" | "ssh" | "autossh" | "et" | "eternal-terminal"
+    )
+}
+
+/// Batched remote detection: which of `ttys` have a mosh/ssh client in the
+/// foreground. One `ps -A` pass. Returns a map keyed by the input tty string;
+/// any error path leaves every tty `false`.
+pub fn detect_remote_all(ttys: &[&str]) -> HashMap<String, bool> {
+    let mut result: HashMap<String, bool> =
+        ttys.iter().map(|t| (t.to_string(), false)).collect();
+    if ttys.is_empty() {
+        return result;
+    }
+    let Some((fg_by_short, last_by_short)) = collect_fg_last_comms() else {
+        return result;
+    };
     for tty in ttys {
-        // `ps -A -o tty=` emits the full short tty name (e.g. `ttys001`) on
-        // macOS — same form cmux already gives us. We only need to strip a
-        // leading `/dev/` if a caller passed the full device path.
         let key = tty.trim_start_matches("/dev/");
-        let comm = fg_by_short
-            .get(key)
-            .or_else(|| last_by_short.get(key));
-        if let Some(comm) = comm {
-            // Strip leading `-` that `ps` prepends for login shells
-            // (e.g. `-/bin/zsh` is the login shell form of `zsh`).
-            let trimmed = comm.trim_start_matches('-');
-            result.insert(tty.to_string(), SurfaceKind::from_comm(trimmed));
+        if let Some(comm) = fg_by_short.get(key).or_else(|| last_by_short.get(key)) {
+            result.insert(tty.to_string(), is_remote_comm(comm));
         }
     }
-
     result
 }
 
@@ -353,5 +403,19 @@ mod tests {
     fn unknown_falls_through() {
         assert_eq!(SurfaceKind::from_comm("vim"), SurfaceKind::Unknown);
         assert_eq!(SurfaceKind::from_comm(""), SurfaceKind::Unknown);
+    }
+
+    #[test]
+    fn remote_comm_detects_mosh_and_ssh() {
+        assert!(is_remote_comm("mosh-client"));
+        assert!(is_remote_comm("/usr/local/bin/mosh-client"));
+        assert!(is_remote_comm("ssh"));
+        assert!(is_remote_comm("-ssh"));
+        assert!(is_remote_comm("autossh"));
+        // Local agents/shells are not remote clients.
+        assert!(!is_remote_comm("claude"));
+        assert!(!is_remote_comm("/opt/homebrew/bin/codex"));
+        assert!(!is_remote_comm("-/bin/zsh"));
+        assert!(!is_remote_comm(""));
     }
 }

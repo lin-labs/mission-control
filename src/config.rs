@@ -62,6 +62,21 @@ pub enum Command {
     Summarize,
     /// Backfill the registry JSON for the active cmux window and exit.
     BackfillWindow,
+    /// Probe the remote screen-grab + frame-merge loop against one surface.
+    ///
+    /// Repeatedly captures a surface, merges overlapping frames, and prints the
+    /// scroll deltas / new-line counts / live status line. Read-only; useful to
+    /// validate remote-surface intent against a live mosh/ssh pane.
+    RemoteGrabProbe {
+        /// Surface ref (e.g. `surface:29`) or surface UUID.
+        surface_ref: String,
+        /// Number of capture iterations.
+        #[arg(long, default_value_t = 6)]
+        iters: u32,
+        /// Seconds between captures.
+        #[arg(long, default_value_t = 5)]
+        interval: u64,
+    },
 }
 
 /// Configuration for the TUI (all existing flags live here).
