@@ -1161,6 +1161,14 @@ async fn run_app(
                 match refresh_result {
                     Ok(snap) => {
                         app.apply_refresh_snapshot(snap, config.xai_api_key.as_deref()).await;
+                        // Surfaces are loaded now — if the detail panel is open,
+                        // (re)generate the xAI "overall" summary for its bound
+                        // agent surfaces (change-gated). More reliable than the
+                        // key-transition trigger, which can fire before the first
+                        // refresh populates surfaces.
+                        if let Some(key) = config.xai_api_key.clone() {
+                            app.spawn_overall_summaries(key, overall_tx.clone());
+                        }
                         // After applying, diff surface counts to detect
                         // detachments (cmux doesn't yet emit
                         // surface.opened/closed events).
