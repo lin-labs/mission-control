@@ -96,14 +96,26 @@ lines.
 
 ### Phase 3 — inference + render ✅ (landed)
 
-- Change-gated: only call the LLM when `ingest` appended lines. Cheap model
-  (Haiku). Reuse `src/llm`.
-- Prompt extracts `{overall_goal, latest_ask}` from the deduped transcript with
-  the strict submitted-vs-suggested guardrails; returns null when unsure.
-- Persist `{transcript_hash, overall, latest, updated}` to
-  `~/data/mission-control/.data/<ws>/surfaces/<sid>.remote-intent.json`. mc reads
-  it as a tier-1 intent source; survives restart/backfill; re-infer only on
-  change. (Local surfaces keep using their structured sources; remote uses this.)
+- `xai::infer_intent` — xAI Grok (`grok-4-fast-non-reasoning`, `XAI_API_KEY`)
+  extracts `{overall_goal, latest_ask}` from the merged transcript with the
+  strict submitted-vs-suggested guardrails; returns null fields when no genuine
+  user message is present rather than guessing.
+- Change-gated: `RemoteWatch::transcript_for_inference` only fires after the
+  transcript grows ≥8 new lines since the last inference (or first time), so the
+  LLM isn't called every 5s tick.
+- Cache: the inferred intent lives in `RemoteWatch` (in-memory, per surface);
+  `all_intents()` snapshots it for the projection. The projection sources
+  `Remote`-surface intent from this cache and renders the two lines via the same
+  `format_surface_text` path as local surfaces. (Restart-persistent JSON cache is
+  a phase-4 nicety, not yet implemented — intent re-derives within ~10s of a
+  fresh launch.)
+- Flow: `apply_remote_grab` returns the transcript to infer → main loop fires the
+  xAI call off-loop → result returns via `RemoteIntentUpdate` →
+  `apply_remote_intent` stores it. `mc remote-grab-probe` prints the inferred
+  intent for validation.
+
+Validated live on surface:30 (labt): `overall`/`latest` both populated in the
+TUI from the screen-grab transcript.
 
 ### Phase 4 — refinements
 
