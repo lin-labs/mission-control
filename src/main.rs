@@ -488,6 +488,9 @@ async fn run_app(
     // Channel for xAI-inferred remote-surface intents (overall/latest).
     let (remote_intent_tx, mut remote_intent_rx) =
         mpsc::unbounded_channel::<crate::tui::app::RemoteIntentUpdate>();
+    // Channel for xAI "overall" session summaries (generated on detail open).
+    let (overall_tx, mut overall_rx) =
+        mpsc::unbounded_channel::<crate::tui::app::OverallSummaryUpdate>();
 
     // Kick off initial screen capture for the selected workspace
     app.spawn_load_screen_preview(cmux_client.clone(), classifier.cloned(), screen_tx.clone());
@@ -906,6 +909,12 @@ async fn run_app(
                             (KeyCode::Char('l') | KeyCode::Right, _) | (KeyCode::Enter, KeyModifiers::NONE) => {
                                 if app.focus == crate::tui::app::Focus::Sidebar {
                                     app.focus = crate::tui::app::Focus::Detail;
+                                    // Opening the detail panel: generate/refresh the
+                                    // xAI "overall" summary for this workspace's bound
+                                    // agent surfaces (change-gated).
+                                    if let Some(key) = config.xai_api_key.clone() {
+                                        app.spawn_overall_summaries(key, overall_tx.clone());
+                                    }
                                 } else {
                                     // In detail focus, Enter switches to the workspace in cmux (fire-and-forget)
                                     if let Some(ws) = app.selected_workspace() {
@@ -1229,6 +1238,10 @@ async fn run_app(
 
             Some(update) = remote_intent_rx.recv() => {
                 app.apply_remote_intent(update);
+            }
+
+            Some(update) = overall_rx.recv() => {
+                app.apply_overall_summary(update);
             }
 
             _ = peek_tick.tick() => {

@@ -155,6 +155,47 @@ fn parse_intent(raw: &str) -> Result<crate::mc_data::surface_render::SurfaceInte
     })
 }
 
+/// Summarize what the user is trying to accomplish across a session into one
+/// short line, for a surface's "overall" goal. Input is the session's user
+/// turns (most recent last). Returns a trimmed one-liner (<=90 chars-ish).
+pub async fn summarize_overall(api_key: &str, user_turns: &[String]) -> Result<String> {
+    if user_turns.is_empty() {
+        anyhow::bail!("no user turns to summarize");
+    }
+    // Cap input: keep the latest turns (they reflect the current direction)
+    // plus the first (the original goal).
+    let mut joined = String::new();
+    if let Some(first) = user_turns.first() {
+        joined.push_str("[first] ");
+        joined.push_str(&first.chars().take(400).collect::<String>());
+        joined.push('\n');
+    }
+    for t in user_turns.iter().rev().take(8).rev() {
+        joined.push_str("- ");
+        joined.push_str(&t.chars().take(400).collect::<String>());
+        joined.push('\n');
+    }
+    let prompt = format!(
+        "These are the user's messages in a coding-agent session (oldest first, \
+         newest last). In ONE short line (<=90 chars), state what the user is \
+         ultimately trying to accomplish overall — the session's goal, accounting \
+         for how it has evolved. Output ONLY the line, no quotes, no prefix.\n\n{joined}"
+    );
+    let raw = call_xai(api_key, &prompt, 64).await?;
+    let line = raw
+        .trim()
+        .trim_matches(|c| c == '"' || c == '`')
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if line.is_empty() {
+        anyhow::bail!("xai returned empty overall summary");
+    }
+    Ok(line)
+}
+
 async fn call_xai(api_key: &str, user_prompt: &str, max_tokens: u32) -> Result<String> {
     let body = Request {
         model: DEFAULT_MODEL,

@@ -22,17 +22,24 @@ use serde_json::Value;
 use crate::mc_data::session_log::{summarize_user_turn, ConversationIntent};
 use crate::mc_data::surface_kind::SurfaceKind;
 
-/// Read the bound transcript and return {overall = first real user turn,
-/// latest = last real user turn}. Empty/unreadable → empty intent.
-pub fn intent_from_transcript(agent: SurfaceKind, path: &Path) -> ConversationIntent {
+/// All real user turns in the bound transcript, in order. Empty/unreadable → [].
+pub fn user_turns(agent: SurfaceKind, path: &Path) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return ConversationIntent::default();
+        return Vec::new();
     };
-    let users = match agent {
+    match agent {
         SurfaceKind::Codex => codex_user_turns(&text),
         // Claude / OtherAgent use the Claude Code transcript shape.
         _ => claude_user_turns(&text),
-    };
+    }
+}
+
+/// Read the bound transcript and return {overall = first real user turn,
+/// latest = last real user turn}. Empty/unreadable → empty intent. The
+/// `overall` here is the deterministic fallback; a richer LLM session summary
+/// overrides it when available (see the overall-summary path in `tui::app`).
+pub fn intent_from_transcript(agent: SurfaceKind, path: &Path) -> ConversationIntent {
+    let users = user_turns(agent, path);
     ConversationIntent {
         overall_goal: users.first().and_then(|t| summarize_user_turn(t)),
         latest_ask: users.last().and_then(|t| summarize_user_turn(t)),

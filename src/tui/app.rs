@@ -475,6 +475,19 @@ pub struct RemoteIntentUpdate {
     pub intent: crate::mc_data::surface_render::SurfaceIntentSummary,
 }
 
+/// Regenerate a surface's "overall" summary only after this many new user turns
+/// (significant change), not every turn.
+const OVERALL_SUMMARY_EVERY: usize = 4;
+
+/// An xAI-generated "overall" session summary for a surface, flowing back from a
+/// background task to [`App::apply_overall_summary`].
+pub struct OverallSummaryUpdate {
+    pub surface_uuid: String,
+    pub summary: String,
+    /// User-turn count the summary was generated from (drives the K-turn gate).
+    pub turns: usize,
+}
+
 impl WorkspaceState {
     /// Whether this workspace has an AI agent surface (Claude Code, Codex, etc.)
     /// Checks screen insights (full capture), surface titles, and screen preview.
@@ -683,6 +696,11 @@ pub struct App {
     remote_watch: crate::mc_data::remote_intent::RemoteWatch,
     /// Monotonic counter incremented each remote-grab tick (drives backoff).
     remote_grab_tick: u64,
+    /// xAI-generated "overall" session summaries, keyed by surface UUID:
+    /// (summary, user_turn_count_when_generated). Regenerated on detail-panel
+    /// open, gated to every K new user turns. Overrides the deterministic
+    /// first-turn overall.
+    overall_summaries: HashMap<String, (String, usize)>,
 }
 
 /// Pre-gathered data for one refresh cycle. Produced off the main loop by
@@ -1052,6 +1070,7 @@ impl App {
             input_mode: crate::tui::command::InputMode::Normal,
             remote_watch: crate::mc_data::remote_intent::RemoteWatch::new(),
             remote_grab_tick: 0,
+            overall_summaries: HashMap::new(),
         }
     }
 
@@ -1429,6 +1448,9 @@ impl App {
         // Snapshot xAI-inferred intents for remote surfaces before the mutable
         // workspace loop (can't borrow self.remote_watch inside iter_mut).
         let remote_intents = self.remote_watch.all_intents();
+        // xAI "overall" summaries keyed by surface UUID, snapshotted before the
+        // mutable workspace loop; override the deterministic first-turn overall.
+        let overall_summaries = self.overall_summaries.clone();
         for ws_state in self.workspaces.iter_mut() {
             let surface_intents_for_ws = surface_intents_by_ws_id.get(&ws_state.workspace.uuid);
             if ws_state
@@ -1476,7 +1498,7 @@ impl App {
                     // overall/latest comes from the xAI inference over the
                     // screen-grab transcript (see remote_intent). Local agent
                     // surfaces use the session-log/screen path as before.
-                    let intent = if eff == crate::mc_data::surface_kind::SurfaceKind::Remote {
+                    let mut intent = if eff == crate::mc_data::surface_kind::SurfaceKind::Remote {
                         remote_intents.get(&s.ref_id).cloned()
                     } else {
                         surface_intent_summary(
@@ -1488,6 +1510,23 @@ impl App {
                             &goals,
                         )
                     };
+                    // Override "overall" with the richer xAI session summary when
+                    // one exists for this surface (keyed by UUID).
+                    if let Some((summary, _)) =
+                        s.uuid.as_deref().and_then(|u| overall_summaries.get(u))
+                    {
+                        let summary = summary.clone();
+                        intent = Some(match intent {
+                            Some(mut i) => {
+                                i.overall_goal = Some(summary);
+                                i
+                            }
+                            None => crate::mc_data::surface_render::SurfaceIntentSummary {
+                                overall_goal: Some(summary),
+                                latest_ask: None,
+                            },
+                        });
+                    }
                     let text = crate::mc_data::surface_render::format_surface_text(
                         eff,
                         &s.title,
@@ -1937,6 +1976,77 @@ impl App {
     pub fn apply_remote_intent(&mut self, update: RemoteIntentUpdate) {
         self.remote_watch
             .set_intent(&update.surface_ref, update.intent);
+    }
+
+    /// When the detail panel is open on a workspace, generate (or refresh) the
+    /// xAI "overall" session summary for each of its bound agent surfaces.
+    /// Change-gated: regenerate only when a surface has ≥`OVERALL_SUMMARY_EVERY`
+    /// new user turns since its last summary (or has none yet). Runs off the
+    /// main loop; results return via [`App::apply_overall_summary`].
+    pub fn spawn_overall_summaries(
+        &self,
+        xai_api_key: String,
+        tx: tokio::sync::mpsc::UnboundedSender<OverallSummaryUpdate>,
+    ) {
+        if self.focus != Focus::Detail {
+            return;
+        }
+        let Some(ws) = self.selected_workspace() else {
+            return;
+        };
+        // (surface_uuid, agent, transcript_path, turns_at_last_summary)
+        let mut targets: Vec<(String, crate::mc_data::surface_kind::SurfaceKind, std::path::PathBuf, usize)> =
+            Vec::new();
+        let bound = crate::mc_data::cmux_sessions::load_by_surface();
+        for s in &ws.surfaces {
+            let eff = crate::mc_data::surface_kind::effective_kind(
+                &ws.workspace.uuid,
+                &s.ref_id,
+                s.kind,
+            );
+            if !eff.is_agent() {
+                continue;
+            }
+            let Some(uuid) = s.uuid.as_deref() else {
+                continue;
+            };
+            let Some(b) = bound.get(uuid) else { continue };
+            let Some(tp) = b.transcript_path.as_ref() else {
+                continue;
+            };
+            let turns_at = self
+                .overall_summaries
+                .get(uuid)
+                .map(|(_, n)| *n)
+                .unwrap_or(0);
+            targets.push((uuid.to_string(), b.agent, tp.clone(), turns_at));
+        }
+        if targets.is_empty() {
+            return;
+        }
+        tokio::spawn(async move {
+            for (uuid, agent, transcript, turns_at) in targets {
+                let users = crate::mc_data::transcript::user_turns(agent, &transcript);
+                let turns = users.len();
+                let due = turns_at == 0 || turns.saturating_sub(turns_at) >= OVERALL_SUMMARY_EVERY;
+                if !due || turns == 0 {
+                    continue;
+                }
+                if let Ok(summary) = crate::llm::xai::summarize_overall(&xai_api_key, &users).await {
+                    let _ = tx.send(OverallSummaryUpdate {
+                        surface_uuid: uuid,
+                        summary,
+                        turns,
+                    });
+                }
+            }
+        });
+    }
+
+    /// Store an xAI "overall" summary for a surface (rendered next refresh).
+    pub fn apply_overall_summary(&mut self, update: OverallSummaryUpdate) {
+        self.overall_summaries
+            .insert(update.surface_uuid, (update.summary, update.turns));
     }
 
     /// Apply a screen update message arriving from a background task.
