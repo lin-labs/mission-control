@@ -9,6 +9,14 @@ use std::path::PathBuf;
 /// `uuid` is the cmux workspace UUID (stable forever).
 /// `unique_name` is the current display name from cmux.
 /// `project` is the project name (defaults to `unique_name`).
+/// Whether a workspace title is worth a human-readable display symlink at the
+/// data root. Path-like titles (containing `/`), dotfile-ish titles (leading
+/// `.`), and empty titles sanitize into top-level junk, so they're skipped.
+fn is_displayable_name(name: &str) -> bool {
+    let t = name.trim();
+    !t.is_empty() && !t.contains('/') && !t.starts_with('.')
+}
+
 pub fn ensure_workspace(uuid: &str, unique_name: &str, project: &str) -> Result<()> {
     let wp = paths::workspace_dir(uuid);
 
@@ -32,8 +40,14 @@ pub fn ensure_workspace(uuid: &str, unique_name: &str, project: &str) -> Result<
             .with_context(|| format!("seed trajectory.md at {traj_path:?}"))?;
     }
 
-    // Display symlink at the data root. Relative target so the symlink
-    // resolves correctly inside the data dir regardless of cwd.
+    // Display symlink at the data root — a human-readable alias for `cd`.
+    // Skip path-like / dotfile / empty titles: they sanitize into top-level
+    // junk (`__data_mission-control_windows`, `__.cmuxterm`, `_mosh___…`) that
+    // clutters the data root without being a useful workspace name.
+    if !is_displayable_name(unique_name) {
+        return Ok(());
+    }
+    // Relative target so the symlink resolves regardless of cwd.
     let link = paths::display_symlink(unique_name);
     let target: PathBuf = PathBuf::from(".data").join(uuid);
     if let Ok(existing) = fs::read_link(&link) {
@@ -102,4 +116,24 @@ fn write_if_changed(path: &std::path::Path, contents: &str) -> Result<()> {
         }
     }
     write_atomic(path, canonical)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_displayable_name;
+
+    #[test]
+    fn displayable_names_filter_path_like_and_dotfiles() {
+        // Real workspace titles → keep.
+        assert!(is_displayable_name("[lab] elonco"));
+        assert!(is_displayable_name("agents upgrade"));
+        assert!(is_displayable_name("gmail-triage"));
+        // Path-like / dotfile / transient → skip (these created the junk symlinks).
+        assert!(!is_displayable_name("/data/mission-control/windows"));
+        assert!(!is_displayable_name("mosh [blin-labs]:~/.c/fish"));
+        assert!(!is_displayable_name(".cmuxterm"));
+        assert!(!is_displayable_name("~/agents/histories"));
+        assert!(!is_displayable_name(""));
+        assert!(!is_displayable_name("   "));
+    }
 }

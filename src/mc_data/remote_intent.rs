@@ -66,7 +66,9 @@ pub struct GrabOutcome {
 impl RemoteWatch {
     pub fn new() -> Self {
         Self {
-            dump_enabled: true,
+            // The per-surface .remote-transcript dump is debug-only noise; write
+            // it only when explicitly asked via MC_DEBUG_REMOTE_TRANSCRIPT.
+            dump_enabled: std::env::var_os("MC_DEBUG_REMOTE_TRANSCRIPT").is_some(),
             ..Default::default()
         }
     }
