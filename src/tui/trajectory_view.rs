@@ -19,6 +19,7 @@ pub fn kind_color(kind: SurfaceKind) -> Color {
         SurfaceKind::Codex => Color::Rgb(6, 182, 212),
         SurfaceKind::OtherAgent => Color::Magenta,
         SurfaceKind::Shell => Color::Gray,
+        SurfaceKind::Remote => Color::Rgb(34, 197, 94),
         SurfaceKind::Unknown => Color::DarkGray,
     }
 }
@@ -33,6 +34,7 @@ fn glyph_kind(c: char) -> Option<SurfaceKind> {
         '▲' => Some(SurfaceKind::Codex),
         '◆' => Some(SurfaceKind::OtherAgent),
         '$' => Some(SurfaceKind::Shell),
+        '⇅' => Some(SurfaceKind::Remote),
         '·' => Some(SurfaceKind::Unknown),
         _ => None,
     }
@@ -111,11 +113,28 @@ fn split_surface_intent(text: &str) -> (&str, Option<&str>, Option<&str>) {
     (text[..main_end].trim_end(), overall, ask)
 }
 
-fn surface_item_lines<'a>(prefix: &str, text: &'a str, dim: bool, base: Style) -> Vec<Line<'a>> {
+fn surface_item_lines<'a>(
+    prefix: &str,
+    text: &'a str,
+    dim: bool,
+    base: Style,
+    cursor: bool,
+) -> Vec<Line<'a>> {
     let (main, overall, ask) = split_surface_intent(text);
-    let mut first = vec![Span::styled(prefix.to_string(), base)];
-    first.extend(surface_row_spans(main, dim, base));
-    let mut lines = vec![Line::from(first)];
+    // The main (title) line carries the nav cursor highlight when selected; the
+    // overall/latest sub-lines render identically whether or not the row is the
+    // cursor, so selecting a surface doesn't change its structure.
+    let first_line = if cursor {
+        Line::from(Span::styled(
+            format!("{prefix}{main}"),
+            Style::default().fg(Color::Black).bg(Color::Cyan),
+        ))
+    } else {
+        let mut first = vec![Span::styled(prefix.to_string(), base)];
+        first.extend(surface_row_spans(main, dim, base));
+        Line::from(first)
+    };
+    let mut lines = vec![first_line];
     if let Some(goal) = overall.filter(|s| !s.is_empty()) {
         lines.push(Line::from(vec![
             Span::styled("    overall: ", base.fg(Color::DarkGray)),
@@ -318,14 +337,24 @@ pub fn render_with_hints(
                 } else {
                     Color::Gray
                 };
-                if section.name == SECTION_CURRENT_SURFACES && !is_cursor && !is_insert_cursor {
+                // Current surfaces render as a clean multi-line block (title +
+                // overall/latest) in nav mode — whether or not the row is the
+                // cursor. Only the editor's insert mode (blocked here anyway)
+                // falls through to the single-line path below.
+                if section.name == SECTION_CURRENT_SURFACES && !is_insert_cursor {
                     let dim = item
                         .surface_id
                         .as_deref()
                         .map(|sid| hints.dim_surface_refs.contains(sid))
                         .unwrap_or(false);
                     let base = Style::default().fg(text_color);
-                    lines.extend(surface_item_lines(prefix, display_text, dim, base));
+                    lines.extend(surface_item_lines(
+                        prefix,
+                        display_text,
+                        dim,
+                        base,
+                        is_cursor && !in_insert,
+                    ));
                     continue;
                 }
 
@@ -571,6 +600,90 @@ workspace: intent
         assert!(
             dump.contains("Show Beads rows"),
             "missing latest ask: {dump}"
+        );
+    }
+
+    #[test]
+    fn cursor_on_surface_row_keeps_overall_and_latest_structure() {
+        // Regression: selecting a surface used to collapse it to a single raw
+        // line (exposing inline `overall:`/`ask:` markers and shifting the
+        // layout). The cursor row must keep the same multi-line structure,
+        // just with the main line highlighted.
+        let doc = TrajectoryDoc::parse(
+            "---
+workspace: intent
+---
+
+## Mission
+- Demo
+
+## Current surfaces
+- ✻ claude · claude · mbp · working   overall:Build detail view   ask:Show Beads rows              <!-- mc:surface:surface:11 -->
+
+## Beads
+- [ ] repo-1 active issue
+",
+        )
+        .unwrap();
+        let surfaces_idx = doc
+            .sections
+            .iter()
+            .position(|s| s.name == SECTION_CURRENT_SURFACES)
+            .expect("current surfaces section");
+        let state = TrajectoryEditState {
+            cursor_section: surfaces_idx,
+            cursor_item: 0,
+            mode: EditMode::Nav,
+            ..Default::default()
+        };
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    Rect::new(0, 0, 90, 20),
+                    Some(&doc),
+                    0,
+                    true,
+                    Some(&state),
+                    None,
+                    None,
+                )
+            })
+            .unwrap();
+        let dump = buf_dump(&terminal);
+        // Structure preserved even though the row is selected.
+        assert!(
+            dump.contains("overall:") && dump.contains("Build detail view"),
+            "selected surface dropped its overall line: {dump}"
+        );
+        assert!(
+            dump.contains("latest:") && dump.contains("Show Beads rows"),
+            "selected surface dropped its latest line: {dump}"
+        );
+
+        // The main (title) line carries the Cyan cursor highlight, and the raw
+        // inline `overall:`/`ask:` markers are NOT on that highlighted line.
+        let buf = terminal.backend().buffer();
+        let mut highlighted_main = false;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().chars().next().unwrap_or(' ')))
+                .collect();
+            let is_main_title =
+                row.contains("claude") && !row.contains("overall:") && !row.contains("latest:");
+            if is_main_title
+                && (0..buf.area.width)
+                    .filter_map(|x| buf.cell((x, y)))
+                    .any(|c| c.style().bg == Some(Color::Cyan))
+            {
+                highlighted_main = true;
+            }
+        }
+        assert!(
+            highlighted_main,
+            "selected surface's main line should have a Cyan highlight: {dump}"
         );
     }
 
