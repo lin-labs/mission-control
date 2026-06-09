@@ -94,7 +94,7 @@ anchors agreeing each transition.
 Not yet rendered — phase 3 turns the merged transcript into the two displayed
 lines.
 
-### Phase 3 — inference + cache
+### Phase 3 — inference + render ✅ (landed)
 
 - Change-gated: only call the LLM when `ingest` appended lines. Cheap model
   (Haiku). Reuse `src/llm`.
