@@ -207,11 +207,24 @@ async fn run_remote_grab_probe(
         }
     }
 
-    if let Some(transcript) = watch.transcript(surface_ref) {
+    let transcript_text = watch.transcript(surface_ref).map(|t| {
         println!("\n── merged transcript tail ──");
-        let start = transcript.len().saturating_sub(20);
-        for line in &transcript[start..] {
+        let start = t.len().saturating_sub(20);
+        for line in &t[start..] {
             println!("  {line}");
+        }
+        t.join("\n")
+    });
+
+    // Exercise the xAI inference path on the merged transcript.
+    if let (Some(text), Some(key)) = (transcript_text, config.xai_api_key.clone()) {
+        println!("\n── xAI inferred intent ──");
+        match crate::llm::xai::infer_intent(&key, &text).await {
+            Ok(intent) => {
+                println!("  overall: {}", intent.overall_goal.as_deref().unwrap_or("(none)"));
+                println!("  latest:  {}", intent.latest_ask.as_deref().unwrap_or("(none)"));
+            }
+            Err(e) => println!("  inference failed: {e:#}"),
         }
     }
     Ok(())
@@ -472,6 +485,9 @@ async fn run_app(
     // Channel for remote (mosh/ssh) surface screen grabs (per-surface).
     let (remote_tx, mut remote_rx) =
         mpsc::unbounded_channel::<crate::tui::app::RemoteGrabUpdate>();
+    // Channel for xAI-inferred remote-surface intents (overall/latest).
+    let (remote_intent_tx, mut remote_intent_rx) =
+        mpsc::unbounded_channel::<crate::tui::app::RemoteIntentUpdate>();
 
     // Kick off initial screen capture for the selected workspace
     app.spawn_load_screen_preview(cmux_client.clone(), classifier.cloned(), screen_tx.clone());
@@ -1190,7 +1206,29 @@ async fn run_app(
             }
 
             Some(update) = remote_rx.recv() => {
-                app.apply_remote_grab(update);
+                // Feed the merger; if the transcript grew enough, fire a
+                // change-gated xAI inference off the main loop to refresh the
+                // surface's overall/latest. Result flows back via remote_intent_rx.
+                if let Some((_ws, surface_ref, transcript)) = app.apply_remote_grab(update) {
+                    if let Some(key) = config.xai_api_key.clone() {
+                        let tx = remote_intent_tx.clone();
+                        tokio::spawn(async move {
+                            match crate::llm::xai::infer_intent(&key, &transcript).await {
+                                Ok(intent) => {
+                                    let _ = tx.send(crate::tui::app::RemoteIntentUpdate {
+                                        surface_ref,
+                                        intent,
+                                    });
+                                }
+                                Err(e) => eprintln!("remote intent inference: {e:#}"),
+                            }
+                        });
+                    }
+                }
+            }
+
+            Some(update) = remote_intent_rx.recv() => {
+                app.apply_remote_intent(update);
             }
 
             _ = peek_tick.tick() => {

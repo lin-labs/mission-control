@@ -468,6 +468,13 @@ pub struct RemoteGrabUpdate {
     pub raw: String,
 }
 
+/// An LLM-inferred intent for a remote surface, flowing back from a background
+/// xAI task to [`App::apply_remote_intent`].
+pub struct RemoteIntentUpdate {
+    pub surface_ref: String,
+    pub intent: crate::mc_data::surface_render::SurfaceIntentSummary,
+}
+
 impl WorkspaceState {
     /// Whether this workspace has an AI agent surface (Claude Code, Codex, etc.)
     /// Checks screen insights (full capture), surface titles, and screen preview.
@@ -1391,6 +1398,9 @@ impl App {
         // workspaces processed back-to-back don't both pick the same code
         // (e.g. "MSC" for two repos that look alike).
         let mut used_prefixes_this_pass: Vec<String> = Vec::new();
+        // Snapshot xAI-inferred intents for remote surfaces before the mutable
+        // workspace loop (can't borrow self.remote_watch inside iter_mut).
+        let remote_intents = self.remote_watch.all_intents();
         for ws_state in self.workspaces.iter_mut() {
             let surface_intents_for_ws = surface_intents_by_ws_id.get(&ws_state.workspace.uuid);
             if ws_state
@@ -1434,14 +1444,22 @@ impl App {
                         &s.ref_id,
                         s.kind,
                     );
-                    let intent = surface_intent_summary(
-                        surface_intents_for_ws.and_then(|m| m.get(&s.ref_id)),
-                        ws_state.session.as_ref(),
-                        ws_state.screen_insights.user_prompt.as_deref(),
-                        s,
-                        eff,
-                        &goals,
-                    );
+                    // Remote (mosh/ssh) surfaces have no local session log; their
+                    // overall/latest comes from the xAI inference over the
+                    // screen-grab transcript (see remote_intent). Local agent
+                    // surfaces use the session-log/screen path as before.
+                    let intent = if eff == crate::mc_data::surface_kind::SurfaceKind::Remote {
+                        remote_intents.get(&s.ref_id).cloned()
+                    } else {
+                        surface_intent_summary(
+                            surface_intents_for_ws.and_then(|m| m.get(&s.ref_id)),
+                            ws_state.session.as_ref(),
+                            ws_state.screen_insights.user_prompt.as_deref(),
+                            s,
+                            eff,
+                            &goals,
+                        )
+                    };
                     let text = crate::mc_data::surface_render::format_surface_text(
                         eff,
                         &s.title,
@@ -1856,10 +1874,24 @@ impl App {
     }
 
     /// Apply a remote-surface capture: feed the frame merger (dedup + status
-    /// peel) and persist the debug transcript.
-    pub fn apply_remote_grab(&mut self, update: RemoteGrabUpdate) {
+    /// peel) and persist the debug transcript. Returns
+    /// `Some((workspace_uuid, surface_ref, transcript))` when the transcript has
+    /// grown enough to warrant a fresh xAI intent inference (change-gated).
+    pub fn apply_remote_grab(
+        &mut self,
+        update: RemoteGrabUpdate,
+    ) -> Option<(String, String, String)> {
         self.remote_watch
             .apply(&update.workspace_uuid, &update.surface_ref, &update.raw);
+        self.remote_watch
+            .transcript_for_inference(&update.surface_ref)
+            .map(|transcript| (update.workspace_uuid, update.surface_ref, transcript))
+    }
+
+    /// Store an xAI-inferred intent for a remote surface (rendered next refresh).
+    pub fn apply_remote_intent(&mut self, update: RemoteIntentUpdate) {
+        self.remote_watch
+            .set_intent(&update.surface_ref, update.intent);
     }
 
     /// Apply a screen update message arriving from a background task.

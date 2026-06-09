@@ -14,6 +14,7 @@ use std::collections::HashMap;
 
 use crate::mc_data::frame_merge::FrameMerger;
 use crate::mc_data::paths;
+use crate::mc_data::surface_render::SurfaceIntentSummary;
 
 /// Max transcript lines retained per remote surface.
 const MAX_TRANSCRIPT_LINES: usize = 4000;
@@ -21,11 +22,18 @@ const MAX_TRANSCRIPT_LINES: usize = 4000;
 const IDLE_BACKOFF_AFTER: u32 = 2;
 /// Largest poll stride (in base-5s ticks) when a surface is idle (~30s).
 const MAX_STRIDE: u64 = 6;
+/// Re-infer intent once the transcript has grown by this many new lines since
+/// the last inference (change-gated, so we don't call the LLM every 5s tick).
+const INFER_DELTA: usize = 8;
 
 struct SurfaceState {
     merger: FrameMerger,
     /// Consecutive grabs that produced no new transcript lines.
     idle_rounds: u32,
+    /// Last LLM-inferred intent for this surface, if any.
+    intent: Option<SurfaceIntentSummary>,
+    /// Transcript length at the last inference (drives the change gate).
+    intent_at_len: usize,
 }
 
 impl SurfaceState {
@@ -33,6 +41,8 @@ impl SurfaceState {
         Self {
             merger: FrameMerger::new(MAX_TRANSCRIPT_LINES),
             idle_rounds: 0,
+            intent: None,
+            intent_at_len: 0,
         }
     }
 }
@@ -116,6 +126,38 @@ impl RemoteWatch {
     /// Current deduplicated transcript for a surface, if tracked.
     pub fn transcript(&self, surface_ref: &str) -> Option<&[String]> {
         self.states.get(surface_ref).map(|s| s.merger.transcript.as_slice())
+    }
+
+    /// If `surface_ref`'s transcript has grown enough since the last inference
+    /// (or has never been inferred), return the transcript to feed the LLM and
+    /// mark this length as inferred (optimistic, so we don't re-trigger while
+    /// the async call is in flight). Returns `None` when no inference is due.
+    pub fn transcript_for_inference(&mut self, surface_ref: &str) -> Option<String> {
+        let st = self.states.get_mut(surface_ref)?;
+        let len = st.merger.transcript.len();
+        let grown = len.saturating_sub(st.intent_at_len);
+        let due = (st.intent.is_none() && len > 0) || grown >= INFER_DELTA;
+        if !due {
+            return None;
+        }
+        st.intent_at_len = len;
+        Some(st.merger.transcript.join("\n"))
+    }
+
+    /// Store an LLM-inferred intent for a surface.
+    pub fn set_intent(&mut self, surface_ref: &str, intent: SurfaceIntentSummary) {
+        if let Some(st) = self.states.get_mut(surface_ref) {
+            st.intent = Some(intent);
+        }
+    }
+
+    /// Snapshot of all tracked surfaces' inferred intents, for the projection
+    /// to read without borrowing the live watch during the workspace loop.
+    pub fn all_intents(&self) -> HashMap<String, SurfaceIntentSummary> {
+        self.states
+            .iter()
+            .filter_map(|(k, s)| s.intent.clone().map(|i| (k.clone(), i)))
+            .collect()
     }
 }
 

@@ -75,13 +75,13 @@ pub async fn generate_workspace_prefix(
     };
 
     // First try.
-    let raw = call_xai(api_key, &attempt(None)).await?;
+    let raw = call_xai(api_key, &attempt(None), 8).await?;
     if let Some(p) = validate(&raw, used_prefixes) {
         return Ok(p);
     }
 
     // Second try, telling the model what it just got wrong.
-    let raw2 = call_xai(api_key, &attempt(Some(&raw))).await?;
+    let raw2 = call_xai(api_key, &attempt(Some(&raw)), 8).await?;
     if let Some(p) = validate(&raw2, used_prefixes) {
         return Ok(p);
     }
@@ -92,7 +92,70 @@ pub async fn generate_workspace_prefix(
     ))
 }
 
-async fn call_xai(api_key: &str, user_prompt: &str) -> Result<String> {
+/// Infer a surface's intent (`overall_goal` + `latest_ask`) from a merged
+/// terminal transcript. Used for remote (mosh/ssh) surfaces, whose convo can
+/// only be observed via the screen — see `frame_merge` / `remote_intent`.
+///
+/// The prompt is hardened against the classic screen-grab mistake: input-box
+/// placeholders, suggestions, and unsent typing must NOT be treated as user
+/// asks. Returns empty fields rather than guessing when no genuine user
+/// message is present.
+pub async fn infer_intent(
+    api_key: &str,
+    transcript: &str,
+) -> Result<crate::mc_data::surface_render::SurfaceIntentSummary> {
+    // Cap input: the tail holds the most recent (and most relevant) turns.
+    let tail = {
+        let lines: Vec<&str> = transcript.lines().collect();
+        let start = lines.len().saturating_sub(200);
+        lines[start..].join("\n")
+    };
+    let prompt = format!(
+        "You are reading a terminal transcript of a coding-agent session (a human user and an AI \
+         assistant). Extract two things:\n\
+         - overall_goal: what the user is ultimately trying to accomplish across the session (<=90 chars).\n\
+         - latest_ask: the MOST RECENT message the user actually SUBMITTED (<=90 chars).\n\
+         Only count text the user actually submitted. Do NOT treat input-box placeholder text, \
+         autocomplete or command suggestions, in-progress (unsent) typing, menus, or the assistant's \
+         own words as a user ask. If you cannot find a genuine submitted user message, use null.\n\
+         Output ONLY compact JSON (no prose, no code fences): \
+         {{\"overall_goal\": <string|null>, \"latest_ask\": <string|null>}}.\n\n\
+         Transcript:\n{tail}"
+    );
+    let raw = call_xai(api_key, &prompt, 200).await?;
+    parse_intent(&raw)
+}
+
+fn parse_intent(raw: &str) -> Result<crate::mc_data::surface_render::SurfaceIntentSummary> {
+    use crate::mc_data::surface_render::SurfaceIntentSummary;
+    let s = raw.trim();
+    // Be lenient: pull the first {...} object even if the model wrapped it.
+    let json = match (s.find('{'), s.rfind('}')) {
+        (Some(a), Some(b)) if b > a => &s[a..=b],
+        _ => anyhow::bail!(
+            "xai intent: no JSON object in {:?}",
+            s.chars().take(80).collect::<String>()
+        ),
+    };
+    #[derive(Deserialize)]
+    struct RawIntent {
+        #[serde(default)]
+        overall_goal: Option<String>,
+        #[serde(default)]
+        latest_ask: Option<String>,
+    }
+    let parsed: RawIntent = serde_json::from_str(json).context("xai intent parse")?;
+    let clean = |o: Option<String>| {
+        o.map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
+    };
+    Ok(SurfaceIntentSummary {
+        overall_goal: clean(parsed.overall_goal),
+        latest_ask: clean(parsed.latest_ask),
+    })
+}
+
+async fn call_xai(api_key: &str, user_prompt: &str, max_tokens: u32) -> Result<String> {
     let body = Request {
         model: DEFAULT_MODEL,
         messages: vec![Message {
@@ -100,7 +163,7 @@ async fn call_xai(api_key: &str, user_prompt: &str) -> Result<String> {
             content: user_prompt,
         }],
         temperature: 0.0,
-        max_tokens: 8,
+        max_tokens,
     };
 
     let client = reqwest::Client::new();
