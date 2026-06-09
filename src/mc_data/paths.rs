@@ -14,13 +14,6 @@ pub fn agent_histories_dir() -> PathBuf {
         .join("histories")
 }
 
-pub fn session_logs_dir() -> PathBuf {
-    dirs::home_dir()
-        .expect("home dir resolvable")
-        .join("data")
-        .join("Sessions")
-}
-
 pub fn data_subroot() -> PathBuf {
     data_root().join(".data")
 }

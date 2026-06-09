@@ -172,11 +172,18 @@ fn mc_setup_creates_data_root() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn mc_setup_creates_histories_symlinks() {
+fn mc_setup_links_tools_into_blueprint_histories() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
+    // The agents blueprint (install/link-obs.sh) owns ~/agents/histories and
+    // wires it to obs/Agents/Sessions (the Obsidian vault). mc only reads it.
+    let vault_sessions = home.join("obs/Agents/Sessions");
+    std::fs::create_dir_all(&vault_sessions).unwrap();
+    std::fs::create_dir_all(home.join("agents")).unwrap();
+    let histories = home.join("agents/histories");
+    symlink(&vault_sessions, &histories).unwrap();
 
     let output = Command::new(mc_bin())
         .env("HOME", &home)
@@ -189,22 +196,18 @@ fn mc_setup_creates_histories_symlinks() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let sessions = home.join("data/Sessions");
+    // mc must not create its own ~/data/Sessions store.
     assert!(
-        sessions.is_dir(),
-        "sessions dir should be created at {sessions:?}"
+        !home.join("data/Sessions").exists(),
+        "mc setup must not create ~/data/Sessions"
     );
-    let histories = home.join("agents/histories");
-    assert!(
-        histories.is_symlink(),
-        "histories path should be a symlink at {histories:?}"
-    );
+    // The blueprint histories symlink is left exactly as the blueprint wired it.
     assert_eq!(
         std::fs::read_link(&histories).unwrap(),
-        sessions,
-        "histories should point to ~/data/Sessions"
+        vault_sessions,
+        "setup must not repoint the blueprint histories symlink"
     );
-
+    // Per-tool convenience links point into ~/agents/histories.
     for tool in &[".claude/histories", ".codex/histories"] {
         let link = home.join(tool);
         let target = std::fs::read_link(&link).unwrap_or_else(|e| {
@@ -214,13 +217,18 @@ fn mc_setup_creates_histories_symlinks() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn mc_setup_is_idempotent_on_histories_symlinks() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
+    let vault_sessions = home.join("obs/Agents/Sessions");
+    std::fs::create_dir_all(&vault_sessions).unwrap();
+    std::fs::create_dir_all(home.join("agents")).unwrap();
+    let histories = home.join("agents/histories");
+    symlink(&vault_sessions, &histories).unwrap();
     let env = [("HOME", home.to_str().unwrap())];
-    // First run — creates everything.
+    // First run — creates the per-tool links.
     let r1 = Command::new(mc_bin())
         .envs(env)
         .arg("setup")
@@ -234,28 +242,30 @@ fn mc_setup_is_idempotent_on_histories_symlinks() {
         .output()
         .unwrap();
     assert!(r2.status.success());
-    // Symlinks still correct.
+    // Tool links still correct.
     for tool in &[".claude/histories", ".codex/histories"] {
         assert_eq!(
             std::fs::read_link(home.join(tool)).unwrap(),
-            home.join("agents/histories")
+            histories
         );
     }
+    // Blueprint histories symlink left untouched across runs.
     assert_eq!(
-        std::fs::read_link(home.join("agents/histories")).unwrap(),
-        home.join("data/Sessions")
+        std::fs::read_link(&histories).unwrap(),
+        vault_sessions
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn mc_setup_migrates_stale_histories_symlink() {
+fn mc_setup_preserves_blueprint_histories_symlink() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
-    let old_sessions = home.join("obs/Agents/Sessions");
-    std::fs::create_dir_all(&old_sessions).unwrap();
+    // The blueprint wires ~/agents/histories -> obs/Agents/Sessions (the vault).
+    let vault_sessions = home.join("obs/Agents/Sessions");
+    std::fs::create_dir_all(&vault_sessions).unwrap();
     std::fs::create_dir_all(home.join("agents")).unwrap();
-    symlink(&old_sessions, home.join("agents/histories")).unwrap();
+    symlink(&vault_sessions, home.join("agents/histories")).unwrap();
 
     let output = Command::new(mc_bin())
         .env("HOME", &home)
@@ -268,11 +278,18 @@ fn mc_setup_migrates_stale_histories_symlink() {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    // mc aligns to the blueprint: it must NOT repoint the vault-backed symlink
+    // to ~/data/Sessions, and must not create that store.
     assert_eq!(
         std::fs::read_link(home.join("agents/histories")).unwrap(),
-        home.join("data/Sessions")
+        vault_sessions,
+        "setup must preserve the blueprint histories symlink"
     );
-    assert!(old_sessions.is_dir(), "setup should not delete old target");
+    assert!(
+        !home.join("data/Sessions").exists(),
+        "mc setup must not create ~/data/Sessions"
+    );
+    assert!(vault_sessions.is_dir(), "setup should not delete the vault target");
 }
 
 #[cfg(unix)]
@@ -399,15 +416,18 @@ fn mc_backfill_window_fails_when_tree_window_does_not_match_list_window() {
 
 #[cfg(unix)]
 #[test]
-fn mc_backfill_window_fails_on_stale_default_histories_symlink() {
+fn mc_backfill_window_accepts_vault_backed_default_histories() {
+    // The blueprint wires the default ~/agents/histories -> obs/Agents/Sessions
+    // (the Obsidian vault). mc must accept that vault-backed symlink, not treat
+    // it as stale.
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
-    let old_sessions = home.join("obs/Agents/Sessions");
+    let vault_sessions = home.join("obs/Agents/Sessions");
     let repo = tmp.path().join("repo");
-    std::fs::create_dir_all(&old_sessions).unwrap();
+    std::fs::create_dir_all(&vault_sessions).unwrap();
     std::fs::create_dir_all(home.join("agents")).unwrap();
     std::fs::create_dir_all(&repo).unwrap();
-    symlink(&old_sessions, home.join("agents/histories")).unwrap();
+    symlink(&vault_sessions, home.join("agents/histories")).unwrap();
     let fake_cmux = tmp.path().join("cmux");
     write_fake_cmux(&fake_cmux, &repo, true);
 
@@ -421,16 +441,15 @@ fn mc_backfill_window_fails_on_stale_default_histories_symlink() {
         .output()
         .expect("run backfill-window");
     assert!(
-        !output.status.success(),
-        "backfill should fail on stale default histories link; stdout={} stderr={}",
+        output.status.success(),
+        "backfill should accept the vault-backed default histories link; stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        !home
-            .join("data/mission-control/windows/WIN-1/window.json")
-            .exists(),
-        "failed backfill should not write a registry"
+        home.join("data/mission-control/windows/WIN-1/window.json")
+            .is_file(),
+        "successful backfill should write a registry"
     );
 }
 

@@ -183,54 +183,24 @@ pub fn summarize_user_turn(text: &str) -> Option<String> {
     one_line_summary(text)
 }
 
+/// Validate that the histories directory exists and is readable.
+///
+/// The histories location is owned by the agents blueprint, which wires
+/// `~/agents/histories -> obs/Agents/Sessions` (the Obsidian vault) via
+/// `install/link-obs.sh`. mc only *reads* session logs from here, so it
+/// trusts whatever the blueprint symlink resolves to — it does not assert a
+/// specific physical target (e.g. `~/data/Sessions`). A symlink to a real
+/// directory passes because `is_dir()` follows symlinks.
 pub fn validate_histories_dir(histories_dir: &Path) -> Result<()> {
     if !histories_dir.is_dir() {
         anyhow::bail!(
-            "histories dir {} does not exist or is not a directory",
+            "histories dir {} does not exist or is not a directory \
+             (the agents blueprint should wire ~/agents/histories -> obs/Agents/Sessions)",
             histories_dir.display()
         );
     }
     std::fs::read_dir(histories_dir)
         .with_context(|| format!("read histories dir {}", histories_dir.display()))?;
-    let default_histories = crate::mc_data::paths::agent_histories_dir();
-    if histories_dir == default_histories.as_path() {
-        let expected = crate::mc_data::paths::session_logs_dir();
-        let meta = std::fs::symlink_metadata(histories_dir)
-            .with_context(|| format!("stat histories dir {}", histories_dir.display()))?;
-        if !meta.file_type().is_symlink() {
-            anyhow::bail!(
-                "{} must be a symlink to {}",
-                histories_dir.display(),
-                expected.display()
-            );
-        }
-        let target = std::fs::read_link(histories_dir)
-            .with_context(|| format!("readlink {}", histories_dir.display()))?;
-        let resolved = if target.is_absolute() {
-            target
-        } else {
-            histories_dir
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(target)
-        };
-        let resolved = std::fs::canonicalize(&resolved)
-            .with_context(|| format!("canonicalize histories target {}", resolved.display()))?;
-        let expected = std::fs::canonicalize(&expected).with_context(|| {
-            format!(
-                "canonicalize expected histories target {}",
-                expected.display()
-            )
-        })?;
-        if resolved != expected {
-            anyhow::bail!(
-                "{} points to {}, expected {}",
-                histories_dir.display(),
-                resolved.display(),
-                expected.display()
-            );
-        }
-    }
     Ok(())
 }
 

@@ -18,21 +18,27 @@ pub fn run() -> Result<()> {
         created.push(format!("Created {}", archive.display()));
     }
 
-    // Histories symlinks: keep the stable access path at
-    // ~/agents/histories, backed by ~/data/Sessions on fresh installs. Do not
-    // route live session logs through the Obsidian vault.
-    let sessions_target = crate::mc_data::paths::session_logs_dir();
-    std::fs::create_dir_all(&sessions_target)
-        .with_context(|| format!("create {sessions_target:?}"))?;
-    let sessions_dir = crate::mc_data::paths::agent_histories_dir();
-    install_history_symlink(&sessions_dir, &sessions_target, &mut created)?;
-
+    // Histories are owned by the agents blueprint: `install/link-obs.sh` wires
+    // ~/agents/histories -> obs/Agents/Sessions (the Obsidian vault), and mc
+    // only *reads* session logs from there. mc must never create or repoint
+    // this path — if it is missing, point the user at the blueprint installer.
     let home = dirs::home_dir().expect("home dir");
-    for tool_history in [
-        home.join(".claude/histories"),
-        home.join(".codex/histories"),
-    ] {
-        install_history_symlink(&tool_history, &sessions_dir, &mut created)?;
+    let sessions_dir = crate::mc_data::paths::agent_histories_dir();
+    if sessions_dir.is_dir() {
+        // Per-tool convenience links into the blueprint histories dir.
+        for tool_history in [
+            home.join(".claude/histories"),
+            home.join(".codex/histories"),
+        ] {
+            install_history_symlink(&tool_history, &sessions_dir, &mut created)?;
+        }
+    } else {
+        eprintln!(
+            "warn: {} is missing or not a directory — session history will not load.\n      \
+             The agents blueprint owns this path; run install/link-obs.sh so it resolves to \
+             obs/Agents/Sessions. mc will not create or repoint it.",
+            sessions_dir.display()
+        );
     }
 
     if created.is_empty() {

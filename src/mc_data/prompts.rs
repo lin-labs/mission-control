@@ -57,16 +57,17 @@ pub struct PromptRules {
 // Path helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve the obsAgents vault root.
-/// Prefers $OBS_AGENTS env var, falls back to the stable ~/agents/Obsidian
-/// symlink (never a hardcoded iCloud path).
+/// Resolve the obsAgents vault root (the `Agents/` folder inside the Obsidian
+/// vault). Prefers the $OBS_AGENTS env var, falls back to the stable
+/// ~/agents/obsAgents symlink (-> obs/Agents) — never a hardcoded iCloud path,
+/// and never the nonexistent ~/agents/Obsidian path.
 pub fn obsagents_root() -> PathBuf {
     if let Ok(v) = std::env::var("OBS_AGENTS") {
         return PathBuf::from(v);
     }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/"))
-        .join("agents/Obsidian/Agents")
+        .join("agents/obsAgents")
 }
 
 pub fn project_prompts_dir(project: &str) -> PathBuf {
