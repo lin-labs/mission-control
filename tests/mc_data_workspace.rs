@@ -50,10 +50,10 @@ fn ensure_workspace_dir_creates_full_tree() {
             "predinvest"
         );
 
-        // Display symlink at the root points into .data/<uuid>/
+        // Display symlink at the root points into active/<uuid>/
         let link = paths::display_symlink("predinvest");
         let target = std::fs::read_link(&link).unwrap();
-        assert!(target.to_string_lossy().contains(".data/uuid-1"));
+        assert!(target.to_string_lossy().contains("active/uuid-1"));
     });
 }
 
@@ -146,9 +146,9 @@ fn ensure_workspace_handles_names_with_slashes() {
     with_tmp_home(|home| {
         workspace::ensure_workspace("uuid-slash", "~/Boyan", "~/Boyan").unwrap();
         assert!(paths::workspace_dir("uuid-slash").is_dir());
-        assert_eq!(
-            std::fs::read_link(home.join("data/mission-control/__Boyan")).unwrap(),
-            std::path::PathBuf::from(".data").join("uuid-slash")
+        assert!(
+            !home.join("data/mission-control/__Boyan").exists(),
+            "path-like workspace titles should not create display symlinks"
         );
     });
 }

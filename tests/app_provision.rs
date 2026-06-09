@@ -29,7 +29,7 @@ fn ensure_workspace_idempotent_across_simulated_refreshes() {
 
         // Display symlink is still the one we created.
         let target = std::fs::read_link(paths::display_symlink("alpha")).unwrap();
-        assert!(target.to_string_lossy().contains(".data/uuid-A"));
+        assert!(target.to_string_lossy().contains("active/uuid-A"));
     });
 
     match prior {

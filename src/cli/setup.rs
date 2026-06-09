@@ -60,8 +60,11 @@ pub fn run() -> Result<()> {
 
 fn print_hook_recommendations() {
     println!();
-    println!("mc setup: optional Claude Code SessionStart hook");
+    println!("mc setup: optional Claude Code SessionStart session-binding hook");
     println!();
+    // Retained intentionally: mux session state carries agent activity, but it
+    // does not carry the cmux surface id or session-history file path that
+    // mc's per-surface peek resolver needs.
     println!("Add to ~/.claude/settings.json under \"hooks\":");
     println!(
         r#"{{

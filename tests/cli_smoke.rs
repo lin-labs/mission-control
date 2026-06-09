@@ -142,8 +142,8 @@ fn mc_resolve_prints_workspace_dir() {
     assert!(
         stdout
             .trim()
-            .ends_with("data/mission-control/.data/abc-123"),
-        "expected resolve to end with .data/abc-123, got stdout={stdout:?}"
+            .ends_with("data/mission-control/active/abc-123"),
+        "expected resolve to end with active/abc-123, got stdout={stdout:?}"
     );
 }
 
@@ -162,7 +162,7 @@ fn mc_setup_creates_data_root() {
     );
     let root = tmp.path().join("data/mission-control");
     assert!(root.is_dir(), "expected {root:?} created");
-    assert!(root.join(".data").is_dir());
+    assert!(root.join("active").is_dir());
     assert!(root.join(".archived").is_dir());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -336,7 +336,7 @@ fn mc_backfill_window_writes_registry_with_fake_cmux() {
     assert!(registry_dir.join("workspaces/WS-1.json").is_file());
     assert!(registry_dir.join("surfaces/surface_1.json").is_file());
     assert!(home
-        .join("data/mission-control/.data/WS-1/trajectory.md")
+        .join("data/mission-control/active/WS-1/trajectory.md")
         .is_file());
     let window = std::fs::read_to_string(registry_dir.join("window.json")).unwrap();
     assert!(window.contains("\"window_id\": \"WIN-1\""));

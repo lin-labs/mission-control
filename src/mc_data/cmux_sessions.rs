@@ -17,8 +17,10 @@ use serde::Deserialize;
 use crate::mc_data::surface_kind::SurfaceKind;
 
 /// One surface's bound agent session, distilled from the cmux hook registry.
-/// `cwd` drives repo attribution now; `agent`/`transcript_path`/`lifecycle` are
-/// consumed by the next increment (per-surface intent from the bound transcript).
+/// `cwd` drives repo attribution now; `agent`/`transcript_path` support
+/// per-surface intent from the bound transcript. `lifecycle` is parsed for
+/// compatibility with the cmux registry, but mission-control's activity state
+/// is read from the centralized mux session docs instead.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct HookSession {

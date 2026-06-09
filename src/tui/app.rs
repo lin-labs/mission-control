@@ -3,6 +3,7 @@ use crate::cmux::events::AgentEvent;
 use crate::llm::Summary;
 use crate::llm::trajectory_regen::RegenInputs;
 use crate::llm::typesafe::{ScreenClassification, TypeSafeClassifier};
+use crate::mc_data::mux_state::MuxSessionState;
 use crate::session::file::{self, SessionFile};
 use crate::session::watcher::FileChanged;
 use anyhow::{Context, Result};
@@ -16,7 +17,6 @@ pub fn notes_dir() -> PathBuf {
         .unwrap_or_default()
         .join(".config/mission-control/notes")
 }
-
 
 /// Slugify a workspace name for use as a filename.
 fn workspace_slug(name: &str) -> String {
@@ -405,9 +405,8 @@ pub struct WorkspaceState {
     pub tool_call_count: u32,
     /// Persistent user notes (loaded from ~/.config/mission-control/notes/).
     pub notes: Option<String>,
-    /// Hook-written status (from ~/.config/mission-control/status/).
-    /// Tuple of (state, timestamp_secs). Stale after 60s.
-    pub hook_status: Option<(String, u64)>,
+    /// Activity status read from the centralized mux protocol state.
+    pub mux_status: Option<MuxSessionState>,
     /// TypeSafe AI classification of screen content.
     pub classification: Option<ScreenClassification>,
     /// True while a background screen refresh / classification is in flight.
@@ -495,17 +494,22 @@ impl WorkspaceState {
     }
 
     /// Whether this workspace is a window onto a remote host: any surface has a
-    /// mosh/ssh client in the foreground. Remote agents have no cmux hook bridge,
-    /// so they get no hook events — this gates the typesafe classifier, which we
-    /// only spend on remote workspaces (local agents are covered by hooks).
+    /// mosh/ssh client in the foreground. Remote panes often lack local mux
+    /// protocol state, so this gates the TypeSafe classifier, which we only
+    /// spend on remote workspaces.
     pub fn is_remote(&self) -> bool {
         self.surfaces
             .iter()
             .any(|s| s.kind == crate::mc_data::surface_kind::SurfaceKind::Remote)
     }
 
-    /// Derive the agent name from session, screen insights, or surface titles.
+    /// Derive the agent name from mux state, session, screen insights, or surface titles.
     pub fn agent_name(&self) -> &str {
+        if let Some(ref status) = self.mux_status {
+            if !status.agent.is_empty() {
+                return &status.agent;
+            }
+        }
         if let Some(ref session) = self.session {
             if let Some(ref agent) = session.frontmatter.agent {
                 return agent;
@@ -554,21 +558,19 @@ impl WorkspaceState {
     }
 
     /// Derive the agent state: is it baking or waiting for me?
-    /// Priority: hook status (if fresh) > session frontmatter > screen activity > surface detection.
+    /// Priority: mux protocol state > TypeSafe classification > screen activity > surface detection.
     pub fn agent_state(&self) -> AgentState {
-        // Hook-written status (instant, from agent hook events via cmux).
-        // No freshness window on purpose: agent state only transitions when a
-        // hook event fires (PreToolUse→working, Stop→waiting, …), so the
-        // absence of new events means the state genuinely hasn't changed. The
-        // last hook verdict stays authoritative until the next event supersedes
-        // it. (Remote agents have no hook bridge, so hook_status is None for
-        // them and they fall through to the typesafe path below.)
-        if let Some((ref state, _ts)) = self.hook_status {
-            return match state.as_str() {
-                "working" => AgentState::Working,
-                "waiting" => AgentState::NeedsMe,
-                _ => AgentState::Idle,
-            };
+        // Central mux state is the authoritative activity source. Native hooks
+        // write exactly one protocol store via `arcmux hook`; mc only reads
+        // these JSON docs and does not infer working/idle from hook event names.
+        if let Some(ref status) = self.mux_status {
+            if status.working {
+                return AgentState::Working;
+            }
+            if status.has_ended_turn() || status.last_event == "notification" {
+                return AgentState::NeedsMe;
+            }
+            return AgentState::Idle;
         }
 
         // TypeSafe AI classification (sub-100ms, high confidence)
@@ -577,18 +579,6 @@ impl WorkspaceState {
                 return match cls.state.as_str() {
                     "working" => AgentState::Working,
                     "waiting" => AgentState::NeedsMe,
-                    _ => AgentState::Idle,
-                };
-            }
-        }
-
-        // Session frontmatter (manual override)
-        if let Some(ref session) = self.session {
-            if let Some(ref status) = session.frontmatter.status {
-                return match status.as_str() {
-                    "active" => AgentState::Working,
-                    "waiting" | "idle" => AgentState::NeedsMe,
-                    "done" => AgentState::Idle,
                     _ => AgentState::Idle,
                 };
             }
@@ -1155,7 +1145,7 @@ impl App {
     /// Apply a pre-gathered refresh snapshot to `self`. Pure mutation, no I/O
     /// that could block: the slow parts (cmux client calls, 999-file session
     /// parsing) ran off-thread in `gather_refresh_snapshot` and arrived here as
-    /// data. Per-workspace file reads (trajectory.md, notes, hook_status) are
+    /// data. Per-workspace file reads (trajectory.md, notes) are
     /// still synchronous but are bounded — ~25 workspaces × ~4 small files ≈
     /// 100 reads, which is ~tens of ms total on a warm cache.
     pub async fn apply_refresh_snapshot(
@@ -1221,15 +1211,13 @@ impl App {
             .iter()
             .map(|ws| (ws.workspace.uuid.clone(), ws.dismissal.clone()))
             .collect();
-        // Preserve hook-derived agent status across refreshes. hook_status is
-        // written in-memory by handle_agent_event from the cmux event stream;
-        // it must survive the workspace rebuild or every refresh tick would
-        // wipe the last hook verdict. (This replaces the old file-based
-        // load_hook_status, whose status dir nothing writes anymore.)
-        let old_hook_statuses: HashMap<String, Option<(String, u64)>> = self
+        // Preserve mux-derived agent status across refreshes. The cmux event
+        // stream is retained only to map session_id -> workspace_id; working
+        // and turn-timing facts are polled from ~/data/mux/sessions/*.json.
+        let old_mux_statuses: HashMap<String, Option<MuxSessionState>> = self
             .workspaces
             .iter()
-            .map(|ws| (ws.workspace.uuid.clone(), ws.hook_status.clone()))
+            .map(|ws| (ws.workspace.uuid.clone(), ws.mux_status.clone()))
             .collect();
         // Preserve the in-memory trajectory across refreshes so we can REUSE
         // it (instead of reloading from disk) when the user is actively
@@ -1300,7 +1288,7 @@ impl App {
                     }
                 };
                 let notes = load_workspace_notes(&ws.name);
-                let hook_status = old_hook_statuses.get(&ws.uuid).cloned().flatten();
+                let mux_status = old_mux_statuses.get(&ws.uuid).cloned().flatten();
                 let summary = old_summaries.get(&ws.uuid).cloned().flatten();
                 let edit_state = old_edit_states.get(&ws.uuid).cloned().flatten();
                 let peek_state = old_peek_states.get(&ws.uuid).cloned().flatten();
@@ -1317,7 +1305,7 @@ impl App {
                     screen_insights,
                     tool_call_count,
                     notes,
-                    hook_status,
+                    mux_status,
                     classification: None,
                     loading: false,
                     summary,
@@ -1703,37 +1691,73 @@ impl App {
     pub fn handle_agent_event(&mut self, event: &AgentEvent) {
         self.session_to_workspace
             .insert(event.session_id.clone(), event.workspace_id.clone());
+        // Retained event names feed non-status consumers such as debugging and
+        // future filtering, but working/waiting is read from mux JSON docs.
+        let _ = event.event_name.as_str();
 
         if let Some(&idx) = self.workspace_index.get(&event.workspace_id) {
             self.workspaces[idx].tool_call_count += 1;
+        }
+    }
 
-            // Derive a status from the hook event name. cmux already publishes
-            // hook events with phase=completed for every agent that has a
-            // cmux hook bridge installed (Claude, Codex, OpenCode, …) — for
-            // local *and* remote workspaces. This is the "first-class status
-            // event" path: agent_state() picks up hook_status at priority 1.
-            //
-            // event_name shape: "agent.hook.PreToolUse", "agent.hook.Stop", …
-            let hook = event
-                .event_name
-                .rsplit_once('.')
-                .map(|(_, h)| h)
-                .unwrap_or(event.event_name.as_str());
-            let derived = match hook {
-                // Agent is actively doing work.
-                "PreToolUse" | "PostToolUse" | "UserPromptSubmit" => Some("working"),
-                // Agent has yielded the turn — needs user.
-                "Stop" | "SubagentStop" | "Notification" | "AskUserQuestion" => Some("waiting"),
-                // Lifecycle bookends — neither working nor blocked.
-                "SessionEnd" => Some("idle"),
-                _ => None,
+    pub fn refresh_mux_statuses_from_disk(&mut self) {
+        let dir = crate::mc_data::mux_state::session_state_dir();
+        self.refresh_mux_statuses_from_dir(&dir);
+    }
+
+    pub fn refresh_mux_statuses_from_dir(&mut self, dir: &std::path::Path) {
+        if !dir.exists() {
+            return;
+        }
+
+        let mut states = Vec::new();
+        let mut active_by_id: HashMap<String, MuxSessionState> = crate::mc_data::mux_state::load_all_in_dir(dir)
+            .into_iter()
+            .map(|state| (state.session_id.clone(), state))
+            .collect();
+        for session_id in self.session_to_workspace.keys() {
+            if let Some(state) = active_by_id.remove(session_id) {
+                states.push(state);
+                continue;
+            }
+            match crate::mc_data::mux_state::load_session_in_dir(dir, session_id) {
+                Ok(Some(state)) => states.push(state),
+                Ok(None) => {}
+                Err(e) => eprintln!("load mux session state {session_id}: {e:#}"),
+            }
+        }
+        self.apply_mux_session_states(states);
+    }
+
+    pub fn apply_mux_session_states<I>(&mut self, states: I)
+    where
+        I: IntoIterator<Item = MuxSessionState>,
+    {
+        let by_session: HashMap<String, MuxSessionState> = states
+            .into_iter()
+            .map(|state| (state.session_id.clone(), state))
+            .collect();
+        let mut by_workspace: HashMap<String, MuxSessionState> = HashMap::new();
+
+        for (session_id, workspace_id) in &self.session_to_workspace {
+            let Some(state) = by_session.get(session_id).cloned() else {
+                continue;
             };
-            if let Some(state) = derived {
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                self.workspaces[idx].hook_status = Some((state.to_string(), ts));
+            match by_workspace.get(workspace_id) {
+                Some(existing) if existing.updated_at >= state.updated_at => {}
+                _ => {
+                    by_workspace.insert(workspace_id.clone(), state);
+                }
+            }
+        }
+
+        for ws in &mut self.workspaces {
+            if self
+                .session_to_workspace
+                .values()
+                .any(|workspace_id| workspace_id == &ws.workspace.uuid)
+            {
+                ws.mux_status = by_workspace.remove(&ws.workspace.uuid);
             }
         }
     }
@@ -1831,8 +1855,8 @@ impl App {
         let idx = self.selected;
         if let Some(ws) = self.workspaces.get_mut(idx) {
             ws.loading = true;
-            // Typesafe only earns its keep on remote workspaces; local agents
-            // are classified by hook events, not vision.
+            // TypeSafe only earns its keep on remote workspaces; local
+            // activity is read from mux state, then screen-regex fallbacks.
             let classifier = if ws.is_remote() { classifier } else { None };
             spawn_screen_task(
                 ws.workspace.uuid.clone(),
@@ -1854,7 +1878,7 @@ impl App {
     ) {
         for ws in &mut self.workspaces {
             ws.loading = true;
-            // Remote-only: skip the typesafe call for local (hook-covered) ones.
+            // Remote-only: skip the TypeSafe call for local mux/screen-covered workspaces.
             let ws_classifier = if ws.is_remote() {
                 classifier.clone()
             } else {
@@ -1969,15 +1993,14 @@ impl App {
             return;
         };
         // (agent, transcript_path) for each bound agent surface in this workspace.
-        let mut targets: Vec<(crate::mc_data::surface_kind::SurfaceKind, std::path::PathBuf)> =
-            Vec::new();
+        let mut targets: Vec<(
+            crate::mc_data::surface_kind::SurfaceKind,
+            std::path::PathBuf,
+        )> = Vec::new();
         let bound = crate::mc_data::cmux_sessions::load_by_surface();
         for s in &ws.surfaces {
-            let eff = crate::mc_data::surface_kind::effective_kind(
-                &ws.workspace.uuid,
-                &s.ref_id,
-                s.kind,
-            );
+            let eff =
+                crate::mc_data::surface_kind::effective_kind(&ws.workspace.uuid, &s.ref_id, s.kind);
             if !eff.is_agent() {
                 continue;
             }
@@ -2009,7 +2032,8 @@ impl App {
                 if !due {
                     continue;
                 }
-                if let Ok(summary) = crate::llm::xai::summarize_overall(&xai_api_key, &users).await {
+                if let Ok(summary) = crate::llm::xai::summarize_overall(&xai_api_key, &users).await
+                {
                     let _ = crate::mc_data::overall_cache::put(&transcript, &summary, turns);
                 }
             }
@@ -3426,7 +3450,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_fake_cmux(path: &std::path::Path, workspace_cwd: &std::path::Path, tree_succeeds: bool) {
+    fn write_fake_cmux(
+        path: &std::path::Path,
+        workspace_cwd: &std::path::Path,
+        tree_succeeds: bool,
+    ) {
         let tree_body = if tree_succeeds {
             r#"cat <<'JSON'
 {
@@ -3555,7 +3583,7 @@ workspace: test-ws
             screen_insights: ScreenInsights::default(),
             tool_call_count: 0,
             notes: None,
-            hook_status: None,
+            mux_status: None,
             classification: None,
             loading: false,
             summary: None,
@@ -3582,6 +3610,32 @@ workspace: test-ws
         app
     }
 
+    fn mux_state(
+        session_id: &str,
+        agent: &str,
+        working: bool,
+        last_event: &str,
+        updated_at: &str,
+        last_turn_end_at: Option<&str>,
+    ) -> MuxSessionState {
+        MuxSessionState {
+            session_id: session_id.to_string(),
+            agent: agent.to_string(),
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-06-09T13:35:42-07:00").unwrap(),
+            updated_at: chrono::DateTime::parse_from_rfc3339(updated_at).unwrap(),
+            last_event: last_event.to_string(),
+            last_tool: Some("Write".to_string()),
+            working,
+            turn_count: u64::from(last_turn_end_at.is_some()),
+            events_seen: 2,
+            last_prompt_submit_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-06-09T13:36:02-07:00").unwrap(),
+            ),
+            last_turn_end_at: last_turn_end_at
+                .map(|ts| chrono::DateTime::parse_from_rfc3339(ts).unwrap()),
+        }
+    }
+
     fn test_bead_issue(
         id: &str,
         title: &str,
@@ -3606,6 +3660,79 @@ workspace: test-ws
             app.bottom_info().as_deref(),
             Some("workspace test-uuid-1 · window window-test")
         );
+    }
+
+    #[test]
+    fn mux_state_drives_agent_state_instead_of_event_name() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.handle_agent_event(&AgentEvent {
+            session_id: "s-1".to_string(),
+            workspace_id: "test-uuid-1".to_string(),
+            event_name: "agent.hook.Stop".to_string(),
+        });
+
+        assert_eq!(
+            app.workspaces[0].agent_state(),
+            AgentState::Idle,
+            "hook event name alone must not derive working/waiting"
+        );
+
+        app.apply_mux_session_states([mux_state(
+            "s-1",
+            "grok",
+            true,
+            "tool_start",
+            "2026-06-09T13:36:05-07:00",
+            None,
+        )]);
+
+        assert_eq!(app.workspaces[0].agent_name(), "grok");
+        assert_eq!(app.workspaces[0].agent_state(), AgentState::Working);
+
+        app.apply_mux_session_states([mux_state(
+            "s-1",
+            "grok",
+            false,
+            "turn_end",
+            "2026-06-09T13:36:08-07:00",
+            Some("2026-06-09T13:36:08-07:00"),
+        )]);
+
+        assert_eq!(app.workspaces[0].agent_state(), AgentState::NeedsMe);
+    }
+
+    #[test]
+    fn newest_mux_state_wins_when_workspace_has_multiple_sessions() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        for session_id in ["s-old", "s-new"] {
+            app.handle_agent_event(&AgentEvent {
+                session_id: session_id.to_string(),
+                workspace_id: "test-uuid-1".to_string(),
+                event_name: "agent.hook.UserPromptSubmit".to_string(),
+            });
+        }
+
+        app.apply_mux_session_states([
+            mux_state(
+                "s-new",
+                "claude",
+                true,
+                "tool_start",
+                "2026-06-09T13:36:10-07:00",
+                None,
+            ),
+            mux_state(
+                "s-old",
+                "grok",
+                false,
+                "turn_end",
+                "2026-06-09T13:36:08-07:00",
+                Some("2026-06-09T13:36:08-07:00"),
+            ),
+        ]);
+
+        assert_eq!(app.workspaces[0].agent_name(), "claude");
+        assert_eq!(app.workspaces[0].agent_state(), AgentState::Working);
     }
 
     #[test]
@@ -3869,7 +3996,10 @@ workspace: test-ws
 
         let fake_cmux = tmp.path().join("cmux");
         write_fake_cmux(&fake_cmux, &repo, false);
-        let client = CmuxClient::new(fake_cmux.display().to_string(), tmp.path().join("cmux.sock"));
+        let client = CmuxClient::new(
+            fake_cmux.display().to_string(),
+            tmp.path().join("cmux.sock"),
+        );
 
         gather_refresh_snapshot(&client, &histories).await.unwrap();
 
@@ -4541,7 +4671,10 @@ workspace: test-ws
             SurfaceKind::Claude,
             &goals,
         );
-        assert!(nf.is_none(), "non-focused surface borrowed a prompt: {nf:?}");
+        assert!(
+            nf.is_none(),
+            "non-focused surface borrowed a prompt: {nf:?}"
+        );
         // The focused surface does pick it up.
         let f = surface_intent_summary(
             None,

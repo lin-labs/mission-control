@@ -49,7 +49,7 @@ fn bind_noop_when_no_workspace_id() {
     );
 
     // No surfaces dir should have been created anywhere under tmp.
-    let surfaces = tmp.path().join("data/mission-control/.data");
+    let surfaces = tmp.path().join("data/mission-control/active");
     assert!(
         !surfaces.exists(),
         "no data should be written when MC_WORKSPACE_ID is unset"
@@ -82,7 +82,7 @@ fn bind_writes_pointer_file_with_explicit_session_file() {
 
     let pointer = tmp
         .path()
-        .join("data/mission-control/.data/uuid-1/surfaces/sid-1.session-path");
+        .join("data/mission-control/active/uuid-1/surfaces/sid-1.session-path");
     assert!(pointer.exists(), "pointer file should exist at {pointer:?}");
 
     let contents = std::fs::read_to_string(&pointer).unwrap();
@@ -120,7 +120,7 @@ fn bind_reads_surface_id_from_env_var() {
 
     let pointer = tmp
         .path()
-        .join("data/mission-control/.data/uuid-env/surfaces/sid-env.session-path");
+        .join("data/mission-control/active/uuid-env/surfaces/sid-env.session-path");
     assert!(pointer.exists(), "pointer file should exist at {pointer:?}");
 }
 
@@ -150,7 +150,7 @@ fn bind_uses_claude_session_file_env_var() {
 
     let pointer = tmp
         .path()
-        .join("data/mission-control/.data/uuid-csf/surfaces/sid-csf.session-path");
+        .join("data/mission-control/active/uuid-csf/surfaces/sid-csf.session-path");
     assert!(pointer.exists(), "pointer file should exist at {pointer:?}");
     let contents = std::fs::read_to_string(&pointer).unwrap();
     assert_eq!(contents.trim(), session_path);
@@ -199,7 +199,7 @@ fn bind_fallback_scan_picks_matching_file() {
 
     let pointer = tmp
         .path()
-        .join("data/mission-control/.data/ws-scan-2/surfaces/sid-scan2.session-path");
+        .join("data/mission-control/active/ws-scan-2/surfaces/sid-scan2.session-path");
     assert!(pointer.exists(), "pointer file should exist at {pointer:?}");
 
     let written = std::fs::read_to_string(&pointer).unwrap();

@@ -7,9 +7,9 @@ fn data_root_under_home_data_mission_control() {
 }
 
 #[test]
-fn workspace_dir_uses_dot_data_uuid() {
+fn workspace_dir_uses_active_uuid() {
     let p = paths::workspace_dir("7f3a-uuid");
-    assert!(p.ends_with("data/mission-control/.data/7f3a-uuid"));
+    assert!(p.ends_with("data/mission-control/active/7f3a-uuid"));
 }
 
 #[test]

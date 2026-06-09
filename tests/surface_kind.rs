@@ -5,7 +5,7 @@
 //! exited" grace-period logic. We don't try to test the lsof/ps detection
 //! pipeline directly — that depends on a live tty and is flaky in CI.
 //!
-//! The persistence tests touch ~/data/mission-control/.data/<uuid>/surfaces/
+//! The persistence tests touch ~/data/mission-control/active/<uuid>/surfaces/
 //! via the production helpers, using deterministic per-test UUIDs prefixed
 //! with `test-surface-kind-` so they don't collide with real workspace data
 //! and clean up after themselves. The repo convention is to run the test

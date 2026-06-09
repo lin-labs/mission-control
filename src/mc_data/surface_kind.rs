@@ -35,8 +35,8 @@ pub enum SurfaceKind {
     OtherAgent,
     Shell,
     /// Foreground process is a remote-shell client (mosh/ssh/…). The real agent
-    /// (if any) runs on another host with no cmux hook bridge, so this surface's
-    /// state can't come from hook events — it's the typesafe / frame-merge path.
+    /// (if any) runs on another host and may not have local mux protocol state,
+    /// so this surface's state falls back to the typesafe / frame-merge path.
     Remote,
     Unknown,
 }

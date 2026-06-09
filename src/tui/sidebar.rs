@@ -187,7 +187,7 @@ mod tests {
             screen_insights: ScreenInsights::default(),
             tool_call_count: 0,
             notes: None,
-            hook_status: None,
+            mux_status: None,
             classification: None,
             loading: false,
             summary: None,

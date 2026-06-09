@@ -555,10 +555,11 @@ async fn run_app(
     app.spawn_load_screen_preview(cmux_client.clone(), classifier.cloned(), screen_tx.clone());
 
     // Spawn cmux event stream subscriber. subscribe() returns only when the
-    // child process dies or the stream closes; hook updates are the primary
-    // agent-state signal, so we must reconnect rather than going silently
-    // blind. Capped exponential backoff prevents spinning on a down daemon; a
-    // healthy run (>60s) resets the backoff so transient blips recover fast.
+    // child process dies or the stream closes. The stream is retained for the
+    // non-overlapping mapping fact that mux state omits: session_id ->
+    // workspace_id. Working/idle facts come from ~/data/mux/sessions/*.json.
+    // Capped exponential backoff prevents spinning on a down daemon; a healthy
+    // run (>60s) resets the backoff so transient blips recover fast.
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let cmux_bin = config.cmux_bin.clone();
     let cmux_socket = config.cmux_socket.clone();
@@ -636,6 +637,7 @@ async fn run_app(
     let mut regen_tick = interval(Duration::from_secs(30));
     let mut surface_summary_tick = interval(Duration::from_secs(60));
     let mut dismiss_tick = interval(Duration::from_secs(30));
+    let mut mux_state_interval = interval(Duration::from_secs(2));
 
     // Track per-workspace surface count from the previous cmux refresh.
     // Used to detect surface detachments between cmux event stream events.
@@ -1119,6 +1121,7 @@ async fn run_app(
             Some(agent_event) = event_rx.recv() => {
                 let ws_uuid = agent_event.workspace_id.clone();
                 app.handle_agent_event(&agent_event);
+                app.refresh_mux_statuses_from_disk();
                 // Accumulate events for the regen scheduler.
                 app.increment_regen_event_count(&ws_uuid);
 
@@ -1272,6 +1275,10 @@ async fn run_app(
             Some(beads_snap) = beads_refresh_rx.recv() => {
                 beads_refresh_inflight = false;
                 app.apply_beads_refresh_snapshot(beads_snap).await;
+            }
+
+            _ = mux_state_interval.tick() => {
+                app.refresh_mux_statuses_from_disk();
             }
 
             _ = screen_interval.tick() => {
