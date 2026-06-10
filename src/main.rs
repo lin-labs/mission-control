@@ -676,9 +676,16 @@ async fn run_app(
 
     loop {
         terminal.draw(|f| {
-            // Split vertically: main area on top, single-line shortcut footer on the bottom.
-            let vchunks =
-                Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).split(f.area());
+            // Split vertically: main area on top, a stable single-line info
+            // layer (window/workspace/surface IDs) next, then the single-line
+            // shortcut/command footer on the bottom. The info line gets its own
+            // row so IDs stay readable and never collide with footer text.
+            let vchunks = Layout::vertical([
+                Constraint::Min(5),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(f.area());
 
             let chunks =
                 Layout::horizontal([Constraint::Length(32), Constraint::Min(40)]).split(vchunks[0]);
@@ -699,12 +706,13 @@ async fn run_app(
                 !sidebar_focused,
             );
             let bottom_info = app.bottom_info();
+            tui::footer::render_info_line(f, vchunks[1], bottom_info.as_deref());
             match &app.input_mode {
                 crate::tui::command::InputMode::Command(cl) => {
-                    tui::footer::render_command_bar(f, vchunks[1], cl, bottom_info.as_deref());
+                    tui::footer::render_command_bar(f, vchunks[2], cl);
                 }
                 crate::tui::command::InputMode::Normal => {
-                    tui::footer::render_footer(f, vchunks[1], app.focus, bottom_info.as_deref());
+                    tui::footer::render_footer(f, vchunks[2], app.focus);
                 }
             }
         })?;

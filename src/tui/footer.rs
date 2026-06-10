@@ -9,8 +9,7 @@ use ratatui::{
 };
 
 /// Render the keyboard-shortcut footer line.
-pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus, info: Option<&str>) {
-    let content_area = render_info_layer(f, area, info);
+pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus) {
     let key_style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
@@ -53,15 +52,14 @@ pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus, info: Option<&str>
     }
 
     let paragraph = Paragraph::new(Line::from(spans));
-    f.render_widget(paragraph, content_area);
+    f.render_widget(paragraph, area);
 }
 
 /// Render the `:command` bar in place of the keybind footer.
 ///
 /// Layout: `:<buffer><cursor><ghost-dim>    <status>`
 /// Status is appended after a 4-space gap when present.
-pub fn render_command_bar(f: &mut Frame, area: Rect, cl: &CommandLine, info: Option<&str>) {
-    let content_area = render_info_layer(f, area, info);
+pub fn render_command_bar(f: &mut Frame, area: Rect, cl: &CommandLine) {
     let prompt_style = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
@@ -109,37 +107,24 @@ pub fn render_command_bar(f: &mut Frame, area: Rect, cl: &CommandLine, info: Opt
     }
 
     let paragraph = Paragraph::new(Line::from(spans));
-    f.render_widget(paragraph, content_area);
+    f.render_widget(paragraph, area);
 }
 
-fn render_info_layer(f: &mut Frame, area: Rect, info: Option<&str>) -> Rect {
+/// Render the info layer (window/workspace/surface IDs) on its own dedicated
+/// line, left-aligned and full-width. Kept separate from the footer so the IDs
+/// stay readable and never collide with the keybind/command text below.
+pub fn render_info_line(f: &mut Frame, area: Rect, info: Option<&str>) {
     let Some(info) = info.filter(|s| !s.trim().is_empty()) else {
-        return area;
+        return;
     };
     if area.width == 0 {
-        return area;
+        return;
     }
-
     let text = truncate_left(info, area.width as usize);
-    let width = text.chars().count().min(area.width as usize) as u16;
-    let info_area = Rect {
-        x: area.x + area.width.saturating_sub(width),
-        y: area.y,
-        width,
-        height: area.height,
-    };
-    let content_width = area.width.saturating_sub(width.saturating_add(1));
-    let content_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: content_width,
-        height: area.height,
-    };
     let style = Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::BOLD);
-    f.render_widget(Paragraph::new(text).style(style), info_area);
-    content_area
+    f.render_widget(Paragraph::new(text).style(style), area);
 }
 
 fn truncate_left(text: &str, max_chars: usize) -> String {
