@@ -106,22 +106,31 @@ impl RawIssue {
 }
 
 pub fn load_for_repo_path(repo: &Path) -> BeadsView {
+    // Prefer live `bd list`, but only when it actually returns issues. The local
+    // bd database can lag the committed `issues.jsonl` export — e.g. a fresh
+    // clone, or a teammate's issues not yet `bd import`ed here — so `bd list`
+    // reports 0 while the jsonl still holds the open work the user sees. Fall
+    // back to the jsonl in that case rather than claiming "no active beads".
     if let Some(mut issues) = load_bd_list(&repo) {
-        sort_and_cap(&mut issues);
-        return BeadsView {
-            repo_path: repo.to_path_buf(),
-            source: BeadsSource::BdList,
-            issues,
-        };
+        if !issues.is_empty() {
+            sort_and_cap(&mut issues);
+            return BeadsView {
+                repo_path: repo.to_path_buf(),
+                source: BeadsSource::BdList,
+                issues,
+            };
+        }
     }
 
     if let Some(mut issues) = load_jsonl(&repo) {
-        sort_and_cap(&mut issues);
-        return BeadsView {
-            repo_path: repo.to_path_buf(),
-            source: BeadsSource::Jsonl,
-            issues,
-        };
+        if !issues.is_empty() {
+            sort_and_cap(&mut issues);
+            return BeadsView {
+                repo_path: repo.to_path_buf(),
+                source: BeadsSource::Jsonl,
+                issues,
+            };
+        }
     }
 
     BeadsView {

@@ -3220,26 +3220,25 @@ fn beads_items_for_view(
         }
     }
 
-    let multi_repo = view.repos.len() > 1;
     let mut items = Vec::new();
     for idx in repo_indices {
         let repo = &view.repos[idx];
-        if multi_repo {
-            items.push(crate::mc_data::trajectory::Item {
-                text: format!("repo: {}", repo_display_name(&repo.repo_path)),
-                is_checkbox: false,
-                checked: None,
-                surface_id: None,
-            });
-        }
+        // Always show the repo header before its list (single- or multi-repo),
+        // so the Beads section is unambiguous about which repo it reflects.
+        items.push(crate::mc_data::trajectory::Item {
+            text: format!("repo: {}", repo_display_name(&repo.repo_path)),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
 
         if repo.issues.is_empty() {
+            // Repo header already names the repo; keep the empty note short.
             let text = match repo.source {
-                crate::mc_data::beads::BeadsSource::Unavailable => format!(
-                    "Beads unavailable in {} (bd list failed; no issues export)",
-                    repo_display_name(&repo.repo_path)
-                ),
-                _ => format!("No active beads in {}", repo_display_name(&repo.repo_path)),
+                crate::mc_data::beads::BeadsSource::Unavailable => {
+                    "  (beads unavailable — bd db empty and no issues.jsonl)".to_string()
+                }
+                _ => "  (no active beads)".to_string(),
             };
             items.push(crate::mc_data::trajectory::Item {
                 text,
@@ -3287,6 +3286,8 @@ fn is_bead_row(text: &str) -> bool {
     t.starts_with("repo: ")
         || t.starts_with("No active beads")
         || t.starts_with("Beads unavailable")
+        || t.starts_with("(no active beads)")
+        || t.starts_with("(beads unavailable")
 }
 
 fn bead_issue_line(issue: &crate::mc_data::beads::BeadIssue) -> String {
@@ -3815,14 +3816,16 @@ workspace: test-ws
             .section(crate::mc_data::trajectory::SECTION_GOALS)
             .expect("Beads section");
         assert_eq!(beads.name, "Beads");
-        assert_eq!(beads.items.len(), 1);
-        assert!(beads.items[0].text.contains("repo-7 in-progress"));
+        // [0] = always-present repo header, [1] = the issue.
+        assert_eq!(beads.items.len(), 2);
+        assert!(beads.items[0].text.starts_with("repo: "));
+        assert!(beads.items[1].text.contains("repo-7 in-progress"));
         assert!(
-            beads.items[0]
+            beads.items[1]
                 .text
                 .contains("Show Beads in mission control")
         );
-        assert_eq!(beads.items[0].checked, Some(false));
+        assert_eq!(beads.items[1].checked, Some(false));
     }
 
     #[test]
@@ -3905,10 +3908,12 @@ workspace: test-ws
             .unwrap()
             .section(crate::mc_data::trajectory::SECTION_GOALS)
             .unwrap();
-        assert_eq!(beads.items.len(), 1);
-        assert!(beads.items[0].text.contains("new-1"));
-        assert!(beads.items[0].text.contains("Newly created issue"));
-        assert!(!beads.items[0].text.contains("old-1"));
+        // [0] = always-present repo header, [1] = the issue.
+        assert_eq!(beads.items.len(), 2);
+        assert!(beads.items[0].text.starts_with("repo: "));
+        assert!(beads.items[1].text.contains("new-1"));
+        assert!(beads.items[1].text.contains("Newly created issue"));
+        assert!(beads.items.iter().all(|i| !i.text.contains("old-1")));
     }
 
     #[tokio::test]
@@ -4024,9 +4029,10 @@ workspace: test-ws
             repo_by_surface_ref: HashMap::new(),
         };
         let items = beads_items_for_view(&view, None);
-        assert_eq!(items.len(), 1);
-        assert!(items[0].text.contains("Beads unavailable"));
-        assert!(items[0].text.contains("bd list failed"));
+        // [0] = always-present repo header, [1] = the unavailable note.
+        assert_eq!(items.len(), 2);
+        assert!(items[0].text.starts_with("repo: "));
+        assert!(items[1].text.contains("beads unavailable"));
     }
 
     #[test]

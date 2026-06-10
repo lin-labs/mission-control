@@ -93,13 +93,15 @@ pub async fn generate_workspace_prefix(
 }
 
 /// Infer a surface's intent (`overall_goal` + `latest_ask`) from a merged
-/// terminal transcript. Used for remote (mosh/ssh) surfaces, whose convo can
+/// terminal transcript. Used for remote (mosh/ssh) surfaces, whose content can
 /// only be observed via the screen — see `frame_merge` / `remote_intent`.
+/// Handles BOTH an AI agent (Claude/Codex) and a plain remote shell: for a
+/// shell, `latest_ask` is the most recent command the user ran.
 ///
-/// The prompt is hardened against the classic screen-grab mistake: input-box
-/// placeholders, suggestions, and unsent typing must NOT be treated as user
-/// asks. Returns empty fields rather than guessing when no genuine user
-/// message is present.
+/// The prompt is hardened against the classic screen-grab mistake: command
+/// OUTPUT, input-box placeholders, suggestions, and unsent typing must NOT be
+/// treated as the user action. Returns empty fields rather than guessing when
+/// no genuine user input/command is present.
 pub async fn infer_intent(
     api_key: &str,
     transcript: &str,
@@ -111,13 +113,16 @@ pub async fn infer_intent(
         lines[start..].join("\n")
     };
     let prompt = format!(
-        "You are reading a terminal transcript of a coding-agent session (a human user and an AI \
-         assistant). Extract two things:\n\
-         - overall_goal: what the user is ultimately trying to accomplish across the session (<=90 chars).\n\
-         - latest_ask: the MOST RECENT message the user actually SUBMITTED (<=90 chars).\n\
-         Only count text the user actually submitted. Do NOT treat input-box placeholder text, \
-         autocomplete or command suggestions, in-progress (unsent) typing, menus, or the assistant's \
-         own words as a user ask. If you cannot find a genuine submitted user message, use null.\n\
+        "You are reading a transcript captured from a terminal pane. It may be an AI coding agent \
+         (Claude/Codex — a human user and an AI assistant) OR a plain shell session (local or over \
+         ssh/mosh). Extract two things:\n\
+         - overall_goal: what the user is doing in this session overall — the task or goal (<=90 chars).\n\
+         - latest_ask: the MOST RECENT meaningful USER action (<=90 chars) — i.e. the latest prompt \
+         the user submitted to an agent, OR, for a shell, the latest command the user actually RAN \
+         at a shell prompt.\n\
+         Count only genuine user input. Do NOT treat command OUTPUT, the agent's own messages, \
+         input-box placeholder/autocomplete/suggestion text, in-progress (unsent) typing, or menus \
+         as the user action. If you cannot find any genuine user input or command, use null.\n\
          Output ONLY compact JSON (no prose, no code fences): \
          {{\"overall_goal\": <string|null>, \"latest_ask\": <string|null>}}.\n\n\
          Transcript:\n{tail}"
