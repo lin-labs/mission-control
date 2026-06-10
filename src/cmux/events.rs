@@ -31,23 +31,52 @@ struct RawPayload {
     phase: Option<String>,
 }
 
+/// The exact argv we hand to `cmux` for the agent event stream. Kept as one
+/// slice so the spawn and the orphan-reaper match on identical text.
+const EVENTS_ARGS: [&str; 5] = [
+    "events",
+    "--reconnect",
+    "--category",
+    "agent",
+    "--no-heartbeat",
+];
+
+/// Kill any `cmux events …` subscribers left behind by a previous `mc` run.
+///
+/// The subscriber is a long-lived child; if `mc` is SIGKILLed (or crashes)
+/// its destructors never run, so the subprocess reparents to launchd/init and
+/// lingers. Each restart would otherwise stack another one. We reap by full
+/// command-line match (`pkill -f`) on the exact arg string, which is unique to
+/// this subscriber, *before* spawning ours so we never kill the new child.
+/// Best-effort: a missing `pkill` or "no matches" exit is not an error.
+fn reap_orphan_subscribers() {
+    let pattern = EVENTS_ARGS.join(" ");
+    let _ = std::process::Command::new("pkill")
+        .arg("-f")
+        .arg("--")
+        .arg(&pattern)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
 /// Spawn `cmux events --reconnect --category agent --no-heartbeat` and stream parsed events.
 pub async fn subscribe(
     cmux_bin: &str,
     socket_path: &std::path::Path,
     tx: mpsc::UnboundedSender<AgentEvent>,
 ) -> Result<()> {
+    // Clear out any subscribers orphaned by a prior run before adding our own.
+    reap_orphan_subscribers();
+
     let mut child = Command::new(cmux_bin)
-        .args([
-            "events",
-            "--reconnect",
-            "--category",
-            "agent",
-            "--no-heartbeat",
-        ])
+        .args(EVENTS_ARGS)
         .env("CMUX_SOCKET_PATH", socket_path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
+        // Ensure a graceful `mc` shutdown (task drop) takes the child with it,
+        // so we don't become the orphan the next run has to reap.
+        .kill_on_drop(true)
         .spawn()?;
 
     let stdout = child

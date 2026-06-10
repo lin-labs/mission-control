@@ -64,6 +64,7 @@ fn main() {
                         SurfaceKind::Codex => "codex",
                         SurfaceKind::OtherAgent => "other_agent",
                         SurfaceKind::Shell => "shell",
+                        SurfaceKind::Remote => "remote",
                         SurfaceKind::Unknown => "unknown",
                     };
                     let title = s.title.chars().take(40).collect::<String>();
