@@ -1,7 +1,8 @@
+use crate::mc_data::mux_state::TurnContract;
 use crate::tui::app::WorkspaceState;
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -30,6 +31,22 @@ pub fn render_detail(
             f.render_widget(Paragraph::new("No workspace selected").block(block), area);
             return;
         }
+    };
+
+    // Authoritative arcmux goal band at the very top of the detail pane, shown
+    // for BOTH render paths so every arcmux-managed agent surfaces its turn
+    // contract (overall / now / progress / validation) at a glance. Consumes a
+    // top slice of `area`; the rest flows to the trajectory or legacy body.
+    let area = if let Some(contract) = ws.turn_contract() {
+        render_contract_band(
+            f,
+            area,
+            contract,
+            ws.workspace.custom_color.as_deref(),
+            focused,
+        )
+    } else {
+        area
     };
 
     // If a trajectory doc is available (or peek mode is active), delegate to
@@ -343,4 +360,89 @@ fn status_color(status: &str) -> Style {
         "done" => Style::default().fg(Color::White).bg(Color::DarkGray),
         _ => Style::default().fg(Color::DarkGray),
     }
+}
+
+/// Render the authoritative arcmux turn-contract as a bordered "Goal" band at
+/// the top of the detail pane and return the remaining `area` below it for the
+/// trajectory / legacy body. One line per present artifact, truncated to a
+/// single row so the band height stays predictable.
+fn render_contract_band(
+    f: &mut Frame,
+    area: Rect,
+    contract: &TurnContract,
+    custom_color: Option<&str>,
+    focused: bool,
+) -> Rect {
+    let lines = contract_lines(contract, area.width as usize);
+    if lines.is_empty() {
+        return area;
+    }
+    let border_style =
+        crate::sidebar_pure::workspace_panel_border_style(custom_color, focused, Color::Cyan);
+    // height = artifact rows + 2 border rows, but always leave room for the body.
+    let want = lines.len() as u16 + 2;
+    let max = area.height.saturating_sub(6).max(3);
+    let band_h = want.min(max);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(band_h), Constraint::Min(0)])
+        .split(area);
+    let block = Block::default()
+        .title(Span::styled(" Goal ", border_style))
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let para = Paragraph::new(Text::from(lines))
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, chunks[0]);
+    chunks[1]
+}
+
+/// One labeled line per present turn-contract artifact, each collapsed to a
+/// single row truncated to `width`.
+fn contract_lines(contract: &TurnContract, width: usize) -> Vec<Line<'static>> {
+    let budget = width.saturating_sub(13).max(20);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut row = |label: &str, text: &str, label_color: Color, text_color: Color| {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {label:<8} "),
+                Style::default()
+                    .fg(label_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(truncate_field(text, budget), Style::default().fg(text_color)),
+        ]));
+    };
+    if let Some(t) = contract.overall_goal() {
+        row("overall", t, Color::Magenta, Color::White);
+    }
+    if let Some(t) = contract.goal() {
+        row("now", t, Color::Cyan, Color::White);
+    }
+    if let Some(t) = contract.path() {
+        row("progress", t, Color::Blue, Color::Gray);
+    }
+    if let Some(t) = contract.success_verification() {
+        row("validate", t, Color::Green, Color::Gray);
+    }
+    if let Some(t) = contract.last_user_message() {
+        row("last ask", t, Color::DarkGray, Color::DarkGray);
+    }
+    if let Some(name) = contract.vault_log_name() {
+        row("log", name, Color::DarkGray, Color::DarkGray);
+    }
+    lines
+}
+
+/// Collapse internal whitespace (the contract may carry newlines) and truncate
+/// to `max` display chars with an ellipsis, so a field occupies a single row.
+fn truncate_field(s: &str, max: usize) -> String {
+    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max {
+        return collapsed;
+    }
+    let mut out: String = collapsed.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }

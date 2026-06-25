@@ -30,11 +30,92 @@ pub struct MuxSessionState {
     pub last_prompt_submit_at: Option<DateTime<FixedOffset>>,
     #[serde(default, deserialize_with = "deserialize_nonzero_timestamp")]
     pub last_turn_end_at: Option<DateTime<FixedOffset>>,
+    /// The arcmux turn contract: the agent-authored goal artifacts refreshed
+    /// every turn (overall goal, current goal, progress path, success check,
+    /// last user turn, vault link). Authoritative — written by the agent's
+    /// hook, not inferred. Absent for sessions without a contract yet.
+    #[serde(default)]
+    pub turn_contract: Option<TurnContract>,
+}
+
+/// The compact, current per-session contract arcmux records each turn: what the
+/// agent is doing now, the whole-conversation objective, how success is
+/// verified, and the consolidated path taken. A snapshot, not a log. Every
+/// field is optional; new fields arcmux adds deserialize without a code change.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct TurnContract {
+    /// The latest gauged "Your ask:" — the current sub-task.
+    #[serde(default)]
+    pub goal: Option<String>,
+    /// The whole-conversation objective (summarizer-refreshed).
+    #[serde(default)]
+    pub overall_goal: Option<String>,
+    /// The raw, verbatim last user turn (truncated upstream).
+    #[serde(default)]
+    pub last_user_message: Option<String>,
+    /// Where the conversation is saved in the vault.
+    #[serde(default)]
+    pub vault_link: Option<String>,
+    /// Current concrete success check (validation).
+    #[serde(default)]
+    pub success_verification: Option<String>,
+    /// Consolidated path taken/planned (progress).
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Which native event supplied the recording (UserPromptSubmit, Stop, …).
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+impl TurnContract {
+    /// Trimmed value of a field, or None when empty/whitespace.
+    fn field(value: &Option<String>) -> Option<&str> {
+        value.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    }
+
+    pub fn goal(&self) -> Option<&str> {
+        Self::field(&self.goal)
+    }
+    pub fn overall_goal(&self) -> Option<&str> {
+        Self::field(&self.overall_goal)
+    }
+    pub fn last_user_message(&self) -> Option<&str> {
+        Self::field(&self.last_user_message)
+    }
+    pub fn vault_link(&self) -> Option<&str> {
+        Self::field(&self.vault_link)
+    }
+    pub fn success_verification(&self) -> Option<&str> {
+        Self::field(&self.success_verification)
+    }
+    pub fn path(&self) -> Option<&str> {
+        Self::field(&self.path)
+    }
+
+    /// The vault link reduced to its file name (the saved conversation log).
+    pub fn vault_log_name(&self) -> Option<&str> {
+        self.vault_link()
+            .map(|v| v.rsplit(['/', '\\']).next().unwrap_or(v))
+    }
+
+    /// True when there is at least one artifact worth showing.
+    pub fn has_content(&self) -> bool {
+        self.goal().is_some()
+            || self.overall_goal().is_some()
+            || self.path().is_some()
+            || self.success_verification().is_some()
+            || self.last_user_message().is_some()
+    }
 }
 
 impl MuxSessionState {
     pub fn has_ended_turn(&self) -> bool {
         self.last_turn_end_at.is_some() || self.last_event == "turn_end"
+    }
+
+    /// The turn contract, only when it carries something worth displaying.
+    pub fn contract(&self) -> Option<&TurnContract> {
+        self.turn_contract.as_ref().filter(|c| c.has_content())
     }
 }
 
@@ -114,4 +195,60 @@ fn is_safe_session_id(session_id: &str) -> bool {
         && !session_id.contains('/')
         && !session_id.contains('\\')
         && !session_id.contains("..")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> MuxSessionState {
+        serde_json::from_str(json).expect("parse session state")
+    }
+
+    #[test]
+    fn parses_turn_contract_artifacts() {
+        let st = parse(
+            r#"{
+                "session_id": "s-1", "agent": "claude",
+                "created_at": "2026-06-25T08:00:00-07:00",
+                "updated_at": "2026-06-25T08:05:00-07:00",
+                "last_event": "turn_end", "working": false,
+                "turn_contract": {
+                    "goal": "  ship the band  ",
+                    "overall_goal": "adapt mc to arcmux contract",
+                    "path": "added parser then band",
+                    "success_verification": "cargo test green",
+                    "last_user_message": "make mc adapt\nto this",
+                    "vault_link": "/Users/blin/agents/histories/2026-06-25-08-mc.md"
+                }
+            }"#,
+        );
+        let c = st.contract().expect("contract present");
+        assert_eq!(c.goal(), Some("ship the band")); // trimmed
+        assert_eq!(c.overall_goal(), Some("adapt mc to arcmux contract"));
+        assert_eq!(c.path(), Some("added parser then band"));
+        assert_eq!(c.success_verification(), Some("cargo test green"));
+        assert_eq!(c.vault_log_name(), Some("2026-06-25-08-mc.md"));
+        assert!(c.has_content());
+    }
+
+    #[test]
+    fn absent_or_empty_contract_is_none() {
+        let no_field = parse(
+            r#"{"session_id":"s-2","agent":"codex",
+                "created_at":"2026-06-25T08:00:00-07:00",
+                "updated_at":"2026-06-25T08:00:00-07:00",
+                "last_event":"tool_start","working":true}"#,
+        );
+        assert!(no_field.contract().is_none());
+
+        let blank = parse(
+            r#"{"session_id":"s-3","agent":"codex",
+                "created_at":"2026-06-25T08:00:00-07:00",
+                "updated_at":"2026-06-25T08:00:00-07:00",
+                "last_event":"tool_start","working":true,
+                "turn_contract":{"goal":"   ","source":"Stop"}}"#,
+        );
+        assert!(blank.contract().is_none(), "whitespace-only goal is not content");
+    }
 }

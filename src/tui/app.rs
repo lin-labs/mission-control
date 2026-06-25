@@ -503,6 +503,12 @@ impl WorkspaceState {
             .any(|s| s.kind == crate::mc_data::surface_kind::SurfaceKind::Remote)
     }
 
+    /// The arcmux turn contract for this workspace's bound session, when it
+    /// carries goal artifacts worth showing. Authoritative agent-written state.
+    pub fn turn_contract(&self) -> Option<&crate::mc_data::mux_state::TurnContract> {
+        self.mux_status.as_ref().and_then(|s| s.contract())
+    }
+
     /// Derive the agent name from mux state, session, screen insights, or surface titles.
     pub fn agent_name(&self) -> &str {
         if let Some(ref status) = self.mux_status {
@@ -3634,6 +3640,7 @@ workspace: test-ws
             ),
             last_turn_end_at: last_turn_end_at
                 .map(|ts| chrono::DateTime::parse_from_rfc3339(ts).unwrap()),
+            turn_contract: None,
         }
     }
 
