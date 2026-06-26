@@ -4,6 +4,11 @@ use crate::mc_data::trajectory::TrajectoryDoc;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
+/// Hard cap on Mission bullets. The prompt asks the model to stay under this;
+/// `clean_mission` enforces it deterministically (and strips process-noise
+/// bullets) so a misbehaving model can't grow Mission unbounded.
+pub const MISSION_MAX_BULLETS: usize = 6;
+
 pub struct RegenInputs {
     pub workspace_name: String,
     pub current_trajectory: String, // markdown
@@ -35,9 +40,40 @@ pub async fn regenerate(
     let response = summarizer
         .regenerate_trajectory(&prompt.system, &prompt.user)
         .await?;
-    let doc = TrajectoryDoc::parse(&response)
+    let mut doc = TrajectoryDoc::parse(&response)
         .with_context(|| "LLM returned invalid markdown for trajectory regeneration")?;
+    clean_mission(&mut doc);
     Ok(doc)
+}
+
+/// Strip process-noise bullets from the Mission section and cap it at
+/// `MISSION_MAX_BULLETS`. Runs on every regen so existing bloated docs are
+/// pruned the next time they regenerate, not just freshly-written ones.
+pub fn clean_mission(doc: &mut TrajectoryDoc) {
+    use crate::mc_data::trajectory::SECTION_MISSION;
+    let Some(mission) = doc.sections.iter_mut().find(|s| s.name == SECTION_MISSION) else {
+        return;
+    };
+    mission.items.retain(|it| !is_mission_noise(&it.text));
+    // Keep the most recent bullets — regen refines forward, so the tail
+    // reflects current intent. (Noise is already removed above.)
+    if mission.items.len() > MISSION_MAX_BULLETS {
+        let drop = mission.items.len() - MISSION_MAX_BULLETS;
+        mission.items.drain(0..drop);
+    }
+}
+
+/// True for Mission bullets that merely narrate activity/process rather than
+/// stating a durable goal or constraint — the unbounded filler the old prompt
+/// produced (e.g. "Latest 111-tool-call signal adds process only…").
+fn is_mission_noise(text: &str) -> bool {
+    let t = text.to_lowercase();
+    t.contains("adds process only")
+        || t.contains("adds process not scope")
+        || t.contains("tool-call signal")
+        || t.contains("tool call signal")
+        || (t.contains("tool-call") && t.contains("signal"))
+        || t.contains("tool calls executed")
 }
 
 pub fn build_prompt(inputs: &RegenInputs) -> RegenPrompt {
@@ -55,7 +91,14 @@ pub fn build_prompt(inputs: &RegenInputs) -> RegenPrompt {
     system.push_str("  add -> user identified gap; preserve and build on it\n");
     system.push_str("  edit -> user rephrased; treat new phrasing as authoritative\n");
     system.push_str("  move -> user re-ordered; respect the priority signal\n");
-    system.push_str("- Mission section is continuously refined, never replaced wholesale.\n");
+    system.push_str(&format!(
+        "- ## Mission is a SHORT list of at most {MISSION_MAX_BULLETS} bullets capturing \
+         the durable goal(s) and standing constraints for this workspace. Refine it IN \
+         PLACE: merge overlapping bullets, drop stale or redundant ones, keep only what \
+         still matters. NEVER add a bullet that merely restates activity, tool-call counts, \
+         or says a signal \"adds process only\" / \"adds process not scope\" — that is noise; \
+         omit it entirely. If nothing durable changed, leave Mission unchanged.\n"
+    ));
     system.push_str("- Each `## Current surfaces` line ends with `<!-- mc:surface:<sid> -->`.\n");
     system.push_str("  Preserve these markers exactly. Do not invent surface IDs.\n");
     system.push_str("- `## Beads` is sourced from repo-local Beads issues when available.\n");
@@ -139,7 +182,8 @@ pub fn build_prompt(inputs: &RegenInputs) -> RegenPrompt {
         }
     }
     user.push_str(&format!(
-        "- Tool calls executed: {}\n",
+        "- Activity since last regen: {} tool calls (context only — do NOT add a Mission \
+         bullet about this count).\n",
         inputs.tool_call_count
     ));
 
@@ -151,4 +195,55 @@ pub fn build_prompt(inputs: &RegenInputs) -> RegenPrompt {
     user.push_str("\nProduce the new trajectory.md.\n");
 
     RegenPrompt { system, user }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mc_data::trajectory::{TrajectoryDoc, SECTION_MISSION};
+
+    fn mission_bullets(doc: &TrajectoryDoc) -> Vec<String> {
+        doc.sections
+            .iter()
+            .find(|s| s.name == SECTION_MISSION)
+            .map(|s| s.items.iter().map(|i| i.text.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn clean_mission_strips_process_noise() {
+        let md = "---\n{}\n---\n\n## Mission\n\
+            - Ship the remote-surface intent feature\n\
+            - Latest 111-tool-call signal adds process only, not a change in scope attribution.\n\
+            - Validate work directly before reporting status\n\
+            - Latest 50-tool-call signal adds process only.\n\
+            \n## Current surfaces\n\n## Beads\n";
+        let mut doc = TrajectoryDoc::parse(md).unwrap();
+        clean_mission(&mut doc);
+        let bullets = mission_bullets(&doc);
+        assert_eq!(bullets.len(), 2, "noise bullets should be gone: {bullets:?}");
+        assert!(bullets.iter().all(|b| !b.to_lowercase().contains("adds process only")));
+    }
+
+    #[test]
+    fn clean_mission_caps_bullet_count() {
+        let mut md = String::from("---\n{}\n---\n\n## Mission\n");
+        for i in 0..12 {
+            md.push_str(&format!("- durable goal number {i}\n"));
+        }
+        md.push_str("\n## Current surfaces\n\n## Beads\n");
+        let mut doc = TrajectoryDoc::parse(&md).unwrap();
+        clean_mission(&mut doc);
+        let bullets = mission_bullets(&doc);
+        assert_eq!(bullets.len(), MISSION_MAX_BULLETS);
+        // Keeps the most recent (tail) bullets.
+        assert_eq!(bullets.last().unwrap(), "durable goal number 11");
+    }
+
+    #[test]
+    fn is_mission_noise_matches_filler_only() {
+        assert!(is_mission_noise("Latest 63-tool-call signal adds process only"));
+        assert!(is_mission_noise("Tool calls executed: 88"));
+        assert!(!is_mission_noise("Ship the remote-surface intent feature"));
+    }
 }

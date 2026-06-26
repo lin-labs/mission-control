@@ -113,12 +113,18 @@ fn split_surface_intent(text: &str) -> (&str, Option<&str>, Option<&str>) {
     (text[..main_end].trim_end(), overall, ask)
 }
 
+/// Max wrapped lines a single overall/latest field may occupy. Beyond this the
+/// text is truncated with `…` rather than pushing the surface block taller. A
+/// short value still renders on one line; a medium one wraps to 2–4.
+const MAX_FIELD_LINES: usize = 4;
+
 fn surface_item_lines<'a>(
     prefix: &str,
     text: &'a str,
     dim: bool,
     base: Style,
     cursor: bool,
+    inner_width: usize,
 ) -> Vec<Line<'a>> {
     let (main, overall, ask) = split_surface_intent(text);
     // The main (title) line carries the nav cursor highlight when selected; the
@@ -136,16 +142,105 @@ fn surface_item_lines<'a>(
     };
     let mut lines = vec![first_line];
     if let Some(goal) = overall.filter(|s| !s.is_empty()) {
-        lines.push(Line::from(vec![
-            Span::styled("    overall: ", base.fg(Color::DarkGray)),
-            Span::styled(goal, base.fg(Color::Gray)),
-        ]));
+        push_field_lines(&mut lines, "    overall: ", goal, base, inner_width);
     }
     if let Some(ask) = ask.filter(|s| !s.is_empty()) {
-        lines.push(Line::from(vec![
-            Span::styled("    latest:  ", base.fg(Color::DarkGray)),
-            Span::styled(ask, base.fg(Color::Gray)),
-        ]));
+        push_field_lines(&mut lines, "    latest:  ", ask, base, inner_width);
+    }
+    lines
+}
+
+/// Push an `overall:`/`latest:` field as 1–`MAX_FIELD_LINES` wrapped lines:
+/// the label leads the first line, continuation lines are indented to align
+/// under the value. Pre-wrapping to the available width (rather than leaning on
+/// the Paragraph's own wrap) lets us cap the field at `MAX_FIELD_LINES`.
+fn push_field_lines<'a>(
+    lines: &mut Vec<Line<'a>>,
+    label: &'static str,
+    value: &str,
+    base: Style,
+    inner_width: usize,
+) {
+    let indent = label.chars().count();
+    // Leave room for the label on the first line and matching indent on the
+    // rest. Floor the wrap width so a very narrow pane still makes progress.
+    let avail = inner_width.saturating_sub(indent).max(8);
+    let wrapped = wrap_words(value, avail, MAX_FIELD_LINES);
+    let pad: String = " ".repeat(indent);
+    for (i, segment) in wrapped.into_iter().enumerate() {
+        let lead = if i == 0 {
+            Span::styled(label, base.fg(Color::DarkGray))
+        } else {
+            Span::styled(pad.clone(), base)
+        };
+        lines.push(Line::from(vec![lead, Span::styled(segment, base.fg(Color::Gray))]));
+    }
+}
+
+/// Greedy word-wrap `text` to `width` columns, capped at `max_lines`. Words
+/// longer than `width` are hard-split. If the text doesn't fit in `max_lines`,
+/// the last line ends with `…`.
+fn wrap_words(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_len = 0usize;
+
+    // Emit `cur` and reset; returns false once we've hit the line budget.
+    let mut overflow = false;
+    for word in text.split_whitespace() {
+        let wlen = word.chars().count();
+        if cur_len == 0 {
+            // Hard-split a word that's wider than the whole line.
+            if wlen > width {
+                let mut chars = word.chars().peekable();
+                while chars.peek().is_some() && lines.len() < max_lines {
+                    let chunk: String = chars.by_ref().take(width).collect();
+                    lines.push(chunk);
+                }
+                // Leftover characters past the line budget → mark overflow so
+                // the ellipsis pass trims the final line.
+                if chars.peek().is_some() {
+                    overflow = true;
+                }
+                continue;
+            }
+            cur.push_str(word);
+            cur_len = wlen;
+        } else if cur_len + 1 + wlen <= width {
+            cur.push(' ');
+            cur.push_str(word);
+            cur_len += 1 + wlen;
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            if lines.len() >= max_lines {
+                overflow = true;
+                break;
+            }
+            cur.push_str(word);
+            cur_len = wlen;
+        }
+    }
+    if !overflow && !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.len() > max_lines {
+        overflow = true;
+        lines.truncate(max_lines);
+    }
+    if overflow {
+        // Append an ellipsis to the last kept line, trimming to fit width.
+        if let Some(last) = lines.last_mut() {
+            let mut chars: Vec<char> = last.chars().collect();
+            while chars.len() + 1 > width && !chars.is_empty() {
+                chars.pop();
+            }
+            *last = chars.into_iter().collect();
+            last.push('…');
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
     }
     lines
 }
@@ -273,6 +368,9 @@ pub fn render_with_hints(
     f.render_widget(body_block, body_area);
 
     let mut lines: Vec<Line> = Vec::new();
+    // Line index (into `lines`) where the nav cursor's row begins. Used below
+    // to scroll the viewport so the cursor stays visible as `j`/`k` move it.
+    let mut cursor_line: Option<u16> = None;
     for (sec_idx, section) in doc.sections.iter().enumerate() {
         // Determine whether the cursor is "on" this section's header, which
         // happens when the section is empty and cursor_section == sec_idx.
@@ -301,6 +399,9 @@ pub fn render_with_hints(
                     .add_modifier(Modifier::BOLD),
             ))
         };
+        if is_header_cursor {
+            cursor_line = Some(lines.len() as u16);
+        }
         lines.push(header_line);
         if section.items.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -313,6 +414,11 @@ pub fn render_with_hints(
                     .map(|s| s.cursor_section == sec_idx && s.cursor_item == item_idx)
                     .unwrap_or(false);
                 let is_insert_cursor = is_cursor && in_insert;
+                if is_cursor {
+                    // Record where this item's first rendered line lands so the
+                    // viewport can scroll to keep the cursor visible.
+                    cursor_line = Some(lines.len() as u16);
+                }
 
                 // When this item is the one being edited, use the buffer text.
                 let display_text: &str = if is_insert_cursor {
@@ -354,6 +460,7 @@ pub fn render_with_hints(
                         dim,
                         base,
                         is_cursor && !in_insert,
+                        body_inner.width as usize,
                     ));
                     continue;
                 }
@@ -427,9 +534,29 @@ pub fn render_with_hints(
         lines.push(Line::raw(""));
     }
 
+    // In nav mode the viewport follows the cursor: derive the scroll offset so
+    // the cursor row is always on screen (it walks off-screen otherwise on a
+    // long trajectory). Outside nav mode, honour the caller's manual scroll.
+    let in_nav = edit_state
+        .map(|s| matches!(s.mode, EditMode::Nav))
+        .unwrap_or(false);
+    let effective_scroll = match cursor_line {
+        Some(cl) if in_nav => {
+            let view_h = body_inner.height.max(1);
+            if cl < scroll {
+                cl
+            } else if cl >= scroll + view_h {
+                cl.saturating_sub(view_h - 1)
+            } else {
+                scroll
+            }
+        }
+        _ => scroll,
+    };
+
     let para = Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+        .scroll((effective_scroll, 0));
     f.render_widget(para, body_inner);
 
     // ── Input context strip (only in insert mode) ────────────────────────────
@@ -1192,5 +1319,77 @@ workspace: bare
         );
         assert!(!dump.contains("   → "), "no goal badge expected: {dump}");
         assert!(dump.contains("An ordinary goal"), "goal text missing");
+    }
+
+    #[test]
+    fn wrap_words_short_value_stays_one_line() {
+        let out = wrap_words("build the detail view", 40, 4);
+        assert_eq!(out, vec!["build the detail view".to_string()]);
+    }
+
+    #[test]
+    fn wrap_words_wraps_to_multiple_lines() {
+        // 5 words of width 5 at width 11 → "aaaaa bbbbb" per line.
+        let out = wrap_words("aaaaa bbbbb ccccc ddddd", 11, 4);
+        assert_eq!(out, vec!["aaaaa bbbbb".to_string(), "ccccc ddddd".to_string()]);
+    }
+
+    #[test]
+    fn wrap_words_caps_at_max_lines_with_ellipsis() {
+        let text = "one two three four five six seven eight nine ten eleven twelve";
+        let out = wrap_words(text, 9, 4);
+        assert_eq!(out.len(), 4, "must not exceed MAX_FIELD_LINES");
+        assert!(out.last().unwrap().ends_with('…'), "truncation marker: {out:?}");
+        // Every line fits the width budget (ellipsis included).
+        assert!(out.iter().all(|l| l.chars().count() <= 9), "overflow: {out:?}");
+    }
+
+    #[test]
+    fn wrap_words_hard_splits_overlong_word() {
+        let out = wrap_words("abcdefghijklmnop", 5, 4);
+        assert_eq!(out, vec!["abcde", "fghij", "klmno", "p"]);
+    }
+
+    #[test]
+    fn nav_cursor_scrolls_viewport_into_view() {
+        // A Mission section longer than the viewport; the cursor on a late
+        // bullet must be visible (viewport follows the cursor), and the first
+        // bullet must have scrolled off-screen.
+        let mut md = String::from("---\n{}\n---\n\n## Mission\n");
+        for i in 0..30 {
+            md.push_str(&format!("- mission bullet number {i:02}\n"));
+        }
+        md.push_str("\n## Current surfaces\n\n## Beads\n");
+        let doc = TrajectoryDoc::parse(&md).unwrap();
+
+        let mut state = TrajectoryEditState::default();
+        state.cursor_section = 0; // Mission
+        state.cursor_item = 27; // a late bullet, well past one screenful
+
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    Rect::new(0, 0, 60, 12),
+                    Some(&doc),
+                    0,
+                    true,
+                    Some(&state),
+                    None,
+                    None,
+                )
+            })
+            .unwrap();
+        let dump = buf_dump(&terminal);
+        assert!(
+            dump.contains("mission bullet number 27"),
+            "cursor bullet should be visible: {dump}"
+        );
+        assert!(
+            !dump.contains("mission bullet number 00"),
+            "viewport should have scrolled past the first bullet: {dump}"
+        );
     }
 }

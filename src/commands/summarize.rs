@@ -21,9 +21,16 @@ pub struct WorkspaceDigest {
     pub num_surfaces: usize,
     /// Surfaces currently driving an agent (Claude / Codex / etc.).
     pub num_agent_surfaces: usize,
-    /// Rough char count of the session's bullets — proxy for context volume.
-    /// We surface a token estimate (chars / 4) in the report.
+    /// Rough char count of the workspace's agent-surface conversations —
+    /// proxy for context volume. We surface a token estimate (chars / 4) in
+    /// the report. Filled by `gather_session_activity` from surface
+    /// transcripts (the histories session log doesn't bind reliably).
     pub session_chars: usize,
+    /// cmux surface UUIDs for surfaces currently running an agent. Used by
+    /// `gather_session_activity` to resolve each surface's transcript and
+    /// count real user turns. Captured on the UI thread (no I/O); the
+    /// transcript reads happen later in the async pass.
+    pub agent_surface_uuids: Vec<String>,
     /// Workspace's git working dir, if cmux reports one. Used by the async
     /// `gather_commit_stats` pass to count recent commits.
     pub cwd: Option<PathBuf>,
@@ -60,11 +67,16 @@ pub fn collect_digests(app: &App) -> Vec<WorkspaceDigest> {
         .map(|ws| {
             let num_surfaces = ws.surfaces.len();
             let num_agent_surfaces = ws.surfaces.iter().filter(|s| s.kind.is_agent()).count();
-            let session_chars = ws
-                .session
-                .as_ref()
-                .map(|s| s.bullets.iter().map(|b| b.len()).sum())
-                .unwrap_or(0);
+            // UUIDs of the agent surfaces — resolved to transcripts later by
+            // `gather_session_activity`. turn_count/session_chars are filled
+            // there too (the histories session log rarely binds to a cmux
+            // workspace, so we no longer source activity from it).
+            let agent_surface_uuids: Vec<String> = ws
+                .surfaces
+                .iter()
+                .filter(|s| s.kind.is_agent())
+                .filter_map(|s| s.uuid.clone())
+                .collect();
             let cwd = ws
                 .workspace
                 .current_directory
@@ -110,7 +122,8 @@ pub fn collect_digests(app: &App) -> Vec<WorkspaceDigest> {
             WorkspaceDigest {
                 name: ws.workspace.name.clone(),
                 status_label: derive_status_label(ws),
-                turn_count: ws.session.as_ref().map(|s| s.bullets.len()).unwrap_or(0),
+                // Filled by `gather_session_activity` from surface transcripts.
+                turn_count: 0,
                 last_summary: ws.summary.as_ref().map(|s| s.trajectory.clone()),
                 next_steps: ws
                     .summary
@@ -119,7 +132,8 @@ pub fn collect_digests(app: &App) -> Vec<WorkspaceDigest> {
                     .unwrap_or_default(),
                 num_surfaces,
                 num_agent_surfaces,
-                session_chars,
+                session_chars: 0,
+                agent_surface_uuids,
                 cwd,
                 commits_24h: None,
                 description: ws.workspace.description.clone(),
@@ -182,6 +196,56 @@ pub async fn gather_commit_stats(digests: &mut [WorkspaceDigest]) {
     }
 }
 
+/// Fill in `turn_count` and `session_chars` for each digest from its agent
+/// surfaces' transcripts. Reads the cmux surface→transcript binding once, then
+/// for every agent surface counts real user turns (via the agent-aware
+/// transcript parser) and sums their characters as a context-volume proxy.
+///
+/// This is the accurate per-cmux-workspace activity source: the markdown
+/// session logs under `~/agents/histories` rarely carry a matching
+/// `workspace_id`, so binding by it left turns/tokens at 0. Surface transcripts
+/// are bound deterministically by surface UUID.
+pub async fn gather_session_activity(digests: &mut [WorkspaceDigest]) {
+    if digests.iter().all(|d| d.agent_surface_uuids.is_empty()) {
+        return;
+    }
+    // The transcript reads are blocking file I/O; do the whole pass on a
+    // blocking thread so we never stall the async runtime / UI.
+    let inputs: Vec<Vec<String>> = digests
+        .iter()
+        .map(|d| d.agent_surface_uuids.clone())
+        .collect();
+    let activity = tokio::task::spawn_blocking(move || {
+        let bound = crate::mc_data::cmux_sessions::load_by_surface();
+        inputs
+            .into_iter()
+            .map(|uuids| {
+                let mut turns = 0usize;
+                let mut chars = 0usize;
+                for uuid in uuids {
+                    let Some(session) = bound.get(&uuid) else {
+                        continue;
+                    };
+                    let Some(tp) = session.transcript_path.as_ref() else {
+                        continue;
+                    };
+                    let users = crate::mc_data::transcript::user_turns(session.agent, tp);
+                    turns += users.len();
+                    chars += users.iter().map(|u| u.chars().count()).sum::<usize>();
+                }
+                (turns, chars)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+
+    for (d, (turns, chars)) in digests.iter_mut().zip(activity) {
+        d.turn_count = turns;
+        d.session_chars = chars;
+    }
+}
+
 async fn commit_stats_for(cwd: &Path) -> Option<CommitStats> {
     use tokio::process::Command;
     // Use `git -C <cwd> log` rather than `cd` so we don't have to worry
@@ -223,16 +287,13 @@ fn derive_status_label(ws: &crate::tui::app::WorkspaceState) -> String {
     state.label().to_string()
 }
 
-/// Resolve the directory where mc writes summary reports.
-/// Under the Obsidian Agents vault, reached via $OBS_AGENTS or the stable
-/// ~/agents/obsAgents symlink (-> obs/Agents) — never a hardcoded iCloud path,
-/// and never the nonexistent ~/agents/Obsidian path.
+/// Resolve the directory where mc writes summary reports: the
+/// `mc-workspaces-summaries/` folder under the obsAgents vault root. The root
+/// itself (via $OBS_AGENTS or the stable ~/agents/obsAgents symlink, never a
+/// hardcoded iCloud path) is resolved by the single source of truth in
+/// `mc_data::prompts::obsagents_root`.
 pub fn output_dir() -> PathBuf {
-    if let Ok(v) = std::env::var("OBS_AGENTS") {
-        return PathBuf::from(v).join("mc-workspaces-summaries");
-    }
-    let home = dirs::home_dir().unwrap_or_default();
-    home.join("agents/obsAgents/mc-workspaces-summaries")
+    crate::mc_data::prompts::obsagents_root().join("mc-workspaces-summaries")
 }
 
 /// Compute the report path for `now`, falling back to minute-/second-suffixed
@@ -426,7 +487,7 @@ pub fn build_document(
         s.push_str("workspaces:\n");
         for d in digests {
             s.push_str(&format!("  - name: {}\n", yaml_inline(&d.name)));
-            s.push_str(&format!("    status: {}\n", d.status_label));
+            s.push_str(&format!("    status: {}\n", yaml_inline(&d.status_label)));
             s.push_str(&format!("    surfaces: {}\n", d.num_surfaces));
             s.push_str(&format!("    agent_surfaces: {}\n", d.num_agent_surfaces));
             s.push_str(&format!("    turns: {}\n", d.turn_count));
@@ -494,14 +555,16 @@ pub fn build_document(
     s
 }
 
-/// Quote a string for safe inline YAML scalar use.
+/// Quote a string for safe inline YAML scalar use. Any value containing a
+/// space (or other YAML-significant character) is wrapped in double quotes so
+/// nested string fields like `name`/`status` never emit a bare multi-word
+/// scalar that a strict parser could misread.
 fn yaml_inline(v: &str) -> String {
     if v.is_empty()
+        || v.contains(' ')
         || v.contains(':')
         || v.contains('#')
         || v.contains('\n')
-        || v.starts_with(' ')
-        || v.ends_with(' ')
     {
         let escaped = v.replace('"', "\\\"");
         format!("\"{}\"", escaped)
@@ -663,6 +726,10 @@ mod tests {
         assert_eq!(yaml_inline("foo"), "foo");
         assert_eq!(yaml_inline("foo: bar"), "\"foo: bar\"");
         assert_eq!(yaml_inline("a#b"), "\"a#b\"");
+        // Any interior space forces quoting (nested name/status fields).
+        assert_eq!(yaml_inline("my project"), "\"my project\"");
+        assert_eq!(yaml_inline("needs attention"), "\"needs attention\"");
+        assert_eq!(yaml_inline("--"), "--");
     }
 
     struct StubSummarizer {

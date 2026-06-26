@@ -27,7 +27,6 @@ pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus) {
             ("s", "rescreen"),
             ("r", "summarize"),
             ("^r", "reload"),
-            ("n", "notes"),
             ("q", "quit"),
         ],
         Focus::Detail => &[
@@ -38,7 +37,6 @@ pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus) {
             ("s", "rescreen"),
             ("r", "summarize"),
             ("^r", "reload"),
-            ("n", "notes"),
             ("q", "quit"),
         ],
     };

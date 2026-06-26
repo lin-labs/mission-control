@@ -417,6 +417,7 @@ async fn run_summarize_cli(config: &Config) -> Result<()> {
     let t = std::time::Instant::now();
     let mut digests = commands::summarize::collect_digests(&app);
     commands::summarize::gather_commit_stats(&mut digests).await;
+    commands::summarize::gather_session_activity(&mut digests).await;
     let stats = commands::summarize::SummaryStats::from_digests(&digests);
     eprintln!(
         "      → {} workspaces · {} surfaces ({} agent) · {} turns · ~{} tokens · {} commits 24h ({:.1}s)",
@@ -798,7 +799,6 @@ async fn run_app(
                             }
                             continue; // exclusive owner — never fall through
                         }
-                        // ─────────────────────────────────────────────────────
 
                         // ── Trajectory key routing ────────────────────────────
                         // When in Detail focus and the selected workspace has a

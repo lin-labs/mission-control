@@ -142,7 +142,10 @@ fn compact_label(text: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    truncate_chars(&cleaned, 90)
+    // Whitespace-collapsed to a single stored line (the trajectory item is one
+    // line), but kept long enough to fill up to ~4 wrapped display lines. The
+    // detail view (trajectory_view) does the width-aware wrap + line cap.
+    truncate_chars(&cleaned, 480)
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
