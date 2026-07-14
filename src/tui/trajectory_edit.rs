@@ -734,7 +734,12 @@ fn insert_item_below(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
         Some(s) => s,
         None => return,
     };
-    let insert_pos = if section.items.is_empty() {
+    let insert_pos = if section.items.is_empty()
+        || (section.name == SECTION_MISSION && state.cursor_item == 0)
+    {
+        // Mission item 0 is the current Mission; later items are history.
+        // Opening below the rendered current Mission must still create a new
+        // current item and move the previous Mission into history.
         0
     } else {
         state.cursor_item + 1
@@ -1175,7 +1180,7 @@ workspace: test-ws
     // ── o / O ────────────────────────────────────────────────────────────────
 
     #[test]
-    fn o_inserts_item_below_cursor_in_insert_mode() {
+    fn o_on_active_mission_opens_new_current_mission() {
         let doc = make_doc();
         let mut state = TrajectoryEditState {
             cursor_section: 0,
@@ -1184,9 +1189,28 @@ workspace: test-ws
         };
         let mut doc_mut = doc.clone();
         handle_key(&mut state, &mut doc_mut, key(KeyCode::Char('o')));
-        // A new empty item should be at index 1 (below cursor).
+        // Mission index 0 is the current Mission; older items render as history.
+        // `o` therefore opens a new index 0 and parks the prior active Mission.
         assert_eq!(doc_mut.sections[0].items.len(), 2);
-        assert_eq!(doc_mut.sections[0].items[1].text, "");
+        assert_eq!(doc_mut.sections[0].items[0].text, "");
+        assert_eq!(doc_mut.sections[0].items[1].text, "Build investment agent");
+        assert_eq!(state.cursor_item, 0);
+        assert!(matches!(state.mode, EditMode::Insert { .. }));
+    }
+
+    #[test]
+    fn o_on_beads_still_inserts_below_cursor() {
+        let mut doc = make_doc();
+        let mut state = TrajectoryEditState {
+            cursor_section: 2,
+            cursor_item: 0,
+            ..Default::default()
+        };
+
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('o')));
+
+        assert_eq!(doc.sections[2].items.len(), 4);
+        assert_eq!(doc.sections[2].items[1].text, "");
         assert_eq!(state.cursor_item, 1);
         assert!(matches!(state.mode, EditMode::Insert { .. }));
     }
@@ -1216,12 +1240,11 @@ workspace: test-ws
         };
         let mut doc_mut = doc.clone();
         handle_key(&mut state, &mut doc_mut, key(KeyCode::Char('o')));
-        state.edit_buffer = "New goal item".to_string();
+        state.edit_buffer = "New current mission".to_string();
         let actions = handle_key(&mut state, &mut doc_mut, key(KeyCode::Esc));
-        // edit_start_text is "", new text is "New goal item" → an Edit action
-        // (the item was created with "" and changed to "New goal item").
-        // Actually it starts as "" via insert_item_below, so we get an Edit action.
         assert!(!actions.is_empty());
+        assert_eq!(doc_mut.sections[0].items[0].text, "New current mission");
+        assert_eq!(doc_mut.sections[0].items[1].text, "Build investment agent");
     }
 
     // ── x (delete) ───────────────────────────────────────────────────────────

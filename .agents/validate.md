@@ -590,6 +590,26 @@ zero items. Prompt compliance alone was treated as the invariant.
    `R`, wait for regen, and verify both the rendered pane and its on-disk
    `trajectory.md` contain a Mission bullet.
 
+### F14 — Mission editor inserts into history instead of current Mission
+
+**Symptom**: pressing `o` on the active Mission opens a blank row under
+`## Mission history`, leaving the previous current Mission unchanged.
+
+**Root cause**: the generic Vim `o` implementation inserted at
+`cursor_item + 1`, while the renderer gives Mission item 0 special meaning as
+the current Mission and renders every later item as history.
+
+**Prevention checklist** for Mission editor changes:
+
+1. Keep insertion semantics aligned with rendering semantics: `o` on Mission
+   item 0 inserts at index 0 and pushes the prior Mission into history.
+2. Preserve ordinary Vim behavior for other sections: `o` still inserts below
+   the current Beads/task row.
+3. Run the focused `o_on_` and `o_then_type_then_esc_emits_add_action` tests.
+4. Tier 4: launch global `mc`, enter Detail, place the cursor on the current
+   Mission, type `o`, enter text, press Esc, and verify the new text is under
+   `## Mission` while the prior text appears under `## Mission history`.
+
 ---
 
 ## Per-area validation cheat sheets
