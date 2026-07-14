@@ -68,6 +68,9 @@ pub fn render_detail(
                 hints.dim_surface_refs.insert(s.ref_id.clone());
             }
         }
+        if ws.linear.is_some() {
+            hints.task_section_title = Some("Linear".to_string());
+        }
         crate::tui::trajectory_view::render_with_hints(
             f,
             area,

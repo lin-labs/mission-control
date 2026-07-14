@@ -610,6 +610,32 @@ the current Mission and renders every later item as history.
    Mission, type `o`, enter text, press Esc, and verify the new text is under
    `## Mission` while the prior text appears under `## Mission history`.
 
+### F15 — Stale `.beads` overrides an authoritative Linear tracker
+
+**Symptom**: an Olympus workspace renders `## Beads` and an unavailable row,
+even though `~/agents/projects.yaml` declares the platform's tracker as Linear.
+
+**Root cause**: task-source selection looked only for a repo-local `.beads/`
+directory. A stale or redirected store therefore won over the project registry.
+
+**Prevention checklist** for task projection and external-ticket actions:
+
+1. Resolve the workspace cwd through `~/agents/projects.yaml` first. A declared
+   Linear tracker stays authoritative even when its coordinates or credential
+   are unavailable; do not silently fall back to `.beads/`.
+2. If the workspace cwd cannot resolve, use exact surface/session repo paths as
+   fallback evidence. Never combine task rows from mismatched Linear targets.
+3. Keep the persisted trajectory section canonical and change only the render
+   title to `Linear`; prove Beads workspaces still render `Beads`.
+4. Treat projected Linear rows as read-only. Enter may open only a validated
+   issue URL rooted at `https://linear.app/`; all non-ticket rows and mutation
+   keys are no-ops.
+5. Run focused registry, response/error, source-heading, read-only, deep-link,
+   refresh-deduplication, and stale-cleanup tests.
+6. Tier 4: launch global `mc` against the live Olympus workspace, verify real
+   Linear issues under `## Linear`, highlight one issue, press Enter, and
+   confirm the installed Linear app opens that exact identifier.
+
 ---
 
 ## Per-area validation cheat sheets
