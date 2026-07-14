@@ -729,12 +729,16 @@ cd /Users/blin/Tools/mission-control
 cargo test -- --test-threads=1       # confirm master is still green
 cargo build --release                 # update the symlinked binary
 mc --help | head -10                  # smoke that subcommands still list
+# In the pinned mc TUI: press Ctrl-R, or quit and relaunch it.
 ```
 
 The `mc` symlink chain (`~/.cargo/bin/mc → ~/.cargo/bin/mission-control →
-target/release/mission-control`) means `cargo build --release` IS the deploy
-step. Skipping it leaves the user on the previous version even though
-master moved.
+target/release/mission-control`) updates the on-disk command, but an already
+running TUI keeps its old executable image. Release is complete only after the
+pinned `mc` workspace has reloaded or relaunched the new binary. Before live
+trajectory validation, also ensure an older parallel `mc` process is not still
+refreshing the same files; it can overwrite the new projection and create a
+false regression.
 
 ---
 

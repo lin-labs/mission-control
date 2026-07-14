@@ -31,6 +31,9 @@ cross-check each F-entry against what was done this session.
 - Did tier 4 (live binary against real cmux) actually run, or was it
   skipped with a self-reported "compiles + tests pass"? Tier-skipping is
   the #1 root cause of post-merge breakage on this repo.
+- Did the pinned `mc` process reload after the release build, and was live
+  validation performed without an older parallel `mc` still rewriting shared
+  trajectories? A symlink update does not replace a running executable image.
 - For changes touching session-log resolution or workspace attribution: did
   the post-change manual inspection step (tier 5) get done? Cross-workspace
   contamination is silent and expensive.
