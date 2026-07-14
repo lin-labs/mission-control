@@ -468,7 +468,7 @@ pub struct RemoteGrabUpdate {
 }
 
 /// An LLM-inferred intent for a remote surface, flowing back from a background
-/// xAI task to [`App::apply_remote_intent`].
+/// provider task to [`App::apply_remote_intent`].
 pub struct RemoteIntentUpdate {
     pub surface_ref: String,
     pub intent: crate::mc_data::surface_render::SurfaceIntentSummary,
@@ -670,6 +670,9 @@ pub struct App {
     pub should_quit: bool,
     pub focus: Focus,
     pub detail_scroll: u16,
+    /// Machine-wide configuration or credential warning. Rendered in the
+    /// global info layer rather than attached to any monitored workspace.
+    pub global_warning: Option<String>,
     session_to_workspace: HashMap<String, String>,
     workspace_index: HashMap<String, usize>,
     bullet_hashes: HashMap<PathBuf, u64>,
@@ -885,7 +888,7 @@ async fn gather_refresh_snapshot_inner(
             // agent's native transcript. Read once; used as the top-priority
             // intent source so each surface shows ITS OWN overall/latest.
             let bound_by_surface = crate::mc_data::cmux_sessions::load_by_surface();
-            // Persistent xAI "overall" summaries keyed by transcript path; these
+            // Persistent provider "overall" summaries keyed by transcript path; these
             // override the deterministic first-turn overall when present.
             let overall_cache = crate::mc_data::overall_cache::load();
             for ws in workspaces_for_surface_sessions {
@@ -918,7 +921,7 @@ async fn gather_refresh_snapshot_inner(
                         if let Some(tp) = b.transcript_path.as_deref() {
                             let mut intent =
                                 crate::mc_data::transcript::intent_from_transcript(b.agent, tp);
-                            // Prefer the persistent xAI session summary for
+                            // Prefer the persistent provider session summary for
                             // "overall" when one is cached for this transcript.
                             if let Some((summary, _)) =
                                 overall_cache.get(&tp.to_string_lossy().into_owned())
@@ -1054,6 +1057,7 @@ impl App {
             should_quit: false,
             focus: Focus::Sidebar,
             detail_scroll: 0,
+            global_warning: None,
             session_to_workspace: HashMap::new(),
             workspace_index: HashMap::new(),
             bullet_hashes: HashMap::new(),
@@ -1069,10 +1073,10 @@ impl App {
         &mut self,
         client: &CmuxClient,
         histories_dir: &std::path::Path,
-        xai_api_key: Option<&str>,
+        short_text_client: Option<&crate::llm::short_text::ShortTextClient>,
     ) -> Result<()> {
         let snap = gather_refresh_snapshot(client, histories_dir).await?;
-        self.apply_refresh_snapshot(snap, xai_api_key).await;
+        self.apply_refresh_snapshot(snap, short_text_client).await;
         Ok(())
     }
 
@@ -1157,7 +1161,7 @@ impl App {
     pub async fn apply_refresh_snapshot(
         &mut self,
         snap: RefreshSnapshot,
-        xai_api_key: Option<&str>,
+        short_text_client: Option<&crate::llm::short_text::ShortTextClient>,
     ) {
         let RefreshSnapshot {
             workspaces,
@@ -1434,7 +1438,7 @@ impl App {
         // workspaces processed back-to-back don't both pick the same code
         // (e.g. "MSC" for two repos that look alike).
         let mut used_prefixes_this_pass: Vec<String> = Vec::new();
-        // Snapshot xAI-inferred intents for remote surfaces before the mutable
+        // Snapshot provider-inferred intents for remote surfaces before the mutable
         // workspace loop (can't borrow self.remote_watch inside iter_mut).
         let remote_intents = self.remote_watch.all_intents();
         for ws_state in self.workspaces.iter_mut() {
@@ -1481,10 +1485,10 @@ impl App {
                         s.kind,
                     );
                     // Remote (mosh/ssh) surfaces have no local session log; their
-                    // overall/latest comes from the xAI inference over the
+                    // overall/latest comes from provider inference over the
                     // screen-grab transcript (see remote_intent). Local agent
                     // surfaces use the session-log/screen path as before.
-                    // Bound surfaces already carry the xAI "overall" summary
+                    // Bound surfaces already carry the provider "overall" summary
                     // (applied in the gather phase from overall_cache); the
                     // workspace-fallback path is for unbound surfaces only.
                     let intent = if eff == crate::mc_data::surface_kind::SurfaceKind::Remote {
@@ -1570,12 +1574,12 @@ impl App {
                         .any(|i| !i.text.trim().is_empty());
                 if needs_prefix {
                     let workspace_name = ws_state.workspace.name.clone();
-                    let picked: String = match xai_api_key {
-                        Some(key) => {
+                    let picked: String = match short_text_client {
+                        Some(client) => {
                             match tokio::time::timeout(
                                 std::time::Duration::from_secs(5),
-                                crate::llm::xai::generate_workspace_prefix(
-                                    key,
+                                crate::llm::short_text::generate_workspace_prefix(
+                                    client,
                                     &workspace_name,
                                     &used_prefixes_this_pass,
                                 ),
@@ -1585,27 +1589,29 @@ impl App {
                                 Ok(Ok(p)) => p,
                                 Ok(Err(e)) => {
                                     eprintln!(
-                                        "xAI prefix gen failed for {}: {e:#}; using deterministic.",
+                                        "{} prefix gen failed for {}: {e:#}; using deterministic.",
+                                        client.provider_name(),
                                         workspace_name
                                     );
-                                    crate::llm::xai::deterministic_prefix(
+                                    crate::llm::short_text::deterministic_prefix(
                                         &workspace_name,
                                         &used_prefixes_this_pass,
                                     )
                                 }
                                 Err(_) => {
                                     eprintln!(
-                                        "xAI prefix gen timed out for {}; using deterministic.",
+                                        "{} prefix gen timed out for {}; using deterministic.",
+                                        client.provider_name(),
                                         workspace_name
                                     );
-                                    crate::llm::xai::deterministic_prefix(
+                                    crate::llm::short_text::deterministic_prefix(
                                         &workspace_name,
                                         &used_prefixes_this_pass,
                                     )
                                 }
                             }
                         }
-                        None => crate::llm::xai::deterministic_prefix(
+                        None => crate::llm::short_text::deterministic_prefix(
                             &workspace_name,
                             &used_prefixes_this_pass,
                         ),
@@ -1840,6 +1846,11 @@ impl App {
         {
             parts.push(format!("window {window_id}"));
         }
+        // Put the warning last: the info renderer truncates from the left, so
+        // narrow terminals retain the actionable warning instead of the IDs.
+        if let Some(warning) = self.global_warning.as_deref() {
+            parts.push(format!("⚠ {warning}"));
+        }
         if parts.is_empty() {
             None
         } else {
@@ -1968,7 +1979,7 @@ impl App {
     /// Apply a remote-surface capture: feed the frame merger (dedup + status
     /// peel) and persist the debug transcript. Returns
     /// `Some((workspace_uuid, surface_ref, transcript))` when the transcript has
-    /// grown enough to warrant a fresh xAI intent inference (change-gated).
+    /// grown enough to warrant fresh provider intent inference (change-gated).
     pub fn apply_remote_grab(
         &mut self,
         update: RemoteGrabUpdate,
@@ -1980,18 +1991,21 @@ impl App {
             .map(|transcript| (update.workspace_uuid, update.surface_ref, transcript))
     }
 
-    /// Store an xAI-inferred intent for a remote surface (rendered next refresh).
+    /// Store a provider-inferred intent for a remote surface (rendered next refresh).
     pub fn apply_remote_intent(&mut self, update: RemoteIntentUpdate) {
         self.remote_watch
             .set_intent(&update.surface_ref, update.intent);
     }
 
     /// When the detail panel is open on a workspace, generate (or refresh) the
-    /// xAI "overall" session summary for each of its bound agent surfaces.
+    /// selected-provider "overall" session summary for each bound agent surface.
     /// Change-gated: regenerate only when a surface has ≥`OVERALL_SUMMARY_EVERY`
     /// new user turns since its last summary (or has none yet). Runs off the
     /// main loop; results return via [`App::apply_overall_summary`].
-    pub fn spawn_overall_summaries(&self, xai_api_key: String) {
+    pub fn spawn_overall_summaries(
+        &self,
+        short_text_client: crate::llm::short_text::ShortTextClient,
+    ) {
         if self.focus != Focus::Detail {
             return;
         }
@@ -2038,7 +2052,8 @@ impl App {
                 if !due {
                     continue;
                 }
-                if let Ok(summary) = crate::llm::xai::summarize_overall(&xai_api_key, &users).await
+                if let Ok(summary) =
+                    crate::llm::short_text::summarize_overall(&short_text_client, &users).await
                 {
                     let _ = crate::mc_data::overall_cache::put(&transcript, &summary, turns);
                 }
@@ -3667,6 +3682,16 @@ workspace: test-ws
         assert_eq!(
             app.bottom_info().as_deref(),
             Some("workspace test-uuid-1 · window window-test")
+        );
+    }
+
+    #[test]
+    fn bottom_info_keeps_global_warning_visible() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.global_warning = Some("OpenAI key unavailable".to_string());
+        assert_eq!(
+            app.bottom_info().as_deref(),
+            Some("workspace test-uuid-1 · window window-test · ⚠ OpenAI key unavailable")
         );
     }
 

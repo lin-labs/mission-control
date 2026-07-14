@@ -3,7 +3,7 @@
 //! (`cmux_sessions::HookSession::transcript_path`).
 //!
 //! This is the per-surface, deterministic counterpart to the remote screen-grab
-//! + xAI path: a bound LOCAL agent has a clean structured transcript, so we read
+//! + LLM path: a bound LOCAL agent has a clean structured transcript, so we read
 //! the actual user turns (first = overall, last = latest) with no LLM and no
 //! workspace-level broadcast. Two formats:
 //!

@@ -22,6 +22,7 @@ signals are weak.
 - `cmux`
 - Optional: `codex` on your `PATH` for local summarization
 - Optional: `OPENAI_API_KEY` for OpenAI-backed summaries
+- Optional: `gcloud` authenticated to `reflectionai` for automatic OpenAI key lookup
 - Optional: `TYPESAFE_API_KEY` for screen classification
 
 ## Build
@@ -45,6 +46,23 @@ mc --cmux-bin cmux --cmux-socket "$CMUX_SOCKET_PATH"
 mc --use-codex false --openai-api-key "$OPENAI_API_KEY"
 mc --typesafe-api-key "$TYPESAFE_API_KEY"
 ```
+
+## Short-text provider
+
+Workspace prefixes, remote intent extraction, and per-surface overall summaries
+use one machine-local provider selected in `~/data/mission-control/config.json`:
+
+```json
+{
+  "short_text_provider": "openai"
+}
+```
+
+Supported values are `xai` and `openai`. A missing file preserves the historical
+`xai` default. OpenAI uses `OPENAI_API_KEY` / `--openai-api-key` when supplied;
+otherwise Mission Control reads `OPENAI_API_KEY_AGENTIC` through `gcloud` from
+the `reflectionai` project. Secret lookup failures are non-fatal and appear as a
+global warning in the TUI. The fetched key is never persisted.
 
 ## Subcommands
 

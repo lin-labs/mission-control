@@ -7,6 +7,14 @@ pub fn data_root() -> PathBuf {
         .join("mission-control")
 }
 
+/// Machine-local Mission Control configuration.
+///
+/// This belongs beside runtime state rather than in the repository because
+/// provider choice may differ across machines.
+pub fn local_config_path() -> PathBuf {
+    data_root().join("config.json")
+}
+
 pub fn agent_histories_dir() -> PathBuf {
     dirs::home_dir()
         .expect("home dir resolvable")

@@ -88,6 +88,10 @@ Meta-patterns observed so far:
 - Running tier 4 (`mc` against real cmux) before claiming done, even when
   unit tests are green.
 - Recording warning count in PR description so drift is visible.
+- **Isolated cloud-auth failure smokes**. For optional credentials, point the
+  process at a fresh temporary auth config (for example `CLOUDSDK_CONFIG`) and
+  live-launch the TUI. This verifies the non-fatal warning path without
+  disturbing the user's real authenticated profile.
 - **File-logged diagnostics for TUI bugs**. The TUI captures stderr to
   the alt-screen, so `eprintln!` is invisible to the user. Writing to
   `/tmp/mc-peek-debug.log` (or similar) with `OpenOptions::append`

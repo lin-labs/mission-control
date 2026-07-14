@@ -1,4 +1,4 @@
-//! Persistent cache of xAI-generated "overall" session summaries.
+//! Persistent cache of provider-generated "overall" session summaries.
 //!
 //! Keyed by the agent's **transcript path** (stable per session, unlike a
 //! surface UUID), so a summary survives mc restarts and the 4-turn change gate
