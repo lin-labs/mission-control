@@ -817,6 +817,7 @@ async fn run_app(
     let (beads_refresh_tx, mut beads_refresh_rx) =
         mpsc::channel::<crate::tui::app::BeadsRefreshSnapshot>(4);
     let mut beads_refresh_inflight: bool = false;
+    let (linear_open_tx, mut linear_open_rx) = mpsc::channel::<Result<(), String>>(4);
 
     let mut refresh_interval = interval(Duration::from_secs(30));
     let mut beads_refresh_interval = interval(Duration::from_secs(5));
@@ -1078,6 +1079,13 @@ async fn run_app(
                                             outcome,
                                             cmux_client.clone(),
                                         );
+                                    }
+                                    if let Some(url) = app.take_linear_open_request() {
+                                        let tx = linear_open_tx.clone();
+                                        tokio::spawn(async move {
+                                            let result = open_linear_desktop_issue(&url).await;
+                                            let _ = tx.send(result).await;
+                                        });
                                     }
                                     continue;
                                 }
@@ -1495,6 +1503,12 @@ async fn run_app(
                 }
             }
 
+            Some(result) = linear_open_rx.recv() => {
+                if let Err(warning) = result {
+                    app.global_warning = Some(warning);
+                }
+            }
+
             Some(beads_snap) = beads_refresh_rx.recv() => {
                 beads_refresh_inflight = false;
                 app.apply_beads_refresh_snapshot(beads_snap).await;
@@ -1776,6 +1790,22 @@ async fn run_app(
     }
 }
 
+async fn open_linear_desktop_issue(url: &str) -> Result<(), String> {
+    if !url.starts_with("linear://linear.app/") {
+        return Err("Linear app unavailable: invalid issue target".to_string());
+    }
+    let status = tokio::process::Command::new("open")
+        .args(["-b", "com.linear", url])
+        .status()
+        .await
+        .map_err(|_| "Linear app unavailable: launch failed".to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Linear app unavailable: launch failed".to_string())
+    }
+}
+
 /// Act on the user's choice from the dispatch modal.
 ///
 /// - `Cancel`              → close the modal, no side effects.
@@ -2020,6 +2050,8 @@ mod tests {
             loading: false,
             summary: None,
             beads: None,
+            linear: None,
+            linear_open_pending: None,
             summarizing: false,
             trajectory: None,
             edit_state: None,
@@ -2070,6 +2102,18 @@ mod tests {
     fn l_and_right_are_owned_by_trajectory_detail() {
         assert!(is_trajectory_detail_key(key(KeyCode::Char('l'))));
         assert!(is_trajectory_detail_key(key(KeyCode::Right)));
+    }
+
+    #[tokio::test]
+    async fn linear_app_launcher_rejects_non_linear_targets_before_launch() {
+        assert_eq!(
+            open_linear_desktop_issue("https://linear.app/acme/issue/MID-1/x").await,
+            Err("Linear app unavailable: invalid issue target".to_string())
+        );
+        assert_eq!(
+            open_linear_desktop_issue("linear://linear.app.evil/acme/issue/MID-1/x").await,
+            Err("Linear app unavailable: invalid issue target".to_string())
+        );
     }
 
     #[test]

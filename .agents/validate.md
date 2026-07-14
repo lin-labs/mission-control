@@ -590,6 +590,55 @@ zero items. Prompt compliance alone was treated as the invariant.
    `R`, wait for regen, and verify both the rendered pane and its on-disk
    `trajectory.md` contain a Mission bullet.
 
+### F14 — Mission editor inserts into history instead of current Mission
+
+**Symptom**: pressing `o` on the active Mission opens a blank row under
+`## Mission history`, leaving the previous current Mission unchanged.
+
+**Root cause**: the generic Vim `o` implementation inserted at
+`cursor_item + 1`, while the renderer gives Mission item 0 special meaning as
+the current Mission and renders every later item as history.
+
+**Prevention checklist** for Mission editor changes:
+
+1. Keep insertion semantics aligned with rendering semantics: `o` on Mission
+   item 0 inserts at index 0 and pushes the prior Mission into history.
+2. Preserve ordinary Vim behavior for other sections: `o` still inserts below
+   the current Beads/task row.
+3. Run the focused `o_on_` and `o_then_type_then_esc_emits_add_action` tests.
+4. Tier 4: launch global `mc`, enter Detail, place the cursor on the current
+   Mission, type `o`, enter text, press Esc, and verify the new text is under
+   `## Mission` while the prior text appears under `## Mission history`.
+
+### F15 — Stale `.beads` overrides an authoritative Linear tracker
+
+**Symptom**: an Olympus workspace renders `## Beads` and an unavailable row,
+even though `~/agents/projects.yaml` declares the platform's tracker as Linear.
+
+**Root cause**: task-source selection looked only for a repo-local `.beads/`
+directory. A stale or redirected store therefore won over the project registry.
+
+**Prevention checklist** for task projection and external-ticket actions:
+
+1. Resolve workspace evidence through `~/agents/projects.yaml`. An exact Linear
+   path wins; for mixed-repo workspaces whose focused-surface cwd points at a
+   utility repo, a unique registered Linear feature-name match keeps stable
+   ownership (including a conservative final plural, such as
+   `group-graders` → `group-grader`).
+2. A declared Linear tracker stays authoritative even when its coordinates or
+   credential are unavailable; do not silently fall back to `.beads/` or
+   combine task rows from mismatched Linear targets.
+3. Keep the persisted trajectory section canonical and change only the render
+   title to `Linear`; prove Beads workspaces still render `Beads`.
+4. Treat projected Linear rows as read-only. Enter may open only a validated
+   issue URL rooted at `https://linear.app/`; all non-ticket rows and mutation
+   keys are no-ops.
+5. Run focused registry, response/error, source-heading, read-only, deep-link,
+   refresh-deduplication, and stale-cleanup tests.
+6. Tier 4: launch global `mc` against the live Olympus workspace, verify real
+   Linear issues under `## Linear`, highlight one issue, press Enter, and
+   confirm the installed Linear app opens that exact identifier.
+
 ---
 
 ## Per-area validation cheat sheets
@@ -683,12 +732,16 @@ cd /Users/blin/Tools/mission-control
 cargo test -- --test-threads=1       # confirm master is still green
 cargo build --release                 # update the symlinked binary
 mc --help | head -10                  # smoke that subcommands still list
+# In the pinned mc TUI: press Ctrl-R, or quit and relaunch it.
 ```
 
 The `mc` symlink chain (`~/.cargo/bin/mc → ~/.cargo/bin/mission-control →
-target/release/mission-control`) means `cargo build --release` IS the deploy
-step. Skipping it leaves the user on the previous version even though
-master moved.
+target/release/mission-control`) updates the on-disk command, but an already
+running TUI keeps its old executable image. Release is complete only after the
+pinned `mc` workspace has reloaded or relaunched the new binary. Before live
+trajectory validation, also ensure an older parallel `mc` process is not still
+refreshing the same files; it can overwrite the new projection and create a
+false regression.
 
 ---
 

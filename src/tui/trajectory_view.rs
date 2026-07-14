@@ -292,6 +292,9 @@ pub struct RenderHints {
     /// (current kind is Shell/Unknown but effective_kind elevated it from a
     /// fresh last-agent snapshot).
     pub dim_surface_refs: HashSet<String>,
+    /// Display-only override for the canonical third trajectory section.
+    /// Persisted trajectory files keep `## Beads` for backward compatibility.
+    pub task_section_title: Option<String>,
 }
 
 /// Render the trajectory detail pane.
@@ -410,9 +413,17 @@ pub fn render_with_hints(
             })
             .unwrap_or(false);
 
+        let section_title = if section.name == SECTION_GOALS {
+            hints
+                .task_section_title
+                .as_deref()
+                .unwrap_or(section.name.as_str())
+        } else {
+            section.name.as_str()
+        };
         let header_line = if is_header_cursor {
             Line::from(Span::styled(
-                format!("## {}", section.name),
+                format!("## {section_title}"),
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -420,7 +431,7 @@ pub fn render_with_hints(
             ))
         } else {
             Line::from(Span::styled(
-                format!("## {}", section.name),
+                format!("## {section_title}"),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -989,6 +1000,37 @@ workspace: predinvest
             !dump.contains("mc:surface:"),
             "leaked surface comment into UI"
         );
+    }
+
+    #[test]
+    fn render_can_label_canonical_task_section_as_linear() {
+        let doc = TrajectoryDoc::parse(SAMPLE).unwrap();
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let hints = RenderHints {
+            task_section_title: Some("Linear".to_string()),
+            ..RenderHints::default()
+        };
+        terminal
+            .draw(|f| {
+                render_with_hints(
+                    f,
+                    Rect::new(0, 0, 80, 20),
+                    Some(&doc),
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    &hints,
+                )
+            })
+            .unwrap();
+
+        let dump = buf_dump(&terminal);
+        assert!(dump.contains("Linear"), "missing Linear header: {dump}");
+        assert!(!dump.contains("Beads"), "canonical header leaked: {dump}");
+        assert!(dump.contains("sprint-01 done"), "task rows disappeared: {dump}");
     }
 
     #[test]

@@ -192,6 +192,8 @@ mod tests {
             loading: false,
             summary: None,
             beads: None,
+            linear: None,
+            linear_open_pending: None,
             summarizing: false,
             trajectory: None,
             edit_state: None,
