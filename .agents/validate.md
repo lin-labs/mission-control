@@ -620,11 +620,14 @@ directory. A stale or redirected store therefore won over the project registry.
 
 **Prevention checklist** for task projection and external-ticket actions:
 
-1. Resolve the workspace cwd through `~/agents/projects.yaml` first. A declared
-   Linear tracker stays authoritative even when its coordinates or credential
-   are unavailable; do not silently fall back to `.beads/`.
-2. If the workspace cwd cannot resolve, use exact surface/session repo paths as
-   fallback evidence. Never combine task rows from mismatched Linear targets.
+1. Resolve workspace evidence through `~/agents/projects.yaml`. An exact Linear
+   path wins; for mixed-repo workspaces whose focused-surface cwd points at a
+   utility repo, a unique registered Linear feature-name match keeps stable
+   ownership (including a conservative final plural, such as
+   `group-graders` → `group-grader`).
+2. A declared Linear tracker stays authoritative even when its coordinates or
+   credential are unavailable; do not silently fall back to `.beads/` or
+   combine task rows from mismatched Linear targets.
 3. Keep the persisted trajectory section canonical and change only the render
    title to `Linear`; prove Beads workspaces still render `Beads`.
 4. Treat projected Linear rows as read-only. Enter may open only a validated

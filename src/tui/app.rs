@@ -802,14 +802,28 @@ fn resolve_task_sources(
     workspaces
         .iter()
         .map(|workspace| {
-            // The workspace cwd is authoritative. Surface/session repo roots
-            // are fallback evidence only when that cwd is not registered.
+            // An exact Linear path is authoritative. Otherwise, a uniquely
+            // matching Linear feature name stabilizes a mixed-repo workspace
+            // when cmux's focused-surface cwd temporarily points at a utility
+            // repo (for example group-graders -> group-grader).
             let mut source = workspace
                 .current_directory
                 .as_deref()
                 .map(std::path::Path::new)
                 .map(|path| registry.resolve(path))
                 .unwrap_or(TaskSource::Unregistered);
+            if !matches!(
+                source,
+                TaskSource::Linear(_) | TaskSource::LinearUnavailable
+            ) {
+                let named_source = registry.resolve_named_feature(&workspace.name);
+                if matches!(
+                    named_source,
+                    TaskSource::Linear(_) | TaskSource::LinearUnavailable
+                ) {
+                    source = named_source;
+                }
+            }
             if source == TaskSource::Unregistered {
                 source = repo_roots_by_ws_id
                     .get(&workspace.uuid)
@@ -4090,6 +4104,8 @@ workspace: test-ws
 projects:
   - project: olympus
     path: ~/Projects/olympus
+  - project: agents
+    path: ~/agents/blin-agents
 platforms:
   - name: olympus
     tracker: linear
@@ -4131,7 +4147,24 @@ platforms:
         assert!(matches!(
             sources.get("fallback"),
             Some(TaskSource::Linear(target))
-                if target.labels == &["group-grader".to_string()]
+                if target.labels == ["group-grader".to_string()]
+        ));
+
+        let mixed_workspace = Workspace {
+            name: "group-graders".to_string(),
+            current_directory: Some(
+                temp.path()
+                    .join("agents/blin-agents")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            ..workspace("mixed", temp.path().join("agents/blin-agents"))
+        };
+        let mixed = resolve_task_sources(&[mixed_workspace], &HashMap::new(), Some(&registry));
+        assert!(matches!(
+            mixed.get("mixed"),
+            Some(TaskSource::Linear(target))
+                if target.labels == ["group-grader".to_string()]
         ));
     }
 

@@ -100,6 +100,41 @@ impl ProjectRegistry {
         self.resolve_project(project)
     }
 
+    /// Resolve a cmux workspace name to a uniquely matching platform feature.
+    /// This is secondary evidence for mixed-repo workspaces whose focused
+    /// surface can make cmux's `current_directory` point at a utility repo.
+    /// A conservative final-token singularization maps names such as
+    /// `group-graders` to the registered `group-grader` feature.
+    pub fn resolve_named_feature(&self, workspace_name: &str) -> TaskSource {
+        let key = unit_name_key(workspace_name);
+        if key.is_empty() {
+            return TaskSource::Unregistered;
+        }
+        let mut matches = self.data.platforms.iter().flat_map(|platform| {
+            platform
+                .features
+                .iter()
+                .filter(|feature| {
+                    feature
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| unit_name_key(name) == key)
+                })
+                .map(move |feature| FeatureMatch {
+                    platform,
+                    feature,
+                    specificity: 0,
+                })
+        });
+        let Some(first) = matches.next() else {
+            return TaskSource::Unregistered;
+        };
+        if matches.next().is_some() {
+            return TaskSource::Unregistered;
+        }
+        self.resolve_feature(first)
+    }
+
     fn best_project<'a>(&'a self, workspace: &Path) -> Option<ProjectMatch<'a>> {
         let mut candidates = Vec::new();
 
@@ -197,21 +232,24 @@ impl ProjectRegistry {
                 .find(|platform| platform.name.as_deref() == Some(name))
         });
 
-        // A same-name platform is the cross-project policy owner. Its explicit
-        // tracker and Linear fields override the project facet when present.
-        let tracker = same_name_platform
-            .and_then(|platform| platform.tracker.as_deref())
-            .or(matched.project.tracker.as_deref())
-            .unwrap_or("beads");
+        // Match projects.py: an explicit project tracker owns the project
+        // facet. A same-name platform supplies tracking only when the project
+        // leaves it unspecified.
+        let (tracker, linear) = if let Some(tracker) = matched.project.tracker.as_deref() {
+            (tracker, matched.project.linear.clone())
+        } else if let Some(platform) = same_name_platform {
+            (
+                platform.tracker.as_deref().unwrap_or("beads"),
+                platform.linear.clone(),
+            )
+        } else {
+            ("beads", None)
+        };
         if tracker != "linear" {
             return TaskSource::Beads;
         }
 
-        let linear = RawLinear::merged(
-            matched.project.linear.as_ref(),
-            same_name_platform.and_then(|platform| platform.linear.as_ref()),
-        );
-        LinearTarget::try_from(linear)
+        LinearTarget::try_from(linear.unwrap_or_default())
             .map(TaskSource::Linear)
             .unwrap_or(TaskSource::LinearUnavailable)
     }
@@ -408,6 +446,22 @@ fn push_unique(values: &mut Vec<String>, value: &str) {
     }
 }
 
+fn unit_name_key(value: &str) -> String {
+    let mut tokens: Vec<String> = value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if let Some(last) = tokens.last_mut()
+        && last.len() > 3
+        && last.ends_with('s')
+        && !last.ends_with("ss")
+    {
+        last.pop();
+    }
+    tokens.join("-")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,13 +490,34 @@ projects:
     }
 
     #[test]
-    fn same_name_platform_overrides_project_with_linear() {
+    fn explicit_project_tracker_overrides_same_name_platform() {
         let (temp, registry) = registry(
             r#"
 projects:
   - project: olympus
     path: ~/Projects/olympus
     tracker: beads
+platforms:
+  - name: olympus
+    tracker: linear
+    linear:
+      team_id: team-1
+      project_id: project-1
+      labels: [platform]
+"#,
+        );
+        let workspace = temp.path().join("Projects/olympus");
+
+        assert_eq!(registry.resolve(workspace), TaskSource::Beads);
+    }
+
+    #[test]
+    fn same_name_platform_supplies_linear_when_project_tracker_is_unspecified() {
+        let (temp, registry) = registry(
+            r#"
+projects:
+  - project: olympus
+    path: ~/Projects/olympus
 platforms:
   - name: olympus
     tracker: linear
@@ -495,6 +570,36 @@ platforms:
                 project_id: "project-1".into(),
                 labels: vec!["configured".into(), "group-grader".into()],
             })
+        );
+    }
+
+    #[test]
+    fn unique_plural_workspace_name_resolves_the_linear_feature() {
+        let (_temp, registry) = registry(
+            r#"
+platforms:
+  - name: olympus
+    tracker: linear
+    linear:
+      project_id: project-1
+    features:
+      - name: group-grader
+        repo: ~/Projects/olympus
+        roots: [olympus/projects/minos/graders]
+"#,
+        );
+
+        assert_eq!(
+            registry.resolve_named_feature("group-graders"),
+            TaskSource::Linear(LinearTarget {
+                team_id: None,
+                project_id: "project-1".to_string(),
+                labels: vec!["group-grader".to_string()],
+            })
+        );
+        assert_eq!(
+            registry.resolve_named_feature("unrelated"),
+            TaskSource::Unregistered
         );
     }
 
