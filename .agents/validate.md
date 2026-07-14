@@ -567,48 +567,63 @@ branch):
 See AGENTS.shared.md "Sprint Completion Contract" for the cross-project
 codification.
 
-### F13 — LLM regen persists an empty Mission
+### F13 — LLM regen loses or reopens Mission state
 
 **Symptom**: the Detail pane renders `## Mission` followed by `(empty)` even
-though the workspace has human conversation or surface summaries.
+though the workspace has human conversation or surface summaries, rewrites a
+human-authored row, or revives a row the user already completed.
 
 **Root cause**: prompt instructions requested Mission content, but the regen
-post-processor accepted a parseable model response whose Mission section had
-zero items. Prompt compliance alone was treated as the invariant.
+post-processor accepted model state as authoritative. Prompt compliance alone
+was treated as the invariant, and the empty-Mission scheduler did not distinguish
+"never had a mission" from "all missions are completed."
 
 **Prevention checklist** for trajectory regen changes:
 
-1. Reconcile Mission after parsing the model response: last saved Mission
-   first, latest human ask second, compact session/surface summaries third,
-   and a short workspace fallback last.
-2. Keep every synthesized fallback bullet at or below 110 characters and cap
+1. Reconcile Mission after parsing the model response: preserve saved `[h]`
+   rows byte-for-byte, preserve completed Mission history exactly, reject model
+   rows similar to either set, then accept distinct agent rows.
+2. Only synthesize a fallback when both active Mission and Mission history are
+   empty: latest human ask first, compact session/surface summaries second, and
+   a short workspace fallback last. An empty active Mission is valid when all
+   work is completed.
+3. Keep every synthesized fallback bullet at or below 110 characters and cap
    conversation-derived fallback at three bullets.
-3. Run `cargo test --test llm_regen -- --test-threads=1`; coverage must include
-   saved-human precedence, latest-ask fallback, conversation-summary fallback,
-   and the no-signal non-empty invariant.
-4. Tier 4: launch global `mc`, open an actually empty active workspace, press
+4. Run `cargo test --test llm_regen -- --test-threads=1`; coverage must include
+   saved-human immutability, human/agent similarity suppression, exact history
+   preservation, completed-work non-revival, latest-ask fallback,
+   conversation-summary fallback, and the no-signal non-empty invariant.
+5. Tier 4: launch global `mc`, open an actually empty active workspace, press
    `R`, wait for regen, and verify both the rendered pane and its on-disk
-   `trajectory.md` contain a Mission bullet.
+   `trajectory.md` contain a Mission bullet. Separately complete the only active
+   Mission and verify regen does not recreate it.
 
-### F14 — Mission editor inserts into history instead of current Mission
+### F14 — Position-based Mission history makes edits destructive
 
-**Symptom**: pressing `o` on the active Mission opens a blank row under
-`## Mission history`, leaving the previous current Mission unchanged.
+**Symptom**: `dd` deletes or shifts Mission rows unpredictably, `o` inserts into
+history, or a completed Mission cannot be revived.
 
-**Root cause**: the generic Vim `o` implementation inserted at
-`cursor_item + 1`, while the renderer gives Mission item 0 special meaning as
-the current Mission and renders every later item as history.
+**Root cause**: a single vector encoded two different states by position: item
+0 meant active and every later item meant history. Generic list edits therefore
+changed state accidentally, and completion had no reversible operation.
 
 **Prevention checklist** for Mission editor changes:
 
-1. Keep insertion semantics aligned with rendering semantics: `o` on Mission
-   item 0 inserts at index 0 and pushes the prior Mission into history.
-2. Preserve ordinary Vim behavior for other sections: `o` still inserts below
-   the current Beads/task row.
-3. Run the focused `o_on_` and `o_then_type_then_esc_emits_add_action` tests.
-4. Tier 4: launch global `mc`, enter Detail, place the cursor on the current
-   Mission, type `o`, enter text, press Esc, and verify the new text is under
-   `## Mission` while the prior text appears under `## Mission history`.
+1. Keep active Mission rows and completed Mission history as explicit states.
+   Persist them as `- [ ]` under `## Mission` and `- [x]` under
+   `## Mission history`; never infer state from a row's position.
+2. `x`/`X` on an active row moves it to history. Enter unfolds history, and
+   `x`/`X` on a completed row moves it back to active Mission. `dd` is a no-op
+   in Mission but retains ordinary deletion behavior for Beads/tasks.
+3. `o` inserts below the selected active Mission as a provisional human row.
+   Esc removes it without an event when empty; otherwise Esc prefixes `[h]`.
+4. History is folded by default, transiently expandable, and all completed rows
+   remain reachable when expanded; do not restore a fixed visible-row cap.
+5. Run focused tests for completion, revival, fold/unfold, empty provisional
+   cancellation, `[h]` insertion, Mission `dd` no-op, and task `dd` behavior.
+6. Tier 4: in an isolated data root, exercise `o` + empty Esc, `o` + text +
+   Esc, `x`, Enter to unfold, and `X` to revive. Inspect both the screen and
+   `trajectory.md`; verify the pinned Release process is replaced afterward.
 
 ### F15 — Stale `.beads` overrides an authoritative Linear tracker
 

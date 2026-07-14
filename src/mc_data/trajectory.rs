@@ -3,12 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const SECTION_MISSION: &str = "Mission";
+pub const SECTION_MISSION_HISTORY: &str = "Mission history";
 pub const SECTION_CURRENT_SURFACES: &str = "Current surfaces";
 pub const SECTION_BEADS: &str = "Beads";
-/// Mission detail renders one active row plus this many history rows. Cursor
-/// navigation uses the same cap so it cannot disappear into hidden history.
-pub const MISSION_HISTORY_MAX_VISIBLE_ITEMS: usize = 12;
-pub const MISSION_MAX_VISIBLE_ITEMS: usize = 1 + MISSION_HISTORY_MAX_VISIBLE_ITEMS;
 /// Historical name kept as an API alias. The third trajectory section now
 /// renders Beads issues, replacing the old hand-maintained goal/progress list.
 pub const SECTION_GOALS: &str = SECTION_BEADS;
@@ -66,6 +63,10 @@ pub struct Section {
 pub struct TrajectoryDoc {
     pub frontmatter: Frontmatter,
     pub sections: Vec<Section>,
+    /// Completed Mission rows. Persisted as `## Mission history`, but kept
+    /// outside `sections` so the three canonical editor section indexes remain
+    /// stable for Current surfaces and Beads.
+    pub mission_history: Vec<Item>,
 }
 
 impl TrajectoryDoc {
@@ -80,6 +81,7 @@ impl TrajectoryDoc {
         let mut doc = TrajectoryDoc {
             frontmatter,
             sections: Vec::new(),
+            mission_history: Vec::new(),
         };
         doc.ensure_sections();
         doc
@@ -117,9 +119,20 @@ impl TrajectoryDoc {
             sections.push(s);
         }
 
+        let mut canonical_sections = Vec::with_capacity(sections.len());
+        let mut mission_history = Vec::new();
+        for section in sections {
+            if section.name == SECTION_MISSION_HISTORY {
+                mission_history.extend(section.items);
+            } else {
+                canonical_sections.push(section);
+            }
+        }
+
         Ok(TrajectoryDoc {
             frontmatter,
-            sections,
+            sections: canonical_sections,
+            mission_history,
         })
     }
 
@@ -145,6 +158,39 @@ impl TrajectoryDoc {
         }
         // Drop any non-canonical sections silently in Phase 1a.
         self.sections = ordered;
+        self.normalize_mission_state();
+    }
+
+    fn normalize_mission_state(&mut self) {
+        let Some(mission) = self.sections.iter_mut().find(|s| s.name == SECTION_MISSION) else {
+            return;
+        };
+
+        let has_explicit_state =
+            !self.mission_history.is_empty() || mission.items.iter().any(|item| item.is_checkbox);
+        if !has_explicit_state && mission.items.len() > 1 {
+            self.mission_history.extend(mission.items.split_off(1));
+        }
+
+        let mut active = Vec::with_capacity(mission.items.len());
+        for mut item in mission.items.drain(..) {
+            if item.is_checkbox && item.checked == Some(true) {
+                item.is_checkbox = true;
+                item.checked = Some(true);
+                self.mission_history.push(item);
+            } else {
+                item.is_checkbox = true;
+                item.checked = Some(false);
+                item.surface_id = None;
+                active.push(item);
+            }
+        }
+        mission.items = active;
+        for item in &mut self.mission_history {
+            item.is_checkbox = true;
+            item.checked = Some(true);
+            item.surface_id = None;
+        }
     }
 
     pub fn to_markdown(&self) -> String {
@@ -175,6 +221,17 @@ impl TrajectoryDoc {
                     out.push_str(&format!("              <!-- mc:surface:{sid} -->"));
                 }
                 out.push('\n');
+            }
+            if section.name == SECTION_MISSION {
+                out.push('\n');
+                out.push_str("## ");
+                out.push_str(SECTION_MISSION_HISTORY);
+                out.push('\n');
+                for item in &self.mission_history {
+                    out.push_str("- [x] ");
+                    out.push_str(&item.text);
+                    out.push('\n');
+                }
             }
         }
         out

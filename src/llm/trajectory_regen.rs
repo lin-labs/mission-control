@@ -52,37 +52,64 @@ pub async fn regenerate(
 
 /// Make Mission deterministic around the LLM:
 ///
-/// 1. The last saved Mission is user-owned and remains authoritative.
-/// 2. A useful model-generated Mission is accepted when no saved Mission exists.
-/// 3. An empty model result is repaired from direct human input, then compact
-///    conversation summaries, and finally the workspace name.
+/// 1. Saved `[h]` Mission rows remain byte-for-byte authoritative.
+/// 2. Model rows are accepted only when they do not substantially overlap a
+///    human row; model-authored `[h]` markers are stripped.
+/// 3. Completed Mission history is always copied from the saved trajectory.
+/// 4. An empty result is repaired from direct human input, compact conversation
+///    summaries, and finally the workspace name.
 fn reconcile_mission(doc: &mut TrajectoryDoc, inputs: &RegenInputs) {
     clean_mission(doc);
 
-    let saved_items = TrajectoryDoc::parse(&inputs.current_trajectory)
-        .ok()
-        .and_then(|saved| saved.section(SECTION_MISSION).cloned())
-        .map(|section| {
-            section
-                .items
-                .into_iter()
-                .filter(|item| !item.text.trim().is_empty())
-                .take(MISSION_MAX_BULLETS)
-                .collect::<Vec<_>>()
-        })
+    let mut saved = TrajectoryDoc::parse(&inputs.current_trajectory).unwrap_or_default();
+    saved.ensure_sections();
+    let completed_items = saved.mission_history.clone();
+    doc.mission_history = completed_items.clone();
+
+    let human_items: Vec<Item> = saved
+        .section(SECTION_MISSION)
+        .into_iter()
+        .flat_map(|section| section.items.iter())
+        .filter(|item| is_human_mission(&item.text) && !item.text.trim().is_empty())
+        .cloned()
+        .collect();
+    let mut merged = human_items.clone();
+    let generated_items = doc
+        .section(SECTION_MISSION)
+        .map(|section| section.items.clone())
         .unwrap_or_default();
-    if !saved_items.is_empty() {
-        doc.replace_section_items(SECTION_MISSION, saved_items);
-        return;
+    for mut item in generated_items {
+        let generated_text = strip_human_marker(&item.text);
+        if generated_text.is_empty()
+            || human_items
+                .iter()
+                .any(|human| missions_are_similar(&human.text, &generated_text))
+            || completed_items
+                .iter()
+                .any(|completed| missions_are_similar(&completed.text, &generated_text))
+            || merged
+                .iter()
+                .filter(|existing| !is_human_mission(&existing.text))
+                .any(|existing| missions_are_similar(&existing.text, &generated_text))
+        {
+            continue;
+        }
+        item.text = generated_text;
+        item.is_checkbox = true;
+        item.checked = Some(false);
+        item.surface_id = None;
+        merged.push(item);
     }
 
-    let generated_is_empty = doc
-        .section(SECTION_MISSION)
-        .map(|section| section.items.is_empty())
-        .unwrap_or(true);
-    if generated_is_empty {
-        doc.replace_section_items(SECTION_MISSION, fallback_mission_items(inputs));
+    if merged.is_empty() && completed_items.is_empty() {
+        merged = fallback_mission_items(inputs);
     }
+    for item in &mut merged {
+        item.is_checkbox = true;
+        item.checked = Some(false);
+        item.surface_id = None;
+    }
+    doc.replace_section_items(SECTION_MISSION, merged);
 }
 
 fn fallback_mission_items(inputs: &RegenInputs) -> Vec<Item> {
@@ -130,10 +157,66 @@ fn fallback_mission_items(inputs: &RegenInputs) -> Vec<Item> {
 fn mission_item(text: String) -> Item {
     Item {
         text,
-        is_checkbox: false,
-        checked: None,
+        is_checkbox: true,
+        checked: Some(false),
         surface_id: None,
     }
+}
+
+fn is_human_mission(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed == "[h]"
+        || trimmed == "[H]"
+        || trimmed.starts_with("[h] ")
+        || trimmed.starts_with("[H] ")
+}
+
+fn strip_human_marker(text: &str) -> String {
+    let trimmed = text.trim();
+    trimmed
+        .strip_prefix("[h]")
+        .or_else(|| trimmed.strip_prefix("[H]"))
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string()
+}
+
+fn mission_tokens(text: &str) -> Vec<String> {
+    const STOP_WORDS: &[&str] = &[
+        "a", "an", "and", "for", "from", "in", "of", "on", "or", "the", "this", "to", "with",
+    ];
+    let normalized = strip_human_marker(text)
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    let mut tokens = normalized
+        .split_whitespace()
+        .filter(|token| !STOP_WORDS.contains(token))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn missions_are_similar(left: &str, right: &str) -> bool {
+    let left = mission_tokens(left);
+    let right = mission_tokens(right);
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    if left == right {
+        return true;
+    }
+    let shared = left.iter().filter(|token| right.contains(token)).count();
+    let smaller = left.len().min(right.len());
+    (smaller >= 2 && shared == smaller) || (shared >= 3 && shared * 4 >= smaller * 3)
 }
 
 fn short_mission_bullet(text: &str) -> Option<String> {
@@ -170,12 +253,27 @@ pub fn clean_mission(doc: &mut TrajectoryDoc) {
     let Some(mission) = doc.sections.iter_mut().find(|s| s.name == SECTION_MISSION) else {
         return;
     };
-    mission.items.retain(|it| !is_mission_noise(&it.text));
-    // Keep the most recent bullets — regen refines forward, so the tail
-    // reflects current intent. (Noise is already removed above.)
-    if mission.items.len() > MISSION_MAX_BULLETS {
-        let drop = mission.items.len() - MISSION_MAX_BULLETS;
-        mission.items.drain(0..drop);
+    mission
+        .items
+        .retain(|item| is_human_mission(&item.text) || !is_mission_noise(&item.text));
+    let agent_count = mission
+        .items
+        .iter()
+        .filter(|item| !is_human_mission(&item.text))
+        .count();
+    let mut agents_to_drop = agent_count.saturating_sub(MISSION_MAX_BULLETS);
+    mission.items.retain(|item| {
+        if agents_to_drop > 0 && !is_human_mission(&item.text) {
+            agents_to_drop -= 1;
+            false
+        } else {
+            true
+        }
+    });
+    for item in &mut mission.items {
+        item.is_checkbox = true;
+        item.checked = Some(false);
+        item.surface_id = None;
     }
 }
 
@@ -196,10 +294,12 @@ pub fn build_prompt(inputs: &RegenInputs) -> RegenPrompt {
     // ── System section (stable, cacheable) ──────────────────────────────────
     let mut system = String::new();
     system.push_str(&format!(
-        "You maintain a 3-section trajectory doc for workspace '{}'.\n",
+        "You maintain a 4-section trajectory doc for workspace '{}'.\n",
         inputs.workspace_name
     ));
-    system.push_str("Sections (exact order): ## Mission, ## Current surfaces, ## Beads.\n\n");
+    system.push_str(
+        "Sections (exact order): ## Mission, ## Mission history, ## Current surfaces, ## Beads.\n\n",
+    );
     system.push_str("Rules:\n");
     system.push_str("- User edits are TYPED ACTIONS. Interpret intent:\n");
     system.push_str("  check -> user marked done; don't re-open the item\n");
@@ -207,7 +307,9 @@ pub fn build_prompt(inputs: &RegenInputs) -> RegenPrompt {
     system.push_str("  add -> user identified gap; preserve and build on it\n");
     system.push_str("  edit -> user rephrased; treat new phrasing as authoritative\n");
     system.push_str("  move -> user re-ordered; respect the priority signal\n");
-    system.push_str("- `## Mission` must never be empty. Human-authored Mission text is primary: preserve its wording and keep it first.\n");
+    system.push_str("- `## Mission` may be empty only when `## Mission history` contains completed work. Otherwise emit active Mission rows. Human-authored Mission text is primary. Preserve all `[h]` Mission rows byte-for-byte and keep them first.\n");
+    system.push_str("  Do not add `[h]` to agent-authored rows, edit a human row, or emit an agent row similar to a human row.\n");
+    system.push_str("- Copy `## Mission history` verbatim. Never revive, rewrite, or remove its completed rows.\n");
     system.push_str("  When no saved Mission exists, write one very short bullet (under ~110 characters) from the user's latest ask.\n");
     system.push_str("  If there is no latest ask, write up to three very short bullets summarizing the active conversations and surface focus.\n");
     system.push_str("  Do not append instructions, old asks, process rules, subtask checklists, activity/tool-call counts, or \"adds process only\" / \"adds process not scope\" filler.\n");
@@ -313,7 +415,7 @@ pub fn build_prompt(inputs: &RegenInputs) -> RegenPrompt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mc_data::trajectory::{TrajectoryDoc, SECTION_MISSION};
+    use crate::mc_data::trajectory::{SECTION_MISSION, TrajectoryDoc};
 
     fn mission_bullets(doc: &TrajectoryDoc) -> Vec<String> {
         doc.sections
@@ -334,8 +436,16 @@ mod tests {
         let mut doc = TrajectoryDoc::parse(md).unwrap();
         clean_mission(&mut doc);
         let bullets = mission_bullets(&doc);
-        assert_eq!(bullets.len(), 2, "noise bullets should be gone: {bullets:?}");
-        assert!(bullets.iter().all(|b| !b.to_lowercase().contains("adds process only")));
+        assert_eq!(
+            bullets.len(),
+            2,
+            "noise bullets should be gone: {bullets:?}"
+        );
+        assert!(
+            bullets
+                .iter()
+                .all(|b| !b.to_lowercase().contains("adds process only"))
+        );
     }
 
     #[test]
@@ -355,7 +465,9 @@ mod tests {
 
     #[test]
     fn is_mission_noise_matches_filler_only() {
-        assert!(is_mission_noise("Latest 63-tool-call signal adds process only"));
+        assert!(is_mission_noise(
+            "Latest 63-tool-call signal adds process only"
+        ));
         assert!(is_mission_noise("Tool calls executed: 88"));
         assert!(!is_mission_noise("Ship the remote-surface intent feature"));
     }

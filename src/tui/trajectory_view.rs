@@ -2,11 +2,10 @@ use std::collections::HashSet;
 
 use crate::mc_data::surface_kind::SurfaceKind;
 use crate::mc_data::trajectory::{
-    MISSION_HISTORY_MAX_VISIBLE_ITEMS, SECTION_CURRENT_SURFACES, SECTION_GOALS, Section,
-    TrajectoryDoc,
+    Item, SECTION_CURRENT_SURFACES, SECTION_GOALS, Section, TrajectoryDoc,
 };
 use crate::tui::peek_view::PeekState;
-use crate::tui::trajectory_edit::{EditMode, InsertFocus, TrajectoryEditState};
+use crate::tui::trajectory_edit::{EditMode, InsertFocus, MissionFocus, TrajectoryEditState};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -178,7 +177,10 @@ fn push_field_lines<'a>(
         } else {
             Span::styled(pad.clone(), base)
         };
-        lines.push(Line::from(vec![lead, Span::styled(segment, base.fg(Color::Gray))]));
+        lines.push(Line::from(vec![
+            lead,
+            Span::styled(segment, base.fg(Color::Gray)),
+        ]));
     }
 }
 
@@ -397,7 +399,15 @@ pub fn render_with_hints(
     let mut cursor_line: Option<u16> = None;
     for (sec_idx, section) in doc.sections.iter().enumerate() {
         if section.name == crate::mc_data::trajectory::SECTION_MISSION {
-            render_mission_section(&mut lines, section, sec_idx, edit_state);
+            if let Some(line) = render_mission_section(
+                &mut lines,
+                section,
+                &doc.mission_history,
+                sec_idx,
+                edit_state,
+            ) {
+                cursor_line = Some(line);
+            }
             lines.push(Line::raw(""));
             continue;
         }
@@ -711,12 +721,15 @@ fn mission_item_line<'a>(
 fn render_mission_section<'a>(
     lines: &mut Vec<Line<'a>>,
     section: &'a Section,
+    history: &'a [Item],
     sec_idx: usize,
     edit_state: Option<&TrajectoryEditState>,
-) {
+) -> Option<u16> {
+    let mut cursor_line = None;
     let header_cursor = edit_state
         .map(|s| {
             s.cursor_section == sec_idx
+                && s.mission_focus == MissionFocus::Active
                 && s.cursor_item == 0
                 && section.items.is_empty()
                 && matches!(s.mode, EditMode::Nav)
@@ -736,83 +749,93 @@ fn render_mission_section<'a>(
                 .add_modifier(Modifier::BOLD)
         },
     )));
+    if header_cursor {
+        cursor_line = Some((lines.len() - 1) as u16);
+    }
 
-    let Some(active) = section.items.first() else {
+    if section.items.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (empty)",
             Style::default().fg(Color::DarkGray),
         )));
-        return;
-    };
-
-    let active_cursor = edit_state
-        .map(|s| {
-            s.cursor_section == sec_idx && s.cursor_item == 0 && matches!(s.mode, EditMode::Nav)
-        })
-        .unwrap_or(false);
-    let active_insert = edit_state.filter(|s| {
-        s.cursor_section == sec_idx
-            && s.cursor_item == 0
-            && matches!(s.mode, EditMode::Insert { .. })
-    });
-    lines.push(mission_item_line(
-        "- ",
-        &active.text,
-        active_cursor,
-        active_insert,
-    ));
-
-    if section.items.len() <= 1 {
-        return;
+    } else {
+        for (item_idx, item) in section.items.iter().enumerate() {
+            let active_cursor = edit_state
+                .map(|s| {
+                    s.cursor_section == sec_idx
+                        && s.mission_focus == MissionFocus::Active
+                        && s.cursor_item == item_idx
+                        && matches!(s.mode, EditMode::Nav)
+                })
+                .unwrap_or(false);
+            let active_insert = edit_state.filter(|s| {
+                s.cursor_section == sec_idx
+                    && s.mission_focus == MissionFocus::Active
+                    && s.cursor_item == item_idx
+                    && matches!(s.mode, EditMode::Insert { .. })
+            });
+            if active_cursor || active_insert.is_some() {
+                cursor_line = Some(lines.len() as u16);
+            }
+            lines.push(mission_item_line(
+                "- [ ] ",
+                &item.text,
+                active_cursor,
+                active_insert,
+            ));
+        }
     }
 
     lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "## Mission history",
+    let expanded = edit_state.is_some_and(|state| state.mission_history_expanded);
+    let history_header_cursor = edit_state.is_some_and(|state| {
+        state.cursor_section == sec_idx
+            && state.mission_focus == MissionFocus::HistoryHeader
+            && matches!(state.mode, EditMode::Nav)
+    });
+    let history_title = if history.is_empty() {
+        "## Mission history (0)".to_string()
+    } else if expanded {
+        format!("## Mission history ({}) ▾ Enter to fold", history.len())
+    } else {
+        format!("## Mission history ({}) ▸ Enter to unfold", history.len())
+    };
+    let history_style = if history_header_cursor {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
         Style::default()
             .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )));
+            .add_modifier(Modifier::BOLD)
+    };
+    if history_header_cursor {
+        cursor_line = Some(lines.len() as u16);
+    }
+    lines.push(Line::from(Span::styled(history_title, history_style)));
 
-    for (history_idx, item) in section
-        .items
-        .iter()
-        .enumerate()
-        .skip(1)
-        .take(MISSION_HISTORY_MAX_VISIBLE_ITEMS)
-    {
-        let cursor = edit_state
-            .map(|s| {
-                s.cursor_section == sec_idx
-                    && s.cursor_item == history_idx
-                    && matches!(s.mode, EditMode::Nav)
-            })
-            .unwrap_or(false);
-        let insert_state = edit_state.filter(|s| {
-            s.cursor_section == sec_idx
-                && s.cursor_item == history_idx
-                && matches!(s.mode, EditMode::Insert { .. })
-        });
-        let insert_cursor = insert_state.is_some();
-        let mut line = mission_item_line("- ", &item.text, cursor, insert_state);
-        if !cursor && !insert_cursor {
-            for span in &mut line.spans {
-                span.style = span.style.fg(Color::DarkGray);
+    if expanded {
+        for (history_idx, item) in history.iter().enumerate() {
+            let cursor = edit_state.is_some_and(|state| {
+                state.cursor_section == sec_idx
+                    && state.mission_focus == MissionFocus::HistoryItem(history_idx)
+                    && matches!(state.mode, EditMode::Nav)
+            });
+            if cursor {
+                cursor_line = Some(lines.len() as u16);
             }
+            let mut line = mission_item_line("- [x] ", &item.text, cursor, None);
+            if !cursor {
+                for span in &mut line.spans {
+                    span.style = span.style.fg(Color::DarkGray);
+                }
+            }
+            lines.push(line);
         }
-        lines.push(line);
     }
 
-    let hidden = section
-        .items
-        .len()
-        .saturating_sub(1 + MISSION_HISTORY_MAX_VISIBLE_ITEMS);
-    if hidden > 0 {
-        lines.push(Line::from(Span::styled(
-            format!("  (+{hidden} more parked mission notes hidden)"),
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
+    cursor_line
 }
 
 #[cfg(test)]
@@ -860,108 +883,125 @@ workspace: predinvest
     }
 
     #[test]
-    fn mission_section_renders_one_active_bullet_and_parks_extra_notes() {
+    fn mission_section_renders_multiple_active_checkboxes_and_folded_history() {
         let section = Section {
             name: crate::mc_data::trajectory::SECTION_MISSION.to_string(),
             items: vec![
                 crate::mc_data::trajectory::Item {
-                    text: "Active mission for the current conversation".to_string(),
-                    is_checkbox: false,
-                    checked: None,
+                    text: "Agent mission".to_string(),
+                    is_checkbox: true,
+                    checked: Some(false),
                     surface_id: None,
                 },
                 crate::mc_data::trajectory::Item {
-                    text: "Older setup instruction that should not be active mission".to_string(),
-                    is_checkbox: false,
-                    checked: None,
-                    surface_id: None,
-                },
-                crate::mc_data::trajectory::Item {
-                    text: "Parked follow-up context".to_string(),
-                    is_checkbox: false,
-                    checked: None,
+                    text: "[h] Human mission".to_string(),
+                    is_checkbox: true,
+                    checked: Some(false),
                     surface_id: None,
                 },
             ],
         };
+        let history = vec![crate::mc_data::trajectory::Item {
+            text: "Finished mission".to_string(),
+            is_checkbox: true,
+            checked: Some(true),
+            surface_id: None,
+        }];
         let mut lines = Vec::new();
 
-        render_mission_section(&mut lines, &section, 0, None);
+        let _ = render_mission_section(&mut lines, &section, &history, 0, None);
         let rendered: Vec<String> = lines.iter().map(line_text).collect();
 
         assert_eq!(rendered[0], "## Mission");
-        assert_eq!(rendered[1], "- Active mission for the current conversation");
-        assert!(
-            rendered.iter().any(|line| line == "## Mission history"),
-            "extra mission bullets should move out of the active Mission slot: {rendered:?}"
-        );
+        assert_eq!(rendered[1], "- [ ] Agent mission");
+        assert_eq!(rendered[2], "- [ ] [h] Human mission");
         assert!(
             rendered
                 .iter()
-                .any(|line| line.contains("Older setup instruction")),
-            "older mission notes should still be visible as history: {rendered:?}"
+                .any(|line| { line == "## Mission history (1) ▸ Enter to unfold" })
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("Finished mission"))
         );
     }
 
     #[test]
-    fn mission_section_stays_condensed_while_editing_active_mission() {
-        let mut items = vec![crate::mc_data::trajectory::Item {
-            text: "Active mission before edit".to_string(),
-            is_checkbox: false,
-            checked: None,
-            surface_id: None,
-        }];
+    fn expanded_mission_history_renders_every_completed_row() {
+        let section = Section {
+            name: crate::mc_data::trajectory::SECTION_MISSION.to_string(),
+            items: vec![crate::mc_data::trajectory::Item {
+                text: "Active mission".to_string(),
+                is_checkbox: true,
+                checked: Some(false),
+                surface_id: None,
+            }],
+        };
+        let mut history = Vec::new();
         for idx in 1..=15 {
-            items.push(crate::mc_data::trajectory::Item {
-                text: format!("Older mission {idx:02}"),
-                is_checkbox: false,
-                checked: None,
+            history.push(crate::mc_data::trajectory::Item {
+                text: format!("Finished mission {idx:02}"),
+                is_checkbox: true,
+                checked: Some(true),
                 surface_id: None,
             });
         }
+        let edit_state = TrajectoryEditState {
+            mission_history_expanded: true,
+            mission_focus: crate::tui::trajectory_edit::MissionFocus::HistoryItem(14),
+            ..TrajectoryEditState::default()
+        };
+        let mut lines = Vec::new();
+
+        let _ = render_mission_section(&mut lines, &section, &history, 0, Some(&edit_state));
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert!(
+            rendered
+                .iter()
+                .any(|line| { line == "## Mission history (15) ▾ Enter to fold" })
+        );
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|line| line.starts_with("- [x] Finished mission"))
+                .count(),
+            15
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("Finished mission 15"))
+        );
+    }
+
+    #[test]
+    fn provisional_human_mission_renders_as_unchecked_insert_row() {
         let section = Section {
             name: crate::mc_data::trajectory::SECTION_MISSION.to_string(),
-            items,
+            items: vec![crate::mc_data::trajectory::Item {
+                text: String::new(),
+                is_checkbox: true,
+                checked: Some(false),
+                surface_id: None,
+            }],
         };
         let edit_state = TrajectoryEditState {
             mode: EditMode::Insert {
                 focus: InsertFocus::Item,
             },
-            edit_buffer: "Edited active mission".to_string(),
+            edit_buffer: "New human mission".to_string(),
+            provisional_human_mission: true,
             cursor_col: 6,
             ..TrajectoryEditState::default()
         };
         let mut lines = Vec::new();
 
-        render_mission_section(&mut lines, &section, 0, Some(&edit_state));
+        let _ = render_mission_section(&mut lines, &section, &[], 0, Some(&edit_state));
         let rendered: Vec<String> = lines.iter().map(line_text).collect();
 
-        assert_eq!(rendered[0], "## Mission");
-        assert_eq!(rendered[1], "- Edited active mission");
-        assert!(
-            rendered.iter().any(|line| line == "## Mission history"),
-            "history remains outside the active Mission slot: {rendered:?}"
-        );
-        assert_eq!(
-            rendered
-                .iter()
-                .filter(|line| line.starts_with("- Older mission"))
-                .count(),
-            MISSION_HISTORY_MAX_VISIBLE_ITEMS,
-            "history should be capped while editing: {rendered:?}"
-        );
-        assert!(
-            rendered
-                .iter()
-                .any(|line| line.contains("more parked mission notes hidden")),
-            "hidden history count should remain visible: {rendered:?}"
-        );
-        assert!(
-            !rendered
-                .iter()
-                .any(|line| line.contains("Older mission 13")),
-            "old Mission items beyond the cap should stay hidden: {rendered:?}"
-        );
+        assert!(rendered[1].starts_with("- [ ] New h"));
     }
 
     #[test]
@@ -1030,7 +1070,10 @@ workspace: predinvest
         let dump = buf_dump(&terminal);
         assert!(dump.contains("Linear"), "missing Linear header: {dump}");
         assert!(!dump.contains("Beads"), "canonical header leaked: {dump}");
-        assert!(dump.contains("sprint-01 done"), "task rows disappeared: {dump}");
+        assert!(
+            dump.contains("sprint-01 done"),
+            "task rows disappeared: {dump}"
+        );
     }
 
     #[test]
@@ -1146,7 +1189,10 @@ workspace: intent
         let mut highlighted_main = false;
         for y in 0..buf.area.height {
             let row: String = (0..buf.area.width)
-                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().chars().next().unwrap_or(' ')))
+                .filter_map(|x| {
+                    buf.cell((x, y))
+                        .map(|c| c.symbol().chars().next().unwrap_or(' '))
+                })
                 .collect();
             let is_main_title =
                 row.contains("claude") && !row.contains("overall:") && !row.contains("latest:");
@@ -1681,7 +1727,10 @@ workspace: bare
     fn wrap_words_wraps_to_multiple_lines() {
         // 5 words of width 5 at width 11 → "aaaaa bbbbb" per line.
         let out = wrap_words("aaaaa bbbbb ccccc ddddd", 11, 4);
-        assert_eq!(out, vec!["aaaaa bbbbb".to_string(), "ccccc ddddd".to_string()]);
+        assert_eq!(
+            out,
+            vec!["aaaaa bbbbb".to_string(), "ccccc ddddd".to_string()]
+        );
     }
 
     #[test]
@@ -1689,9 +1738,15 @@ workspace: bare
         let text = "one two three four five six seven eight nine ten eleven twelve";
         let out = wrap_words(text, 9, 4);
         assert_eq!(out.len(), 4, "must not exceed MAX_FIELD_LINES");
-        assert!(out.last().unwrap().ends_with('…'), "truncation marker: {out:?}");
+        assert!(
+            out.last().unwrap().ends_with('…'),
+            "truncation marker: {out:?}"
+        );
         // Every line fits the width budget (ellipsis included).
-        assert!(out.iter().all(|l| l.chars().count() <= 9), "overflow: {out:?}");
+        assert!(
+            out.iter().all(|l| l.chars().count() <= 9),
+            "overflow: {out:?}"
+        );
     }
 
     #[test]

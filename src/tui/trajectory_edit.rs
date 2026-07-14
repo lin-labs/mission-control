@@ -10,8 +10,7 @@ use crate::mc_data::inputs::{InputContext, write_input};
 use crate::mc_data::paths;
 use crate::mc_data::snapshots::{highest_snapshot, write_snapshot};
 use crate::mc_data::trajectory::{
-    Item, MISSION_MAX_VISIBLE_ITEMS, SECTION_CURRENT_SURFACES, SECTION_GOALS, SECTION_MISSION,
-    Section, TrajectoryDoc,
+    Item, SECTION_CURRENT_SURFACES, SECTION_GOALS, SECTION_MISSION, TrajectoryDoc,
 };
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -35,6 +34,13 @@ pub enum EditMode {
     Nav,
     /// Single-line text edit for a trajectory item.
     Insert { focus: InsertFocus },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissionFocus {
+    Active,
+    HistoryHeader,
+    HistoryItem(usize),
 }
 
 /// A pending line-level change produced by `handle_key`.
@@ -83,6 +89,14 @@ pub struct TrajectoryEditState {
     pub cursor_col: usize,
     /// Timestamp of the first `d` keypress, for the `dd` two-key sequence.
     pub pending_d_at: Option<std::time::Instant>,
+    /// Mission history is folded by default and expanded explicitly with Enter.
+    pub mission_history_expanded: bool,
+    /// Mission rows use a virtual history header/items without changing the
+    /// canonical section indexes used by Current surfaces and Beads.
+    pub mission_focus: MissionFocus,
+    /// True only for a blank row created by `o`/`O` (or empty-section `i`) in
+    /// Mission. Esc either removes it or commits it with the `[h]` marker.
+    pub provisional_human_mission: bool,
 }
 
 impl Default for TrajectoryEditState {
@@ -96,6 +110,9 @@ impl Default for TrajectoryEditState {
             edit_start_text: None,
             cursor_col: 0,
             pending_d_at: None,
+            mission_history_expanded: false,
+            mission_focus: MissionFocus::Active,
+            provisional_human_mission: false,
         }
     }
 }
@@ -153,12 +170,16 @@ fn handle_nav_key(
             state.pending_d_at = None;
             state.cursor_section = first_non_empty_section(doc);
             state.cursor_item = 0;
+            state.mission_focus = MissionFocus::Active;
+            clamp_cursor_to_visible_items(state, doc);
         }
         KeyCode::Char('G') => {
             state.pending_d_at = None;
             let (s, i) = last_item_pos(doc);
             state.cursor_section = s;
             state.cursor_item = i;
+            state.mission_focus = MissionFocus::Active;
+            clamp_cursor_to_visible_items(state, doc);
         }
         // ── Editing ─────────────────────────────────────────────────────────
         KeyCode::Char(' ') => {
@@ -172,17 +193,33 @@ fn handle_nav_key(
                 actions.push(action);
             }
         }
-        KeyCode::Char('x') => {
+        KeyCode::Char('x') | KeyCode::Char('X') => {
             state.pending_d_at = None;
             // Delete is blocked on Current surfaces (refresh loop owns that section).
             if is_current_surfaces_row(state, doc) {
                 return actions;
             }
-            if let Some(action) = delete_item(state, doc) {
+            let on_mission = doc
+                .sections
+                .get(state.cursor_section)
+                .is_some_and(|section| section.name == SECTION_MISSION);
+            if on_mission {
+                if let Some(action) = toggle_mission_completion(state, doc) {
+                    actions.push(action);
+                }
+            } else if let Some(action) = delete_item(state, doc) {
                 actions.push(action);
             }
         }
         KeyCode::Char('d') => {
+            if doc
+                .sections
+                .get(state.cursor_section)
+                .is_some_and(|section| section.name == SECTION_MISSION)
+            {
+                state.pending_d_at = None;
+                return actions;
+            }
             if let Some(t) = state.pending_d_at {
                 if t.elapsed() <= std::time::Duration::from_secs(1) {
                     // Second `d` within window — delete.
@@ -205,6 +242,14 @@ fn handle_nav_key(
             if is_current_surfaces_row(state, doc) {
                 return actions;
             }
+            if doc
+                .sections
+                .get(state.cursor_section)
+                .is_some_and(|section| section.name == SECTION_MISSION)
+                && state.mission_focus != MissionFocus::Active
+            {
+                return actions;
+            }
             insert_item_below(state, doc);
         }
         KeyCode::Char('O') => {
@@ -213,12 +258,28 @@ fn handle_nav_key(
             if is_current_surfaces_row(state, doc) {
                 return actions;
             }
+            if doc
+                .sections
+                .get(state.cursor_section)
+                .is_some_and(|section| section.name == SECTION_MISSION)
+                && state.mission_focus != MissionFocus::Active
+            {
+                return actions;
+            }
             insert_item_above(state, doc);
         }
         KeyCode::Char('i') => {
             state.pending_d_at = None;
             // i to enter insert mode is blocked on Current surfaces.
             if is_current_surfaces_row(state, doc) {
+                return actions;
+            }
+            if doc
+                .sections
+                .get(state.cursor_section)
+                .is_some_and(|section| section.name == SECTION_MISSION)
+                && state.mission_focus != MissionFocus::Active
+            {
                 return actions;
             }
             enter_insert_mode(state, doc);
@@ -230,17 +291,25 @@ fn handle_nav_key(
             if is_current_surfaces_row(state, doc) {
                 return actions;
             }
-            // On Beads: Enter opens a new item below (like `o`).
-            // On Mission (and any other section): Enter edits the current item (like `i`).
-            let on_tasks = doc
+            let section_name = doc
                 .sections
                 .get(state.cursor_section)
-                .map(|s| s.name == SECTION_GOALS)
-                .unwrap_or(false);
-            if on_tasks {
-                insert_item_below(state, doc);
-            } else {
-                enter_insert_mode(state, doc);
+                .map(|s| s.name.as_str());
+            match section_name {
+                Some(SECTION_GOALS) => insert_item_below(state, doc),
+                Some(SECTION_MISSION) => match state.mission_focus {
+                    MissionFocus::Active => enter_insert_mode(state, doc),
+                    MissionFocus::HistoryHeader => {
+                        if !doc.mission_history.is_empty() {
+                            state.mission_history_expanded = !state.mission_history_expanded;
+                        }
+                    }
+                    MissionFocus::HistoryItem(_) => {
+                        state.mission_history_expanded = false;
+                        state.mission_focus = MissionFocus::HistoryHeader;
+                    }
+                },
+                _ => enter_insert_mode(state, doc),
             }
         }
         // ── Move item within section ─────────────────────────────────────────
@@ -248,6 +317,14 @@ fn handle_nav_key(
             state.pending_d_at = None;
             // Move-down is blocked on Current surfaces.
             if is_current_surfaces_row(state, doc) {
+                return actions;
+            }
+            if doc
+                .sections
+                .get(state.cursor_section)
+                .is_some_and(|section| section.name == SECTION_MISSION)
+                && state.mission_focus != MissionFocus::Active
+            {
                 return actions;
             }
             if let Some(action) = move_item_down(state, doc) {
@@ -258,6 +335,14 @@ fn handle_nav_key(
             state.pending_d_at = None;
             // Move-up is blocked on Current surfaces.
             if is_current_surfaces_row(state, doc) {
+                return actions;
+            }
+            if doc
+                .sections
+                .get(state.cursor_section)
+                .is_some_and(|section| section.name == SECTION_MISSION)
+                && state.mission_focus != MissionFocus::Active
+            {
                 return actions;
             }
             if let Some(action) = move_item_up(state, doc) {
@@ -460,12 +545,36 @@ fn previous_word_start(s: &str, cursor_col: usize) -> usize {
 /// Commit insert mode: write edit_buffer back to doc and produce diff actions.
 fn commit_insert(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> Vec<EditAction> {
     let mut actions = Vec::new();
-    let new_text = state.edit_buffer.clone();
+    let mut new_text = state.edit_buffer.clone();
     let section_name = doc
         .sections
         .get(state.cursor_section)
         .map(|s| s.name.clone())
         .unwrap_or_default();
+
+    if state.provisional_human_mission && section_name == SECTION_MISSION {
+        if new_text.trim().is_empty() {
+            if let Some(section) = doc.sections.get_mut(state.cursor_section)
+                && state.cursor_item < section.items.len()
+            {
+                section.items.remove(state.cursor_item);
+                state.cursor_item = state.cursor_item.min(section.items.len().saturating_sub(1));
+            }
+            state.mode = EditMode::Nav;
+            state.edit_buffer.clear();
+            state.cursor_col = 0;
+            state.edit_start_text = None;
+            state.provisional_human_mission = false;
+            state.mission_focus = MissionFocus::Active;
+            return actions;
+        }
+        let trimmed = new_text.trim();
+        new_text = if trimmed.starts_with("[h]") {
+            trimmed.to_string()
+        } else {
+            format!("[h] {trimmed}")
+        };
+    }
 
     if let Some(section) = doc.sections.get_mut(state.cursor_section) {
         if let Some(item) = section.items.get_mut(state.cursor_item) {
@@ -492,6 +601,7 @@ fn commit_insert(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> Ve
     state.edit_buffer.clear();
     state.cursor_col = 0;
     state.edit_start_text = None;
+    state.provisional_human_mission = false;
     actions
 }
 
@@ -594,7 +704,7 @@ fn action_to_event(action: &EditAction, snapshot: u32) -> Event {
 /// Find the first section index that has items (for `g`).
 fn first_non_empty_section(doc: &TrajectoryDoc) -> usize {
     for (i, s) in doc.sections.iter().enumerate() {
-        if visible_item_len(s) > 0 {
+        if !s.items.is_empty() || (s.name == SECTION_MISSION && !doc.mission_history.is_empty()) {
             return i;
         }
     }
@@ -604,7 +714,7 @@ fn first_non_empty_section(doc: &TrajectoryDoc) -> usize {
 /// Find the last item's (section_idx, item_idx) for `G`.
 fn last_item_pos(doc: &TrajectoryDoc) -> (usize, usize) {
     for i in (0..doc.sections.len()).rev() {
-        let visible_len = visible_item_len(&doc.sections[i]);
+        let visible_len = doc.sections[i].items.len();
         if visible_len > 0 {
             return (i, visible_len - 1);
         }
@@ -612,21 +722,30 @@ fn last_item_pos(doc: &TrajectoryDoc) -> (usize, usize) {
     (0, 0)
 }
 
-fn visible_item_len(section: &Section) -> usize {
-    if section.name == SECTION_MISSION {
-        section.items.len().min(MISSION_MAX_VISIBLE_ITEMS)
-    } else {
-        section.items.len()
-    }
-}
-
 fn clamp_cursor_to_visible_items(state: &mut TrajectoryEditState, doc: &TrajectoryDoc) {
     let Some(section) = doc.sections.get(state.cursor_section) else {
         return;
     };
-    let visible_len = visible_item_len(section);
-    if visible_len > 0 && state.cursor_item >= visible_len {
-        state.cursor_item = visible_len - 1;
+    if section.name == SECTION_MISSION {
+        match state.mission_focus {
+            MissionFocus::Active => {
+                if section.items.is_empty() && !doc.mission_history.is_empty() {
+                    state.mission_focus = MissionFocus::HistoryHeader;
+                } else if !section.items.is_empty() && state.cursor_item >= section.items.len() {
+                    state.cursor_item = section.items.len() - 1;
+                }
+            }
+            MissionFocus::HistoryHeader => {}
+            MissionFocus::HistoryItem(index) => {
+                if !state.mission_history_expanded || doc.mission_history.is_empty() {
+                    state.mission_focus = MissionFocus::HistoryHeader;
+                } else if index >= doc.mission_history.len() {
+                    state.mission_focus = MissionFocus::HistoryItem(doc.mission_history.len() - 1);
+                }
+            }
+        }
+    } else if !section.items.is_empty() && state.cursor_item >= section.items.len() {
+        state.cursor_item = section.items.len() - 1;
     }
 }
 
@@ -636,10 +755,42 @@ fn move_cursor_down(state: &mut TrajectoryEditState, doc: &TrajectoryDoc) {
         return;
     }
     let cur_sec = &doc.sections[state.cursor_section];
-    let cur_visible_len = visible_item_len(cur_sec);
+
+    if cur_sec.name == SECTION_MISSION {
+        match state.mission_focus {
+            MissionFocus::Active => {
+                if !cur_sec.items.is_empty() && state.cursor_item + 1 < cur_sec.items.len() {
+                    state.cursor_item += 1;
+                    return;
+                }
+                if !doc.mission_history.is_empty() {
+                    state.mission_focus = MissionFocus::HistoryHeader;
+                    return;
+                }
+            }
+            MissionFocus::HistoryHeader => {
+                if state.mission_history_expanded && !doc.mission_history.is_empty() {
+                    state.mission_focus = MissionFocus::HistoryItem(0);
+                    return;
+                }
+            }
+            MissionFocus::HistoryItem(index) => {
+                if index + 1 < doc.mission_history.len() {
+                    state.mission_focus = MissionFocus::HistoryItem(index + 1);
+                    return;
+                }
+            }
+        }
+        if n_sections > 1 {
+            state.cursor_section = 1;
+            state.cursor_item = 0;
+            state.mission_focus = MissionFocus::Active;
+        }
+        return;
+    }
 
     // If current section is non-empty and there is a next item within it, move there.
-    if cur_visible_len > 0 && state.cursor_item + 1 < cur_visible_len {
+    if !cur_sec.items.is_empty() && state.cursor_item + 1 < cur_sec.items.len() {
         state.cursor_item += 1;
         return;
     }
@@ -656,6 +807,31 @@ fn move_cursor_down(state: &mut TrajectoryEditState, doc: &TrajectoryDoc) {
 }
 
 fn move_cursor_up(state: &mut TrajectoryEditState, doc: &TrajectoryDoc) {
+    if doc
+        .sections
+        .get(state.cursor_section)
+        .is_some_and(|section| section.name == SECTION_MISSION)
+    {
+        match state.mission_focus {
+            MissionFocus::Active => {
+                if state.cursor_item > 0 {
+                    state.cursor_item -= 1;
+                }
+            }
+            MissionFocus::HistoryHeader => {
+                state.mission_focus = MissionFocus::Active;
+                state.cursor_item = doc.sections[0].items.len().saturating_sub(1);
+            }
+            MissionFocus::HistoryItem(0) => {
+                state.mission_focus = MissionFocus::HistoryHeader;
+            }
+            MissionFocus::HistoryItem(index) => {
+                state.mission_focus = MissionFocus::HistoryItem(index - 1);
+            }
+        }
+        return;
+    }
+
     // If inside a non-empty section and not at its first item, move up within it.
     if state.cursor_item > 0 {
         state.cursor_item -= 1;
@@ -668,14 +844,26 @@ fn move_cursor_up(state: &mut TrajectoryEditState, doc: &TrajectoryDoc) {
         return;
     }
     let prev = state.cursor_section - 1;
-    if doc.sections[prev].items.is_empty() {
+    if doc.sections[prev].name == SECTION_MISSION {
+        state.cursor_section = prev;
+        if !doc.mission_history.is_empty() {
+            state.mission_focus = if state.mission_history_expanded {
+                MissionFocus::HistoryItem(doc.mission_history.len() - 1)
+            } else {
+                MissionFocus::HistoryHeader
+            };
+        } else {
+            state.mission_focus = MissionFocus::Active;
+            state.cursor_item = doc.sections[prev].items.len().saturating_sub(1);
+        }
+    } else if doc.sections[prev].items.is_empty() {
         // Previous section is empty: land on its header.
         state.cursor_section = prev;
         state.cursor_item = 0;
     } else {
         // Previous section has items: land on its last visible item.
         state.cursor_section = prev;
-        state.cursor_item = visible_item_len(&doc.sections[prev]).saturating_sub(1);
+        state.cursor_item = doc.sections[prev].items.len().saturating_sub(1);
     }
 }
 
@@ -712,6 +900,66 @@ fn toggle_checkbox(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> 
     })
 }
 
+fn toggle_mission_completion(
+    state: &mut TrajectoryEditState,
+    doc: &mut TrajectoryDoc,
+) -> Option<EditAction> {
+    match state.mission_focus {
+        MissionFocus::Active => {
+            let mission = doc
+                .sections
+                .iter_mut()
+                .find(|section| section.name == SECTION_MISSION)?;
+            if state.cursor_item >= mission.items.len() {
+                return None;
+            }
+            let mut item = mission.items.remove(state.cursor_item);
+            let before = item_display_text(&item, &item.text);
+            item.is_checkbox = true;
+            item.checked = Some(true);
+            let after = item_display_text(&item, &item.text);
+            doc.mission_history.push(item);
+            if mission.items.is_empty() {
+                state.cursor_item = 0;
+                state.mission_focus = MissionFocus::HistoryHeader;
+            } else if state.cursor_item >= mission.items.len() {
+                state.cursor_item = mission.items.len() - 1;
+            }
+            Some(EditAction::Check {
+                section: SECTION_MISSION.to_string(),
+                before,
+                after,
+            })
+        }
+        MissionFocus::HistoryItem(index) if state.mission_history_expanded => {
+            if index >= doc.mission_history.len() {
+                return None;
+            }
+            let mut item = doc.mission_history.remove(index);
+            let before = item_display_text(&item, &item.text);
+            item.is_checkbox = true;
+            item.checked = Some(false);
+            let after = item_display_text(&item, &item.text);
+            let mission = doc
+                .sections
+                .iter_mut()
+                .find(|section| section.name == SECTION_MISSION)?;
+            mission.items.push(item);
+            state.cursor_item = mission.items.len() - 1;
+            state.mission_focus = MissionFocus::Active;
+            if doc.mission_history.is_empty() {
+                state.mission_history_expanded = false;
+            }
+            Some(EditAction::Uncheck {
+                section: SECTION_MISSION.to_string(),
+                before,
+                after,
+            })
+        }
+        MissionFocus::HistoryHeader | MissionFocus::HistoryItem(_) => None,
+    }
+}
+
 fn delete_item(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> Option<EditAction> {
     let section = doc.sections.get_mut(state.cursor_section)?;
     if section.items.is_empty() {
@@ -734,17 +982,16 @@ fn insert_item_below(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
         Some(s) => s,
         None => return,
     };
-    let insert_pos = if section.items.is_empty()
-        || (section.name == SECTION_MISSION && state.cursor_item == 0)
-    {
-        // Mission item 0 is the current Mission; later items are history.
-        // Opening below the rendered current Mission must still create a new
-        // current item and move the previous Mission into history.
+    let is_mission = section.name == SECTION_MISSION;
+    let insert_pos = if section.items.is_empty() {
         0
+    } else if is_mission {
+        (state.cursor_item + 1).min(section.items.len())
     } else {
         state.cursor_item + 1
     };
-    let is_checkbox = section.name == SECTION_GOALS || section.name == SECTION_CURRENT_SURFACES;
+    let is_checkbox =
+        is_mission || section.name == SECTION_GOALS || section.name == SECTION_CURRENT_SURFACES;
     section.items.insert(
         insert_pos,
         Item {
@@ -762,6 +1009,7 @@ fn insert_item_below(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
     state.cursor_col = 0;
     state.input_ctx_buffer = String::new();
     state.edit_start_text = Some(String::new());
+    state.provisional_human_mission = is_mission;
 }
 
 fn insert_item_above(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
@@ -774,7 +1022,9 @@ fn insert_item_above(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
     } else {
         state.cursor_item
     };
-    let is_checkbox = section.name == SECTION_GOALS || section.name == SECTION_CURRENT_SURFACES;
+    let is_mission = section.name == SECTION_MISSION;
+    let is_checkbox =
+        is_mission || section.name == SECTION_GOALS || section.name == SECTION_CURRENT_SURFACES;
     section.items.insert(
         insert_pos,
         Item {
@@ -792,6 +1042,7 @@ fn insert_item_above(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
     state.cursor_col = 0;
     state.input_ctx_buffer = String::new();
     state.edit_start_text = Some(String::new());
+    state.provisional_human_mission = is_mission;
 }
 
 fn enter_insert_mode(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
@@ -802,14 +1053,18 @@ fn enter_insert_mode(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
 
     // Auto-create the first item if section is empty.
     if section.items.is_empty() {
-        let is_tasks = section.name == SECTION_GOALS;
+        let is_mission = section.name == SECTION_MISSION;
+        let is_checkbox = is_mission || section.name == SECTION_GOALS;
         section.items.push(Item {
             text: String::new(),
-            is_checkbox: is_tasks,
-            checked: if is_tasks { Some(false) } else { None },
+            is_checkbox,
+            checked: if is_checkbox { Some(false) } else { None },
             surface_id: None,
         });
         state.cursor_item = 0;
+        state.provisional_human_mission = is_mission;
+    } else {
+        state.provisional_human_mission = false;
     }
 
     // Clamp cursor to a valid index if it drifted (e.g. after a deletion).
@@ -927,19 +1182,13 @@ workspace: test-ws
         doc
     }
 
-    fn make_long_mission_doc() -> TrajectoryDoc {
+    fn make_long_mission_history_doc() -> TrajectoryDoc {
         let mut doc = make_doc();
-        let mission = doc
-            .sections
-            .iter_mut()
-            .find(|section| section.name == SECTION_MISSION)
-            .expect("sample doc has Mission section");
-        while mission.items.len() < MISSION_MAX_VISIBLE_ITEMS + 5 {
-            let idx = mission.items.len();
-            mission.items.push(Item {
-                text: format!("Older mission {idx:02}"),
-                is_checkbox: false,
-                checked: None,
+        for idx in 0..18 {
+            doc.mission_history.push(Item {
+                text: format!("Finished mission {idx:02}"),
+                is_checkbox: true,
+                checked: Some(true),
                 surface_id: None,
             });
         }
@@ -977,11 +1226,10 @@ workspace: test-ws
     }
 
     #[test]
-    fn j_from_last_visible_mission_history_skips_hidden_rows() {
-        let mut doc = make_long_mission_doc();
+    fn j_from_folded_mission_history_header_moves_to_next_section() {
+        let mut doc = make_long_mission_history_doc();
         let mut state = TrajectoryEditState {
-            cursor_section: 0,
-            cursor_item: MISSION_MAX_VISIBLE_ITEMS - 1,
+            mission_focus: MissionFocus::HistoryHeader,
             ..Default::default()
         };
 
@@ -992,8 +1240,8 @@ workspace: test-ws
     }
 
     #[test]
-    fn k_from_next_section_lands_on_last_visible_mission_history() {
-        let mut doc = make_long_mission_doc();
+    fn k_from_next_section_lands_on_folded_mission_history_header() {
+        let mut doc = make_long_mission_history_doc();
         let mut state = TrajectoryEditState {
             cursor_section: 1,
             cursor_item: 0,
@@ -1003,7 +1251,7 @@ workspace: test-ws
         handle_key(&mut state, &mut doc, key(KeyCode::Char('k')));
 
         assert_eq!(state.cursor_section, 0);
-        assert_eq!(state.cursor_item, MISSION_MAX_VISIBLE_ITEMS - 1);
+        assert_eq!(state.mission_focus, MissionFocus::HistoryHeader);
     }
 
     #[test]
@@ -1064,8 +1312,8 @@ workspace: test-ws
     }
 
     #[test]
-    fn big_g_in_mission_only_doc_targets_last_visible_mission_history() {
-        let mut doc = make_long_mission_doc();
+    fn big_g_in_mission_only_doc_targets_active_mission() {
+        let mut doc = make_long_mission_history_doc();
         doc.sections[1].items.clear();
         doc.sections[2].items.clear();
         let mut state = TrajectoryEditState::default();
@@ -1073,7 +1321,8 @@ workspace: test-ws
         handle_key(&mut state, &mut doc, shift_key('G'));
 
         assert_eq!(state.cursor_section, 0);
-        assert_eq!(state.cursor_item, MISSION_MAX_VISIBLE_ITEMS - 1);
+        assert_eq!(state.cursor_item, 0);
+        assert_eq!(state.mission_focus, MissionFocus::Active);
     }
 
     // ── Insert mode ──────────────────────────────────────────────────────────
@@ -1180,7 +1429,7 @@ workspace: test-ws
     // ── o / O ────────────────────────────────────────────────────────────────
 
     #[test]
-    fn o_on_active_mission_opens_new_current_mission() {
+    fn o_on_active_mission_opens_new_human_mission_below() {
         let doc = make_doc();
         let mut state = TrajectoryEditState {
             cursor_section: 0,
@@ -1189,12 +1438,12 @@ workspace: test-ws
         };
         let mut doc_mut = doc.clone();
         handle_key(&mut state, &mut doc_mut, key(KeyCode::Char('o')));
-        // Mission index 0 is the current Mission; older items render as history.
-        // `o` therefore opens a new index 0 and parks the prior active Mission.
         assert_eq!(doc_mut.sections[0].items.len(), 2);
-        assert_eq!(doc_mut.sections[0].items[0].text, "");
-        assert_eq!(doc_mut.sections[0].items[1].text, "Build investment agent");
-        assert_eq!(state.cursor_item, 0);
+        assert_eq!(doc_mut.sections[0].items[0].text, "Build investment agent");
+        assert_eq!(doc_mut.sections[0].items[1].text, "");
+        assert_eq!(state.cursor_item, 1);
+        assert!(doc_mut.sections[0].items[1].is_checkbox);
+        assert!(state.provisional_human_mission);
         assert!(matches!(state.mode, EditMode::Insert { .. }));
     }
 
@@ -1243,8 +1492,27 @@ workspace: test-ws
         state.edit_buffer = "New current mission".to_string();
         let actions = handle_key(&mut state, &mut doc_mut, key(KeyCode::Esc));
         assert!(!actions.is_empty());
-        assert_eq!(doc_mut.sections[0].items[0].text, "New current mission");
-        assert_eq!(doc_mut.sections[0].items[1].text, "Build investment agent");
+        assert_eq!(doc_mut.sections[0].items[0].text, "Build investment agent");
+        assert_eq!(doc_mut.sections[0].items[1].text, "[h] New current mission");
+        assert!(!state.provisional_human_mission);
+    }
+
+    #[test]
+    fn o_then_esc_removes_empty_provisional_mission() {
+        let mut doc = make_doc();
+        let mut state = TrajectoryEditState::default();
+
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('o')));
+        assert_eq!(doc.section(SECTION_MISSION).unwrap().items.len(), 2);
+
+        let actions = handle_key(&mut state, &mut doc, key(KeyCode::Esc));
+
+        assert!(actions.is_empty());
+        assert_eq!(doc.section(SECTION_MISSION).unwrap().items.len(), 1);
+        assert_eq!(
+            doc.section(SECTION_MISSION).unwrap().items[0].text,
+            "Build investment agent"
+        );
     }
 
     // ── x (delete) ───────────────────────────────────────────────────────────
@@ -1268,6 +1536,70 @@ workspace: test-ws
         } else {
             panic!("expected Delete action, got {:?}", actions[0]);
         }
+    }
+
+    #[test]
+    fn x_completes_active_mission_without_deleting_it() {
+        let mut doc = make_doc();
+        let mut state = TrajectoryEditState::default();
+
+        let actions = handle_key(&mut state, &mut doc, key(KeyCode::Char('x')));
+
+        assert!(doc.section(SECTION_MISSION).unwrap().items.is_empty());
+        assert_eq!(doc.mission_history.len(), 1);
+        assert_eq!(doc.mission_history[0].text, "Build investment agent");
+        assert_eq!(doc.mission_history[0].checked, Some(true));
+        assert_eq!(state.mission_focus, MissionFocus::HistoryHeader);
+        assert!(matches!(actions.as_slice(), [EditAction::Check { .. }]));
+    }
+
+    #[test]
+    fn uppercase_x_revives_completed_mission() {
+        let mut doc = make_doc();
+        let mut state = TrajectoryEditState::default();
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('x')));
+        state.mission_history_expanded = true;
+        state.mission_focus = MissionFocus::HistoryItem(0);
+
+        let actions = handle_key(&mut state, &mut doc, shift_key('X'));
+
+        assert!(doc.mission_history.is_empty());
+        assert_eq!(doc.section(SECTION_MISSION).unwrap().items.len(), 1);
+        assert_eq!(
+            doc.section(SECTION_MISSION).unwrap().items[0].checked,
+            Some(false)
+        );
+        assert_eq!(state.mission_focus, MissionFocus::Active);
+        assert!(matches!(actions.as_slice(), [EditAction::Uncheck { .. }]));
+    }
+
+    #[test]
+    fn enter_toggles_mission_history_fold() {
+        let mut doc = make_doc();
+        let mut state = TrajectoryEditState::default();
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('x')));
+
+        handle_key(&mut state, &mut doc, key(KeyCode::Enter));
+        assert!(state.mission_history_expanded);
+        assert_eq!(state.mission_focus, MissionFocus::HistoryHeader);
+
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
+        assert_eq!(state.mission_focus, MissionFocus::HistoryItem(0));
+        handle_key(&mut state, &mut doc, key(KeyCode::Enter));
+        assert!(!state.mission_history_expanded);
+        assert_eq!(state.mission_focus, MissionFocus::HistoryHeader);
+    }
+
+    #[test]
+    fn dd_is_a_noop_on_mission_rows() {
+        let mut doc = make_doc();
+        let mut state = TrajectoryEditState::default();
+
+        assert!(handle_key(&mut state, &mut doc, key(KeyCode::Char('d'))).is_empty());
+        assert!(handle_key(&mut state, &mut doc, key(KeyCode::Char('d'))).is_empty());
+
+        assert_eq!(doc.section(SECTION_MISSION).unwrap().items.len(), 1);
+        assert!(doc.mission_history.is_empty());
     }
 
     // ── Space (toggle) ───────────────────────────────────────────────────────
@@ -1326,7 +1658,8 @@ workspace: test-ws
         let goal = doc.section("Mission").unwrap();
         assert_eq!(goal.items.len(), 1);
         assert_eq!(goal.items[0].text, "");
-        assert!(!goal.items[0].is_checkbox);
+        assert!(goal.items[0].is_checkbox);
+        assert_eq!(goal.items[0].checked, Some(false));
         // No action yet — actions fire on Esc-commit.
         assert!(actions.is_empty());
     }
@@ -1544,18 +1877,21 @@ workspace: test-ws
     fn dd_within_one_second_deletes_item() {
         let mut doc = TrajectoryDoc::default();
         doc.ensure_sections();
-        doc.sections[0].items.push(Item {
+        doc.sections[2].items.push(Item {
             text: "kill me".to_string(),
-            is_checkbox: false,
-            checked: None,
+            is_checkbox: true,
+            checked: Some(false),
             surface_id: None,
         });
-        let mut state = TrajectoryEditState::default();
+        let mut state = TrajectoryEditState {
+            cursor_section: 2,
+            ..TrajectoryEditState::default()
+        };
         handle_key(&mut state, &mut doc, key(KeyCode::Char('d')));
         assert!(state.pending_d_at.is_some());
-        assert_eq!(doc.sections[0].items.len(), 1, "first d should NOT delete");
+        assert_eq!(doc.sections[2].items.len(), 1, "first d should NOT delete");
         let actions = handle_key(&mut state, &mut doc, key(KeyCode::Char('d')));
-        assert_eq!(doc.sections[0].items.len(), 0);
+        assert_eq!(doc.sections[2].items.len(), 0);
         assert!(!actions.is_empty()); // delete action emitted
         assert!(state.pending_d_at.is_none());
     }

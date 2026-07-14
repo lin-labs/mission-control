@@ -125,12 +125,19 @@ fn parser_accepts_legacy_goal_and_tasks_headers() {
     let legacy = "---\nworkspace: x\n---\n\n## Goal\n- legacy mission item\n\n## Current surfaces\n\n## Tasks & Progress\n- [x] legacy done\n- [ ] legacy todo\n";
     let doc = TrajectoryDoc::parse(legacy).unwrap();
     assert_eq!(doc.sections.len(), 3);
-    assert_eq!(doc.sections[0].name, "Mission",
-        "legacy `## Goal` must be canonicalized to `Mission`");
-    assert_eq!(doc.sections[2].name, "Beads",
-        "legacy `## Tasks & Progress` must be canonicalized to `Beads`");
+    assert_eq!(
+        doc.sections[0].name, "Mission",
+        "legacy `## Goal` must be canonicalized to `Mission`"
+    );
+    assert_eq!(
+        doc.sections[2].name, "Beads",
+        "legacy `## Tasks & Progress` must be canonicalized to `Beads`"
+    );
     // Items survive the rename.
-    assert_eq!(doc.section("Mission").unwrap().items[0].text, "legacy mission item");
+    assert_eq!(
+        doc.section("Mission").unwrap().items[0].text,
+        "legacy mission item"
+    );
     let goals = doc.section("Beads").unwrap();
     assert_eq!(goals.items.len(), 2);
     assert!(goals.items[0].is_checkbox && goals.items[0].checked == Some(true));
@@ -151,20 +158,30 @@ fn writer_emits_only_new_headers_after_loading_legacy() {
     let legacy = "---\nworkspace: x\n---\n\n## Goal\n- m1\n\n## Current surfaces\n\n## Tasks & Progress\n- [ ] g1\n";
     let doc = TrajectoryDoc::parse(legacy).unwrap();
     let out = doc.to_markdown();
-    assert!(out.contains("## Mission"), "writer must emit `## Mission`: {out}");
-    assert!(out.contains("## Beads"),
-        "writer must emit `## Beads`: {out}");
+    assert!(
+        out.contains("## Mission"),
+        "writer must emit `## Mission`: {out}"
+    );
+    assert!(
+        out.contains("## Beads"),
+        "writer must emit `## Beads`: {out}"
+    );
     // The literal old headers (as standalone section starters) must be gone.
-    assert!(!out.contains("## Goal\n"),
-        "writer must not emit `## Goal` after migration: {out}");
-    assert!(!out.contains("## Tasks & Progress"),
-        "writer must not emit `## Tasks & Progress` after migration: {out}");
+    assert!(
+        !out.contains("## Goal\n"),
+        "writer must not emit `## Goal` after migration: {out}"
+    );
+    assert!(
+        !out.contains("## Tasks & Progress"),
+        "writer must not emit `## Tasks & Progress` after migration: {out}"
+    );
 }
 
 #[test]
 fn parser_round_trips_already_new_headers_unchanged() {
     // Sanity: docs already using the new taxonomy round-trip identically.
-    let modern = "---\nworkspace: x\n---\n\n## Mission\n- m1\n\n## Current surfaces\n\n## Beads\n- [ ] g1\n";
+    let modern =
+        "---\nworkspace: x\n---\n\n## Mission\n- m1\n\n## Current surfaces\n\n## Beads\n- [ ] g1\n";
     let doc = TrajectoryDoc::parse(modern).unwrap();
     assert_eq!(doc.sections[0].name, "Mission");
     assert_eq!(doc.sections[2].name, "Beads");
@@ -247,6 +264,47 @@ fn skeleton_has_all_three_canonical_sections_with_frontmatter() {
     assert!(doc.section("Mission").is_some());
     assert!(doc.section("Current surfaces").is_some());
     assert!(doc.section("Beads").is_some());
+}
+
+#[test]
+fn legacy_positional_missions_migrate_to_active_and_completed_state() {
+    let mut doc = TrajectoryDoc::parse(
+        "## Mission\n- Current mission\n- Previously parked mission\n\n## Current surfaces\n\n## Beads\n",
+    )
+    .unwrap();
+
+    doc.ensure_sections();
+
+    let active = doc.section("Mission").unwrap();
+    assert_eq!(active.items.len(), 1);
+    assert_eq!(active.items[0].text, "Current mission");
+    assert!(active.items[0].is_checkbox);
+    assert_eq!(active.items[0].checked, Some(false));
+    assert_eq!(doc.mission_history.len(), 1);
+    assert_eq!(doc.mission_history[0].text, "Previously parked mission");
+    assert_eq!(doc.mission_history[0].checked, Some(true));
+}
+
+#[test]
+fn explicit_mission_checkboxes_and_history_round_trip() {
+    let source = "## Mission\n- [ ] Agent mission\n- [ ] [h] Human mission\n\n## Mission history\n- [x] Finished mission\n\n## Current surfaces\n\n## Beads\n";
+    let mut doc = TrajectoryDoc::parse(source).unwrap();
+    doc.ensure_sections();
+
+    assert_eq!(doc.section("Mission").unwrap().items.len(), 2);
+    assert_eq!(doc.mission_history.len(), 1);
+    assert!(
+        doc.to_markdown()
+            .contains("## Mission history\n- [x] Finished mission")
+    );
+
+    let mut reparsed = TrajectoryDoc::parse(&doc.to_markdown()).unwrap();
+    reparsed.ensure_sections();
+    assert_eq!(
+        reparsed.section("Mission").unwrap().items[1].text,
+        "[h] Human mission"
+    );
+    assert_eq!(reparsed.mission_history[0].text, "Finished mission");
 }
 
 #[test]

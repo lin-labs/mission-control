@@ -281,6 +281,7 @@ fn is_trajectory_detail_key(key: KeyEvent) -> bool {
             | KeyCode::Char(' ')
             | KeyCode::Char('-')
             | KeyCode::Char('x')
+            | KeyCode::Char('X')
             | KeyCode::Char('d')
             | KeyCode::Char('o')
             | KeyCode::Char('O')

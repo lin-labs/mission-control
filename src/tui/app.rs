@@ -1590,10 +1590,11 @@ impl App {
                 Some(d) => d,
                 None => continue,
             };
-            let goal_section_empty = doc
-                .section(crate::mc_data::trajectory::SECTION_MISSION)
-                .map(|s| s.items.is_empty())
-                .unwrap_or(true);
+            let goal_section_empty = doc.mission_history.is_empty()
+                && doc
+                    .section(crate::mc_data::trajectory::SECTION_MISSION)
+                    .map(|s| s.items.is_empty())
+                    .unwrap_or(true);
             if !goal_section_empty {
                 continue;
             }
@@ -1602,8 +1603,8 @@ impl App {
                 .filter(|l| !l.trim().is_empty())
                 .map(|l| crate::mc_data::trajectory::Item {
                     text: l.trim().to_string(),
-                    is_checkbox: false,
-                    checked: None,
+                    is_checkbox: true,
+                    checked: Some(false),
                     surface_id: None,
                 })
                 .collect();
@@ -2354,7 +2355,7 @@ impl App {
     /// Return UUIDs of workspaces that are due for a trajectory regen.
     ///
     /// Thresholds (compile-time defaults, configurable in the future):
-    /// - Mission is empty, OR
+    /// - Mission and Mission history are both empty, OR
     /// - ≥ 10 events since last regen, OR
     /// - ≥ 300 seconds since last regen (with any events pending)
     ///
@@ -2386,16 +2387,19 @@ impl App {
                 if ws.regen.regen_in_flight {
                     return false;
                 }
-                // Empty Mission is itself a regen signal. This makes newly
-                // provisioned or previously blank workspaces self-heal even
-                // when they have no pending trajectory edit events.
+                // A completely blank Mission is itself a regen signal. A
+                // workspace with completed Mission history is intentionally
+                // allowed to have no active row; do not reopen finished work.
                 let mission_is_empty = ws
                     .trajectory
                     .as_ref()
-                    .and_then(|doc| {
-                        doc.section(crate::mc_data::trajectory::SECTION_MISSION)
+                    .map(|doc| {
+                        doc.mission_history.is_empty()
+                            && doc
+                                .section(crate::mc_data::trajectory::SECTION_MISSION)
+                                .map(|section| section.items.is_empty())
+                                .unwrap_or(true)
                     })
-                    .map(|section| section.items.is_empty())
                     .unwrap_or(true);
                 if mission_is_empty {
                     return true;
@@ -2850,6 +2854,7 @@ impl App {
                 }
                 KeyCode::Char(' ')
                 | KeyCode::Char('x')
+                | KeyCode::Char('X')
                 | KeyCode::Char('d')
                 | KeyCode::Char('o')
                 | KeyCode::Char('O')
@@ -2878,6 +2883,7 @@ impl App {
                 KeyCode::Enter
                 | KeyCode::Char(' ')
                 | KeyCode::Char('x')
+                | KeyCode::Char('X')
                 | KeyCode::Char('d')
                 | KeyCode::Char('o')
                 | KeyCode::Char('O')
@@ -4259,6 +4265,7 @@ platforms:
         for code in [
             KeyCode::Char(' '),
             KeyCode::Char('x'),
+            KeyCode::Char('X'),
             KeyCode::Char('d'),
             KeyCode::Char('o'),
             KeyCode::Char('O'),
@@ -5166,6 +5173,24 @@ workspace: test-ws
             vec!["test-uuid-1".to_string()],
             "an empty Mission should self-heal without waiting for edit events"
         );
+    }
+
+    #[test]
+    fn completed_mission_history_does_not_self_heal_into_active_work() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let doc = app.workspaces[0].trajectory.as_mut().unwrap();
+        let mut completed = doc
+            .section(crate::mc_data::trajectory::SECTION_MISSION)
+            .unwrap()
+            .items[0]
+            .clone();
+        completed.checked = Some(true);
+        doc.replace_section_items(crate::mc_data::trajectory::SECTION_MISSION, Vec::new());
+        doc.mission_history.push(completed);
+        app.workspaces[0].regen.events_since_last_regen = 0;
+        app.workspaces[0].regen.last_regen_at = None;
+
+        assert!(app.workspaces_due_for_regen().is_empty());
     }
 
     #[test]

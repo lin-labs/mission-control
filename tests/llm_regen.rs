@@ -58,13 +58,16 @@ fn build_prompt_contains_trajectory_text() {
         "prompt should contain the trajectory content"
     );
     assert!(
-        p.system
-            .contains("`## Mission` must never be empty"),
-        "prompt should require a non-empty Mission"
+        p.system.contains("`## Mission` may be empty only when"),
+        "prompt should allow empty active Mission only after completion"
     );
     assert!(
         p.system.contains("Human-authored Mission text is primary"),
         "prompt should prioritize human Mission input"
+    );
+    assert!(
+        p.system.contains("`[h]` Mission rows byte-for-byte"),
+        "prompt should make human Mission rows immutable"
     );
     assert!(
         p.system.contains("Do not append instructions, old asks"),
@@ -96,8 +99,7 @@ fn build_prompt_contains_workspace_name() {
 
 #[test]
 fn build_prompt_includes_recent_events() {
-    let event = Event::new_now(Source::User, Kind::Check, "Beads")
-        .with_after("deploy to prod");
+    let event = Event::new_now(Source::User, Kind::Check, "Beads").with_after("deploy to prod");
 
     let inputs = RegenInputs {
         workspace_name: "ws".to_string(),
@@ -188,7 +190,7 @@ fn build_prompt_splits_into_system_and_user() {
     assert!(!p.system.is_empty(), "system part should not be empty");
     assert!(!p.user.is_empty(), "user part should not be empty");
     assert!(
-        p.system.contains("3-section trajectory doc"),
+        p.system.contains("4-section trajectory doc"),
         "system part should contain stable instructions"
     );
     assert!(
@@ -246,7 +248,7 @@ async fn regenerate_preserves_saved_human_mission_as_primary() {
     });
     let inputs = RegenInputs {
         workspace_name: "test-ws".to_string(),
-        current_trajectory: "## Mission\n- Ship the human-selected outcome\n".to_string(),
+        current_trajectory: "## Mission\n- [ ] [h] Ship the human-selected outcome\n".to_string(),
         recent_events: vec![],
         recent_user_explanations: vec![],
         session_bullets: vec![],
@@ -259,13 +261,102 @@ async fn regenerate_preserves_saved_human_mission_as_primary() {
     let doc = regenerate(&summarizer, &inputs).await.unwrap();
     assert_eq!(
         mission_texts(&doc).first().map(String::as_str),
-        Some("Ship the human-selected outcome")
+        Some("[h] Ship the human-selected outcome")
     );
 }
 
 #[tokio::test]
+async fn regenerate_deduplicates_agent_mission_similar_to_human_wording() {
+    let model_response = "## Mission\n- [ ] Ship the selected human outcome\n- [ ] Verify the released binary\n\n## Current surfaces\n\n## Beads\n";
+    let summarizer: Arc<dyn Summarizer> = Arc::new(MockSummarizer {
+        response: model_response.to_string(),
+    });
+    let inputs = RegenInputs {
+        workspace_name: "test-ws".to_string(),
+        current_trajectory:
+            "## Mission\n- [ ] [h] Ship the human-selected outcome\n\n## Current surfaces\n\n## Beads\n"
+                .to_string(),
+        recent_events: vec![],
+        recent_user_explanations: vec![],
+        session_bullets: vec![],
+        surface_summaries: vec![],
+        tool_call_count: 0,
+        cmux_surface_order: vec![],
+        user_ask: None,
+    };
+
+    let doc = regenerate(&summarizer, &inputs).await.unwrap();
+    let mission = mission_texts(&doc);
+
+    assert_eq!(
+        mission,
+        vec![
+            "[h] Ship the human-selected outcome",
+            "Verify the released binary"
+        ]
+    );
+    assert!(
+        doc.section("Mission")
+            .unwrap()
+            .items
+            .iter()
+            .all(|item| item.is_checkbox && item.checked == Some(false))
+    );
+}
+
+#[tokio::test]
+async fn regenerate_preserves_completed_mission_history_exactly() {
+    let model_response = "## Mission\n- [ ] Continue active work\n\n## Mission history\n- [x] Model rewrite\n\n## Current surfaces\n\n## Beads\n";
+    let summarizer: Arc<dyn Summarizer> = Arc::new(MockSummarizer {
+        response: model_response.to_string(),
+    });
+    let inputs = RegenInputs {
+        workspace_name: "test-ws".to_string(),
+        current_trajectory: "## Mission\n- [ ] Continue active work\n\n## Mission history\n- [x] [h] Exact finished wording!\n\n## Current surfaces\n\n## Beads\n".to_string(),
+        recent_events: vec![],
+        recent_user_explanations: vec![],
+        session_bullets: vec![],
+        surface_summaries: vec![],
+        tool_call_count: 0,
+        cmux_surface_order: vec![],
+        user_ask: None,
+    };
+
+    let doc = regenerate(&summarizer, &inputs).await.unwrap();
+
+    assert_eq!(doc.mission_history.len(), 1);
+    assert_eq!(doc.mission_history[0].text, "[h] Exact finished wording!");
+    assert_eq!(doc.mission_history[0].checked, Some(true));
+}
+
+#[tokio::test]
+async fn regenerate_does_not_reopen_a_similar_completed_mission() {
+    let model_response = "## Mission\n- [ ] Ship the selected outcome\n\n## Mission history\n\n## Current surfaces\n\n## Beads\n";
+    let summarizer: Arc<dyn Summarizer> = Arc::new(MockSummarizer {
+        response: model_response.to_string(),
+    });
+    let inputs = RegenInputs {
+        workspace_name: "test-ws".to_string(),
+        current_trajectory: "## Mission\n\n## Mission history\n- [x] Ship the human-selected outcome\n\n## Current surfaces\n\n## Beads\n".to_string(),
+        recent_events: vec![],
+        recent_user_explanations: vec![],
+        session_bullets: vec![],
+        surface_summaries: vec![],
+        tool_call_count: 0,
+        cmux_surface_order: vec![],
+        user_ask: Some("Ship the selected outcome".to_string()),
+    };
+
+    let doc = regenerate(&summarizer, &inputs).await.unwrap();
+
+    assert!(doc.section("Mission").unwrap().items.is_empty());
+    assert_eq!(doc.mission_history.len(), 1);
+}
+
+#[tokio::test]
 async fn regenerate_fills_empty_mission_from_latest_human_ask() {
-    let empty_response = "---\nworkspace: test-ws\n---\n\n## Mission\n\n## Current surfaces\n\n## Beads\n";
+    let empty_response =
+        "---\nworkspace: test-ws\n---\n\n## Mission\n\n## Current surfaces\n\n## Beads\n";
     let summarizer: Arc<dyn Summarizer> = Arc::new(MockSummarizer {
         response: empty_response.to_string(),
     });
@@ -288,12 +379,16 @@ async fn regenerate_fills_empty_mission_from_latest_human_ask() {
     let mission = mission_texts(&doc);
     assert_eq!(mission.len(), 1);
     assert!(mission[0].contains("Make Mission reliable and concise"));
-    assert!(mission[0].chars().count() <= 110, "fallback must stay short");
+    assert!(
+        mission[0].chars().count() <= 110,
+        "fallback must stay short"
+    );
 }
 
 #[tokio::test]
 async fn regenerate_fills_empty_mission_from_conversation_summaries() {
-    let empty_response = "---\nworkspace: test-ws\n---\n\n## Mission\n\n## Current surfaces\n\n## Beads\n";
+    let empty_response =
+        "---\nworkspace: test-ws\n---\n\n## Mission\n\n## Current surfaces\n\n## Beads\n";
     let summarizer: Arc<dyn Summarizer> = Arc::new(MockSummarizer {
         response: empty_response.to_string(),
     });
@@ -317,8 +412,14 @@ async fn regenerate_fills_empty_mission_from_conversation_summaries() {
 
     let doc = regenerate(&summarizer, &inputs).await.unwrap();
     let mission = mission_texts(&doc);
-    assert!(!mission.is_empty(), "conversation fallback must populate Mission");
-    assert!(mission.len() <= 3, "fallback should remain compact: {mission:?}");
+    assert!(
+        !mission.is_empty(),
+        "conversation fallback must populate Mission"
+    );
+    assert!(
+        mission.len() <= 3,
+        "fallback should remain compact: {mission:?}"
+    );
     assert!(mission.iter().all(|item| item.chars().count() <= 110));
     assert!(mission[0].contains("OpenAI provider integration"));
 }
