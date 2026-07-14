@@ -122,12 +122,24 @@ fn split_surface_intent(text: &str) -> (&str, Option<&str>, Option<&str>) {
 /// short value still renders on one line; a medium one wraps to 2–4.
 const MAX_FIELD_LINES: usize = 4;
 
+fn nav_cursor_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(Color::Black).bg(Color::Cyan)
+    } else {
+        Style::default()
+            .fg(Color::Gray)
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
+    }
+}
+
 fn surface_item_lines<'a>(
     prefix: &str,
     text: &'a str,
     dim: bool,
     base: Style,
     cursor: bool,
+    focused: bool,
     inner_width: usize,
 ) -> Vec<Line<'a>> {
     let (main, overall, ask) = split_surface_intent(text);
@@ -137,7 +149,7 @@ fn surface_item_lines<'a>(
     let first_line = if cursor {
         Line::from(Span::styled(
             format!("{prefix}{main}"),
-            Style::default().fg(Color::Black).bg(Color::Cyan),
+            nav_cursor_style(focused),
         ))
     } else {
         let mut first = vec![Span::styled(prefix.to_string(), base)];
@@ -405,6 +417,7 @@ pub fn render_with_hints(
                 &doc.mission_history,
                 sec_idx,
                 edit_state,
+                focused,
             ) {
                 cursor_line = Some(line);
             }
@@ -434,10 +447,7 @@ pub fn render_with_hints(
         let header_line = if is_header_cursor {
             Line::from(Span::styled(
                 format!("## {section_title}"),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                nav_cursor_style(focused).add_modifier(Modifier::BOLD),
             ))
         } else {
             Line::from(Span::styled(
@@ -508,16 +518,18 @@ pub fn render_with_hints(
                         dim,
                         base,
                         is_cursor && !in_insert,
+                        focused,
                         body_inner.width as usize,
                     ));
                     continue;
                 }
 
                 let line = if is_cursor && !in_insert {
-                    // Nav mode cursor: highlight with Cyan background.
+                    // Nav mode cursor: active Cyan in Detail, dimmed when the
+                    // sidebar owns focus so the stale row does not look active.
                     Line::from(Span::styled(
                         format!("{prefix}{display_text}"),
-                        Style::default().fg(Color::Black).bg(Color::Cyan),
+                        nav_cursor_style(focused),
                     ))
                 } else if is_insert_cursor {
                     // Insert mode cursor: render with a block cursor at cursor_col.
@@ -699,6 +711,7 @@ fn mission_item_line<'a>(
     text: &str,
     nav_cursor: bool,
     insert_state: Option<&TrajectoryEditState>,
+    focused: bool,
 ) -> Line<'a> {
     if let Some(state) = insert_state {
         return mission_insert_line(prefix, state.edit_buffer.as_str(), state);
@@ -708,7 +721,7 @@ fn mission_item_line<'a>(
     if nav_cursor {
         Line::from(Span::styled(
             format!("{prefix}{display}"),
-            Style::default().fg(Color::Black).bg(Color::Cyan),
+            nav_cursor_style(focused),
         ))
     } else {
         Line::from(Span::styled(
@@ -724,6 +737,7 @@ fn render_mission_section<'a>(
     history: &'a [Item],
     sec_idx: usize,
     edit_state: Option<&TrajectoryEditState>,
+    focused: bool,
 ) -> Option<u16> {
     let mut cursor_line = None;
     let header_cursor = edit_state
@@ -739,10 +753,7 @@ fn render_mission_section<'a>(
     lines.push(Line::from(Span::styled(
         format!("## {}", section.name),
         if header_cursor {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            nav_cursor_style(focused).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
                 .fg(Color::White)
@@ -782,6 +793,7 @@ fn render_mission_section<'a>(
                 &item.text,
                 active_cursor,
                 active_insert,
+                focused,
             ));
         }
     }
@@ -801,10 +813,7 @@ fn render_mission_section<'a>(
         format!("## Mission history ({}) ▸ Enter to unfold", history.len())
     };
     let history_style = if history_header_cursor {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        nav_cursor_style(focused).add_modifier(Modifier::BOLD)
     } else {
         Style::default()
             .fg(Color::DarkGray)
@@ -825,7 +834,7 @@ fn render_mission_section<'a>(
             if cursor {
                 cursor_line = Some(lines.len() as u16);
             }
-            let mut line = mission_item_line("- [x] ", &item.text, cursor, None);
+            let mut line = mission_item_line("- [x] ", &item.text, cursor, None, focused);
             if !cursor {
                 for span in &mut line.spans {
                     span.style = span.style.fg(Color::DarkGray);
@@ -909,7 +918,7 @@ workspace: predinvest
         }];
         let mut lines = Vec::new();
 
-        let _ = render_mission_section(&mut lines, &section, &history, 0, None);
+        let _ = render_mission_section(&mut lines, &section, &history, 0, None, true);
         let rendered: Vec<String> = lines.iter().map(line_text).collect();
 
         assert_eq!(rendered[0], "## Mission");
@@ -954,7 +963,7 @@ workspace: predinvest
         };
         let mut lines = Vec::new();
 
-        let _ = render_mission_section(&mut lines, &section, &history, 0, Some(&edit_state));
+        let _ = render_mission_section(&mut lines, &section, &history, 0, Some(&edit_state), true);
         let rendered: Vec<String> = lines.iter().map(line_text).collect();
 
         assert!(
@@ -998,7 +1007,7 @@ workspace: predinvest
         };
         let mut lines = Vec::new();
 
-        let _ = render_mission_section(&mut lines, &section, &[], 0, Some(&edit_state));
+        let _ = render_mission_section(&mut lines, &section, &[], 0, Some(&edit_state), true);
         let rendered: Vec<String> = lines.iter().map(line_text).collect();
 
         assert!(rendered[1].starts_with("- [ ] New h"));
@@ -1276,6 +1285,102 @@ workspace: intent
             }
         }
         assert!(found, "did not find highlighted cursor item");
+    }
+
+    #[test]
+    fn render_fades_mission_cursor_when_detail_is_unfocused() {
+        let mut doc = TrajectoryDoc::parse(SAMPLE).unwrap();
+        doc.ensure_sections();
+        let state = TrajectoryEditState {
+            cursor_section: 0,
+            cursor_item: 0,
+            mode: EditMode::Nav,
+            ..Default::default()
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    Rect::new(0, 0, 80, 24),
+                    Some(&doc),
+                    0,
+                    false,
+                    Some(&state),
+                    None,
+                    None,
+                )
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .filter_map(|x| {
+                    buf.cell((x, y))
+                        .map(|c| c.symbol().chars().next().unwrap_or(' '))
+                })
+                .collect();
+            if row.contains("Build self-improvement") {
+                let cell = (0..buf.area.width)
+                    .filter_map(|x| buf.cell((x, y)))
+                    .find(|cell| cell.symbol() == "B")
+                    .expect("mission row has a B cell");
+                assert_eq!(cell.style().bg, Some(Color::DarkGray));
+                assert!(cell.style().add_modifier.contains(Modifier::DIM));
+                return;
+            }
+        }
+        panic!("did not find faded Mission cursor item");
+    }
+
+    #[test]
+    fn render_fades_beads_cursor_when_detail_is_unfocused() {
+        let mut doc = TrajectoryDoc::parse(SAMPLE).unwrap();
+        doc.ensure_sections();
+        let state = TrajectoryEditState {
+            cursor_section: 2,
+            cursor_item: 0,
+            mode: EditMode::Nav,
+            ..Default::default()
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render(
+                    f,
+                    Rect::new(0, 0, 80, 24),
+                    Some(&doc),
+                    0,
+                    false,
+                    Some(&state),
+                    None,
+                    None,
+                )
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .filter_map(|x| {
+                    buf.cell((x, y))
+                        .map(|c| c.symbol().chars().next().unwrap_or(' '))
+                })
+                .collect();
+            if row.contains("sprint-01 done") {
+                let cell = (0..buf.area.width)
+                    .filter_map(|x| buf.cell((x, y)))
+                    .find(|cell| cell.symbol() == "s")
+                    .expect("Beads row has an s cell");
+                assert_eq!(cell.style().bg, Some(Color::DarkGray));
+                assert!(cell.style().add_modifier.contains(Modifier::DIM));
+                return;
+            }
+        }
+        panic!("did not find faded Beads cursor item");
     }
 
     #[test]
