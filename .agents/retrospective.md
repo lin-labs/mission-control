@@ -102,6 +102,12 @@ Meta-patterns observed so far:
 - **Asking Boyan for concrete repro IDs** (e.g.
   `workspace_id=ED00E698... surface_ref=surface:121`) the moment a UI
   bug stalls. Three lines of IDs > three back-and-forths of "try this."
+- **Use Mission Control's persisted window snapshots for attribution work**.
+  When the live `cmux` socket is unavailable, inspect
+  `~/data/mission-control/windows/*/window.json` and check its `updated_at`
+  before dropping to lower-level pane inspection. The snapshot already carries
+  the workspace-to-surface mapping plus each structured surface's overall goal
+  and latest ask.
 
 ## Where retro findings from this project should land
 

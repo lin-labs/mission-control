@@ -9,7 +9,10 @@ use crate::mc_data::events::{Event, Kind, Source};
 use crate::mc_data::inputs::{InputContext, write_input};
 use crate::mc_data::paths;
 use crate::mc_data::snapshots::{highest_snapshot, write_snapshot};
-use crate::mc_data::trajectory::{Item, SECTION_CURRENT_SURFACES, SECTION_GOALS, TrajectoryDoc};
+use crate::mc_data::trajectory::{
+    Item, MISSION_MAX_VISIBLE_ITEMS, SECTION_CURRENT_SURFACES, SECTION_GOALS, SECTION_MISSION,
+    Section, TrajectoryDoc,
+};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -112,7 +115,10 @@ pub fn handle_key(
     key: KeyEvent,
 ) -> Vec<EditAction> {
     match &state.mode {
-        EditMode::Nav => handle_nav_key(state, doc, key),
+        EditMode::Nav => {
+            clamp_cursor_to_visible_items(state, doc);
+            handle_nav_key(state, doc, key)
+        }
         EditMode::Insert { .. } => handle_insert_key(state, doc, key),
     }
 }
@@ -588,7 +594,7 @@ fn action_to_event(action: &EditAction, snapshot: u32) -> Event {
 /// Find the first section index that has items (for `g`).
 fn first_non_empty_section(doc: &TrajectoryDoc) -> usize {
     for (i, s) in doc.sections.iter().enumerate() {
-        if !s.items.is_empty() {
+        if visible_item_len(s) > 0 {
             return i;
         }
     }
@@ -598,11 +604,30 @@ fn first_non_empty_section(doc: &TrajectoryDoc) -> usize {
 /// Find the last item's (section_idx, item_idx) for `G`.
 fn last_item_pos(doc: &TrajectoryDoc) -> (usize, usize) {
     for i in (0..doc.sections.len()).rev() {
-        if !doc.sections[i].items.is_empty() {
-            return (i, doc.sections[i].items.len() - 1);
+        let visible_len = visible_item_len(&doc.sections[i]);
+        if visible_len > 0 {
+            return (i, visible_len - 1);
         }
     }
     (0, 0)
+}
+
+fn visible_item_len(section: &Section) -> usize {
+    if section.name == SECTION_MISSION {
+        section.items.len().min(MISSION_MAX_VISIBLE_ITEMS)
+    } else {
+        section.items.len()
+    }
+}
+
+fn clamp_cursor_to_visible_items(state: &mut TrajectoryEditState, doc: &TrajectoryDoc) {
+    let Some(section) = doc.sections.get(state.cursor_section) else {
+        return;
+    };
+    let visible_len = visible_item_len(section);
+    if visible_len > 0 && state.cursor_item >= visible_len {
+        state.cursor_item = visible_len - 1;
+    }
 }
 
 fn move_cursor_down(state: &mut TrajectoryEditState, doc: &TrajectoryDoc) {
@@ -611,9 +636,10 @@ fn move_cursor_down(state: &mut TrajectoryEditState, doc: &TrajectoryDoc) {
         return;
     }
     let cur_sec = &doc.sections[state.cursor_section];
+    let cur_visible_len = visible_item_len(cur_sec);
 
     // If current section is non-empty and there is a next item within it, move there.
-    if !cur_sec.items.is_empty() && state.cursor_item + 1 < cur_sec.items.len() {
+    if cur_visible_len > 0 && state.cursor_item + 1 < cur_visible_len {
         state.cursor_item += 1;
         return;
     }
@@ -647,9 +673,9 @@ fn move_cursor_up(state: &mut TrajectoryEditState, doc: &TrajectoryDoc) {
         state.cursor_section = prev;
         state.cursor_item = 0;
     } else {
-        // Previous section has items: land on its last item.
+        // Previous section has items: land on its last visible item.
         state.cursor_section = prev;
-        state.cursor_item = doc.sections[prev].items.len() - 1;
+        state.cursor_item = visible_item_len(&doc.sections[prev]).saturating_sub(1);
     }
 }
 
@@ -896,6 +922,25 @@ workspace: test-ws
         doc
     }
 
+    fn make_long_mission_doc() -> TrajectoryDoc {
+        let mut doc = make_doc();
+        let mission = doc
+            .sections
+            .iter_mut()
+            .find(|section| section.name == SECTION_MISSION)
+            .expect("sample doc has Mission section");
+        while mission.items.len() < MISSION_MAX_VISIBLE_ITEMS + 5 {
+            let idx = mission.items.len();
+            mission.items.push(Item {
+                text: format!("Older mission {idx:02}"),
+                is_checkbox: false,
+                checked: None,
+                surface_id: None,
+            });
+        }
+        doc
+    }
+
     // ── Cursor navigation ────────────────────────────────────────────────────
 
     #[test]
@@ -924,6 +969,36 @@ workspace: test-ws
         handle_key(&mut state, &mut doc.clone(), key(KeyCode::Char('j')));
         assert_eq!(state.cursor_section, 1);
         assert_eq!(state.cursor_item, 0);
+    }
+
+    #[test]
+    fn j_from_last_visible_mission_history_skips_hidden_rows() {
+        let mut doc = make_long_mission_doc();
+        let mut state = TrajectoryEditState {
+            cursor_section: 0,
+            cursor_item: MISSION_MAX_VISIBLE_ITEMS - 1,
+            ..Default::default()
+        };
+
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
+
+        assert_eq!(state.cursor_section, 1);
+        assert_eq!(state.cursor_item, 0);
+    }
+
+    #[test]
+    fn k_from_next_section_lands_on_last_visible_mission_history() {
+        let mut doc = make_long_mission_doc();
+        let mut state = TrajectoryEditState {
+            cursor_section: 1,
+            cursor_item: 0,
+            ..Default::default()
+        };
+
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('k')));
+
+        assert_eq!(state.cursor_section, 0);
+        assert_eq!(state.cursor_item, MISSION_MAX_VISIBLE_ITEMS - 1);
     }
 
     #[test]
@@ -981,6 +1056,19 @@ workspace: test-ws
         // Tasks has 3 items (sprint-01, sprint-02, sprint-03), last index = 2.
         assert_eq!(state.cursor_section, 2);
         assert_eq!(state.cursor_item, 2);
+    }
+
+    #[test]
+    fn big_g_in_mission_only_doc_targets_last_visible_mission_history() {
+        let mut doc = make_long_mission_doc();
+        doc.sections[1].items.clear();
+        doc.sections[2].items.clear();
+        let mut state = TrajectoryEditState::default();
+
+        handle_key(&mut state, &mut doc, shift_key('G'));
+
+        assert_eq!(state.cursor_section, 0);
+        assert_eq!(state.cursor_item, MISSION_MAX_VISIBLE_ITEMS - 1);
     }
 
     // ── Insert mode ──────────────────────────────────────────────────────────

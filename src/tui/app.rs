@@ -2158,6 +2158,7 @@ impl App {
     /// Return UUIDs of workspaces that are due for a trajectory regen.
     ///
     /// Thresholds (compile-time defaults, configurable in the future):
+    /// - Mission is empty, OR
     /// - ≥ 10 events since last regen, OR
     /// - ≥ 300 seconds since last regen (with any events pending)
     ///
@@ -2188,6 +2189,20 @@ impl App {
                 // Don't spawn another if one is already running
                 if ws.regen.regen_in_flight {
                     return false;
+                }
+                // Empty Mission is itself a regen signal. This makes newly
+                // provisioned or previously blank workspaces self-heal even
+                // when they have no pending trajectory edit events.
+                let mission_is_empty = ws
+                    .trajectory
+                    .as_ref()
+                    .and_then(|doc| {
+                        doc.section(crate::mc_data::trajectory::SECTION_MISSION)
+                    })
+                    .map(|section| section.items.is_empty())
+                    .unwrap_or(true);
+                if mission_is_empty {
+                    return true;
                 }
                 // Must have at least 1 event pending (time threshold requires some change)
                 if ws.regen.events_since_last_regen == 0 {
@@ -4489,6 +4504,24 @@ workspace: test-ws
         assert!(
             due.is_empty(),
             "workspace with 0 pending events should not be due for regen"
+        );
+    }
+
+    #[test]
+    fn workspaces_due_for_regen_includes_empty_mission_without_events() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.workspaces[0]
+            .trajectory
+            .as_mut()
+            .unwrap()
+            .replace_section_items(crate::mc_data::trajectory::SECTION_MISSION, Vec::new());
+        app.workspaces[0].regen.events_since_last_regen = 0;
+        app.workspaces[0].regen.last_regen_at = None;
+
+        assert_eq!(
+            app.workspaces_due_for_regen(),
+            vec!["test-uuid-1".to_string()],
+            "an empty Mission should self-heal without waiting for edit events"
         );
     }
 

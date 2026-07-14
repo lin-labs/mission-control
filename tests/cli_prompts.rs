@@ -138,6 +138,7 @@ fn gc_moves_stale_rules_and_marks_old_ones() {
         let sixty_five_days_ago = (chrono::Local::now() - chrono::Duration::days(65))
             .format("%Y-%m-%d")
             .to_string();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
         let initial = PromptRules {
             project: "gcproject".to_string(),
@@ -166,7 +167,7 @@ fn gc_moves_stale_rules_and_marks_old_ones() {
                     confidence: Confidence::High,
                     added: "2026-05-23".to_string(),
                     added_by: "ws".to_string(),
-                    last_fired: Some("2026-05-23".to_string()),
+                    last_fired: Some(today),
                     hits: 5,
                 },
             ],

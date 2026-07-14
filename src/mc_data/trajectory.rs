@@ -5,6 +5,10 @@ use std::path::Path;
 pub const SECTION_MISSION: &str = "Mission";
 pub const SECTION_CURRENT_SURFACES: &str = "Current surfaces";
 pub const SECTION_BEADS: &str = "Beads";
+/// Mission detail renders one active row plus this many history rows. Cursor
+/// navigation uses the same cap so it cannot disappear into hidden history.
+pub const MISSION_HISTORY_MAX_VISIBLE_ITEMS: usize = 12;
+pub const MISSION_MAX_VISIBLE_ITEMS: usize = 1 + MISSION_HISTORY_MAX_VISIBLE_ITEMS;
 /// Historical name kept as an API alias. The third trajectory section now
 /// renders Beads issues, replacing the old hand-maintained goal/progress list.
 pub const SECTION_GOALS: &str = SECTION_BEADS;

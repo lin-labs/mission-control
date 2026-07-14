@@ -21,7 +21,10 @@ use crate::tui::app::App;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -191,6 +194,99 @@ impl BinaryStamp {
 
         metadata.len() != self.len || metadata.modified().ok() != self.modified
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailScrollIntent {
+    Up,
+    Down,
+}
+
+fn detail_scroll_context(app: &App) -> bool {
+    if app.focus != crate::tui::app::Focus::Detail {
+        return false;
+    }
+    let Some(ws) = app.selected_workspace() else {
+        return false;
+    };
+    if ws.peek_state.is_some() || ws.dispatch_modal.is_some() {
+        return false;
+    }
+    let in_insert = ws
+        .edit_state
+        .as_ref()
+        .is_some_and(|s| matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. }));
+    !in_insert
+}
+
+fn detail_scroll_intent_from_key(app: &App, key: KeyEvent) -> Option<DetailScrollIntent> {
+    if key.kind != KeyEventKind::Press || !detail_scroll_context(app) {
+        return None;
+    }
+    match (key.code, key.modifiers) {
+        (KeyCode::PageDown, KeyModifiers::NONE) => Some(DetailScrollIntent::Down),
+        (KeyCode::PageUp, KeyModifiers::NONE) => Some(DetailScrollIntent::Up),
+        _ => None,
+    }
+}
+
+fn detail_scroll_intent_from_mouse(app: &App, mouse: MouseEvent) -> Option<DetailScrollIntent> {
+    if !detail_scroll_context(app) {
+        return None;
+    }
+    match mouse.kind {
+        MouseEventKind::ScrollDown => Some(DetailScrollIntent::Down),
+        MouseEventKind::ScrollUp => Some(DetailScrollIntent::Up),
+        _ => None,
+    }
+}
+
+fn apply_detail_scroll(app: &mut App, intent: DetailScrollIntent) {
+    match intent {
+        DetailScrollIntent::Up => app.scroll_up(),
+        DetailScrollIntent::Down => app.scroll_down(),
+    }
+}
+
+fn selected_workspace_has_trajectory(app: &App) -> bool {
+    app.selected_workspace()
+        .is_some_and(|ws| ws.trajectory.is_some())
+}
+
+fn ensure_selected_trajectory_cursor(app: &mut App) {
+    if app.focus != crate::tui::app::Focus::Detail {
+        return;
+    }
+    let Some(ws) = app.workspaces.get_mut(app.selected) else {
+        return;
+    };
+    if ws.trajectory.is_some() && ws.edit_state.is_none() {
+        ws.edit_state = Some(crate::tui::trajectory_edit::TrajectoryEditState::default());
+    }
+}
+
+fn is_trajectory_detail_key(key: KeyEvent) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Char('j')
+            | KeyCode::Down
+            | KeyCode::Char('k')
+            | KeyCode::Up
+            | KeyCode::Char('g')
+            | KeyCode::Char('G')
+            | KeyCode::Char('i')
+            | KeyCode::Char('l')
+            | KeyCode::Right
+            | KeyCode::Enter
+            | KeyCode::Char(' ')
+            | KeyCode::Char('-')
+            | KeyCode::Char('x')
+            | KeyCode::Char('d')
+            | KeyCode::Char('o')
+            | KeyCode::Char('O')
+            | KeyCode::Char('J')
+            | KeyCode::Char('K')
+    )
 }
 
 #[tokio::main]
@@ -577,7 +673,7 @@ async fn run_tui(_tui_config: Config) -> Result<()> {
 
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -598,7 +694,11 @@ async fn run_tui(_tui_config: Config) -> Result<()> {
         .await;
 
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(
+            terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        )?;
         terminal.show_cursor()?;
 
         match result? {
@@ -763,6 +863,8 @@ async fn run_app(
         .expect("spawn input thread");
 
     loop {
+        ensure_selected_trajectory_cursor(&mut app);
+
         terminal.draw(|f| {
             // Split vertically: main area on top, a stable single-line info
             // layer (window/workspace/surface IDs) next, then the single-line
@@ -795,12 +897,19 @@ async fn run_app(
             );
             let bottom_info = app.bottom_info();
             tui::footer::render_info_line(f, vchunks[1], bottom_info.as_deref());
+            let detail_has_trajectory = app.focus == crate::tui::app::Focus::Detail
+                && selected_workspace_has_trajectory(&app);
             match &app.input_mode {
                 crate::tui::command::InputMode::Command(cl) => {
                     tui::footer::render_command_bar(f, vchunks[2], cl);
                 }
                 crate::tui::command::InputMode::Normal => {
-                    tui::footer::render_footer(f, vchunks[2], app.focus);
+                    tui::footer::render_footer(
+                        f,
+                        vchunks[2],
+                        app.focus,
+                        detail_has_trajectory,
+                    );
                 }
             }
         })?;
@@ -820,6 +929,13 @@ async fn run_app(
             // `mc-input` spawn above), so a busy main loop never delays a
             // keypress past the next select! iteration.
             Some(event) = input_rx.recv() => {
+                if let Event::Mouse(mouse) = event {
+                    if let Some(intent) = detail_scroll_intent_from_mouse(&app, mouse) {
+                        apply_detail_scroll(&mut app, intent);
+                    }
+                    continue;
+                }
+
                 if let Event::Key(key) = event {
                     // Only process key press events (not release/repeat)
                     if key.kind != KeyEventKind::Press {
@@ -887,6 +1003,13 @@ async fn run_app(
                             continue; // exclusive owner — never fall through
                         }
 
+                        // Detail view owns page keys for viewport scrolling.
+                        // j/k and Up/Down stay with the trajectory editor cursor.
+                        if let Some(intent) = detail_scroll_intent_from_key(&app, key) {
+                            apply_detail_scroll(&mut app, intent);
+                            continue;
+                        }
+
                         // ── Trajectory key routing ────────────────────────────
                         // When in Detail focus and the selected workspace has a
                         // trajectory loaded, intercept keys for the editor.
@@ -914,25 +1037,7 @@ async fn run_app(
                                     .selected_workspace()
                                     .map_or(false, |ws| ws.peek_state.is_some());
 
-                                let is_traj_nav_key = matches!(
-                                    key.code,
-                                    KeyCode::Char('j')
-                                        | KeyCode::Down
-                                        | KeyCode::Char('k')
-                                        | KeyCode::Up
-                                        | KeyCode::Char('g')
-                                        | KeyCode::Char('G')
-                                        | KeyCode::Char('i')
-                                        | KeyCode::Enter
-                                        | KeyCode::Char(' ')
-                                        | KeyCode::Char('-')
-                                        | KeyCode::Char('x')
-                                        | KeyCode::Char('d')
-                                        | KeyCode::Char('o')
-                                        | KeyCode::Char('O')
-                                        | KeyCode::Char('J')
-                                        | KeyCode::Char('K')
-                                );
+                                let is_traj_nav_key = is_trajectory_detail_key(key);
 
                                 // If the dispatch modal is active for the
                                 // selected workspace, route ALL keys through
@@ -1062,9 +1167,24 @@ async fn run_app(
                                     );
                                 }
                             }
-                            (KeyCode::Char('l') | KeyCode::Right, _) | (KeyCode::Enter, KeyModifiers::NONE) => {
+                            (KeyCode::Char('l') | KeyCode::Right, _) => {
                                 if app.focus == crate::tui::app::Focus::Sidebar {
                                     app.focus = crate::tui::app::Focus::Detail;
+                                    app.detail_scroll = 0;
+                                    ensure_selected_trajectory_cursor(&mut app);
+                                    // Opening the detail panel: generate/refresh the
+                                    // configured-provider "overall" summary for bound
+                                    // agent surfaces (change-gated).
+                                    if let Some(client) = short_text_client.clone() {
+                                        app.spawn_overall_summaries(client);
+                                    }
+                                }
+                            }
+                            (KeyCode::Enter, KeyModifiers::NONE) => {
+                                if app.focus == crate::tui::app::Focus::Sidebar {
+                                    app.focus = crate::tui::app::Focus::Detail;
+                                    app.detail_scroll = 0;
+                                    ensure_selected_trajectory_cursor(&mut app);
                                     // Opening the detail panel: generate/refresh the
                                     // configured-provider "overall" summary for bound
                                     // agent surfaces (change-gated).
@@ -1105,7 +1225,11 @@ async fn run_app(
                                     }
                                     // Suspend TUI
                                     disable_raw_mode()?;
-                                    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                                    execute!(
+                                        terminal.backend_mut(),
+                                        DisableMouseCapture,
+                                        LeaveAlternateScreen
+                                    )?;
                                     terminal.show_cursor()?;
 
                                     let editor = std::env::var("EDITOR")
@@ -1116,7 +1240,11 @@ async fn run_app(
 
                                     // Resume TUI
                                     enable_raw_mode()?;
-                                    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                                    execute!(
+                                        terminal.backend_mut(),
+                                        EnterAlternateScreen,
+                                        EnableMouseCapture
+                                    )?;
                                     terminal.clear()?;
                                     app.load_notes();
                                 }
@@ -1839,4 +1967,175 @@ fn build_summary_context(
     }
 
     parts.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmux::client::Workspace;
+    use crate::tui::app::{
+        DismissalState, Focus, RegenSchedulerState, ScreenInsights, WorkspaceState,
+    };
+    use crate::tui::trajectory_edit::{EditMode, InsertFocus, TrajectoryEditState};
+    use crossterm::event::{KeyEvent, KeyEventState, MouseEvent};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn workspace_state() -> WorkspaceState {
+        WorkspaceState {
+            workspace: Workspace {
+                ref_id: "workspace:1".to_string(),
+                uuid: "test-workspace".to_string(),
+                window_id: Some("window-test".to_string()),
+                window_ref: Some("window:1".to_string()),
+                name: "test".to_string(),
+                description: None,
+                current_directory: None,
+                custom_color: None,
+            },
+            session: None,
+            surfaces: Vec::new(),
+            screen_preview: None,
+            screen_insights: ScreenInsights::default(),
+            tool_call_count: 0,
+            notes: None,
+            mux_status: None,
+            classification: None,
+            loading: false,
+            summary: None,
+            beads: None,
+            summarizing: false,
+            trajectory: None,
+            edit_state: None,
+            peek_state: None,
+            peek_yield_pending: false,
+            regen: RegenSchedulerState::default(),
+            dismissal: DismissalState::default(),
+            dispatch_modal: None,
+            dispatch_pending_outcome: None,
+            dispatch_error: None,
+        }
+    }
+
+    fn detail_app() -> App {
+        let mut app = App::new();
+        app.workspaces.push(workspace_state());
+        app.focus = Focus::Detail;
+        app
+    }
+
+    fn detail_app_with_trajectory() -> App {
+        let mut app = detail_app();
+        app.workspaces[0].trajectory = Some(crate::mc_data::trajectory::TrajectoryDoc::skeleton(
+            "test-workspace",
+            "test",
+            "",
+        ));
+        app
+    }
+
+    #[test]
+    fn detail_focus_initializes_visible_trajectory_cursor() {
+        let mut app = detail_app_with_trajectory();
+
+        assert!(app.workspaces[0].edit_state.is_none());
+        ensure_selected_trajectory_cursor(&mut app);
+
+        let state = app.workspaces[0]
+            .edit_state
+            .as_ref()
+            .expect("Detail trajectory should initialize nav cursor");
+        assert!(matches!(state.mode, EditMode::Nav));
+        assert_eq!(state.cursor_section, 0);
+        assert_eq!(state.cursor_item, 0);
+    }
+
+    #[test]
+    fn l_and_right_are_owned_by_trajectory_detail() {
+        assert!(is_trajectory_detail_key(key(KeyCode::Char('l'))));
+        assert!(is_trajectory_detail_key(key(KeyCode::Right)));
+    }
+
+    #[test]
+    fn page_keys_scroll_plain_detail_view_but_j_k_do_not() {
+        let mut app = detail_app();
+
+        assert_eq!(
+            detail_scroll_intent_from_key(&app, key(KeyCode::Char('j'))),
+            None
+        );
+        assert_eq!(
+            detail_scroll_intent_from_key(&app, key(KeyCode::Char('k'))),
+            None
+        );
+
+        assert_eq!(
+            detail_scroll_intent_from_key(&app, key(KeyCode::PageDown)),
+            Some(DetailScrollIntent::Down)
+        );
+        apply_detail_scroll(&mut app, DetailScrollIntent::Down);
+        assert_eq!(app.detail_scroll, 3);
+
+        assert_eq!(
+            detail_scroll_intent_from_key(&app, key(KeyCode::PageUp)),
+            Some(DetailScrollIntent::Up)
+        );
+        apply_detail_scroll(&mut app, DetailScrollIntent::Up);
+        assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_plain_detail_view() {
+        let mut app = detail_app();
+
+        assert_eq!(
+            detail_scroll_intent_from_mouse(&app, mouse(MouseEventKind::ScrollDown)),
+            Some(DetailScrollIntent::Down)
+        );
+        apply_detail_scroll(&mut app, DetailScrollIntent::Down);
+        assert_eq!(app.detail_scroll, 3);
+
+        assert_eq!(
+            detail_scroll_intent_from_mouse(&app, mouse(MouseEventKind::ScrollUp)),
+            Some(DetailScrollIntent::Up)
+        );
+        apply_detail_scroll(&mut app, DetailScrollIntent::Up);
+        assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn insert_mode_keeps_scroll_inputs_for_editor() {
+        let mut app = detail_app();
+        app.workspaces[0].edit_state = Some(TrajectoryEditState {
+            mode: EditMode::Insert {
+                focus: InsertFocus::Item,
+            },
+            ..TrajectoryEditState::default()
+        });
+
+        assert_eq!(
+            detail_scroll_intent_from_key(&app, key(KeyCode::Char('j'))),
+            None
+        );
+        assert_eq!(
+            detail_scroll_intent_from_mouse(&app, mouse(MouseEventKind::ScrollDown)),
+            None
+        );
+    }
 }

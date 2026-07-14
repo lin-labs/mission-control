@@ -1,7 +1,10 @@
 use std::collections::HashSet;
 
 use crate::mc_data::surface_kind::SurfaceKind;
-use crate::mc_data::trajectory::{SECTION_CURRENT_SURFACES, SECTION_GOALS, Section, TrajectoryDoc};
+use crate::mc_data::trajectory::{
+    MISSION_HISTORY_MAX_VISIBLE_ITEMS, SECTION_CURRENT_SURFACES, SECTION_GOALS, Section,
+    TrajectoryDoc,
+};
 use crate::tui::peek_view::PeekState;
 use crate::tui::trajectory_edit::{EditMode, InsertFocus, TrajectoryEditState};
 use ratatui::{
@@ -11,6 +14,8 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
+
+const ACTIVE_MISSION_MAX_CHARS: usize = 110;
 
 /// Map a kind to the text color used for its glyph + label in surface rows.
 pub fn kind_color(kind: SurfaceKind) -> Color {
@@ -264,6 +269,22 @@ fn is_goals_section(section: &Section) -> bool {
     section.name == SECTION_GOALS
 }
 
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in text.chars().enumerate() {
+        if idx >= max_chars {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn mission_display_text(text: &str) -> String {
+    truncate_chars(text.trim(), ACTIVE_MISSION_MAX_CHARS)
+}
+
 /// Per-section, per-item context for dim-glyph decisions. Empty by default.
 #[derive(Default, Debug, Clone)]
 pub struct RenderHints {
@@ -372,6 +393,12 @@ pub fn render_with_hints(
     // to scroll the viewport so the cursor stays visible as `j`/`k` move it.
     let mut cursor_line: Option<u16> = None;
     for (sec_idx, section) in doc.sections.iter().enumerate() {
+        if section.name == crate::mc_data::trajectory::SECTION_MISSION {
+            render_mission_section(&mut lines, section, sec_idx, edit_state);
+            lines.push(Line::raw(""));
+            continue;
+        }
+
         // Determine whether the cursor is "on" this section's header, which
         // happens when the section is empty and cursor_section == sec_idx.
         let is_header_cursor = edit_state
@@ -608,10 +635,179 @@ pub fn render_with_hints(
     }
 }
 
+fn mission_insert_line<'a>(
+    prefix: &str,
+    display_text: &str,
+    edit_state: &TrajectoryEditState,
+) -> Line<'a> {
+    let cursor_col = edit_state.cursor_col;
+    let chars: Vec<char> = display_text.chars().collect();
+    let before: String = chars[..cursor_col.min(chars.len())].iter().collect();
+    let cursor_char: String = if cursor_col < chars.len() {
+        chars[cursor_col].to_string()
+    } else {
+        " ".to_string()
+    };
+    let after: String = if cursor_col + 1 < chars.len() {
+        chars[cursor_col + 1..].iter().collect()
+    } else {
+        String::new()
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("{prefix}{before}"),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            cursor_char,
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        ),
+        Span::styled(
+            after,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn mission_item_line<'a>(
+    prefix: &str,
+    text: &str,
+    nav_cursor: bool,
+    insert_state: Option<&TrajectoryEditState>,
+) -> Line<'a> {
+    if let Some(state) = insert_state {
+        return mission_insert_line(prefix, state.edit_buffer.as_str(), state);
+    }
+
+    let display = mission_display_text(text);
+    if nav_cursor {
+        Line::from(Span::styled(
+            format!("{prefix}{display}"),
+            Style::default().fg(Color::Black).bg(Color::Cyan),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!("{prefix}{display}"),
+            Style::default().fg(Color::Gray),
+        ))
+    }
+}
+
+fn render_mission_section<'a>(
+    lines: &mut Vec<Line<'a>>,
+    section: &'a Section,
+    sec_idx: usize,
+    edit_state: Option<&TrajectoryEditState>,
+) {
+    let header_cursor = edit_state
+        .map(|s| {
+            s.cursor_section == sec_idx
+                && s.cursor_item == 0
+                && section.items.is_empty()
+                && matches!(s.mode, EditMode::Nav)
+        })
+        .unwrap_or(false);
+
+    lines.push(Line::from(Span::styled(
+        format!("## {}", section.name),
+        if header_cursor {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        },
+    )));
+
+    let Some(active) = section.items.first() else {
+        lines.push(Line::from(Span::styled(
+            "  (empty)",
+            Style::default().fg(Color::DarkGray),
+        )));
+        return;
+    };
+
+    let active_cursor = edit_state
+        .map(|s| {
+            s.cursor_section == sec_idx && s.cursor_item == 0 && matches!(s.mode, EditMode::Nav)
+        })
+        .unwrap_or(false);
+    let active_insert = edit_state.filter(|s| {
+        s.cursor_section == sec_idx
+            && s.cursor_item == 0
+            && matches!(s.mode, EditMode::Insert { .. })
+    });
+    lines.push(mission_item_line(
+        "- ",
+        &active.text,
+        active_cursor,
+        active_insert,
+    ));
+
+    if section.items.len() <= 1 {
+        return;
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "## Mission history",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    for (history_idx, item) in section
+        .items
+        .iter()
+        .enumerate()
+        .skip(1)
+        .take(MISSION_HISTORY_MAX_VISIBLE_ITEMS)
+    {
+        let cursor = edit_state
+            .map(|s| {
+                s.cursor_section == sec_idx
+                    && s.cursor_item == history_idx
+                    && matches!(s.mode, EditMode::Nav)
+            })
+            .unwrap_or(false);
+        let insert_state = edit_state.filter(|s| {
+            s.cursor_section == sec_idx
+                && s.cursor_item == history_idx
+                && matches!(s.mode, EditMode::Insert { .. })
+        });
+        let insert_cursor = insert_state.is_some();
+        let mut line = mission_item_line("- ", &item.text, cursor, insert_state);
+        if !cursor && !insert_cursor {
+            for span in &mut line.spans {
+                span.style = span.style.fg(Color::DarkGray);
+            }
+        }
+        lines.push(line);
+    }
+
+    let hidden = section
+        .items
+        .len()
+        .saturating_sub(1 + MISSION_HISTORY_MAX_VISIBLE_ITEMS);
+    if hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  (+{hidden} more parked mission notes hidden)"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::trajectory_edit::TrajectoryEditState;
+    use crate::tui::trajectory_edit::{EditMode, InsertFocus, TrajectoryEditState};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -643,6 +839,118 @@ workspace: predinvest
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn mission_section_renders_one_active_bullet_and_parks_extra_notes() {
+        let section = Section {
+            name: crate::mc_data::trajectory::SECTION_MISSION.to_string(),
+            items: vec![
+                crate::mc_data::trajectory::Item {
+                    text: "Active mission for the current conversation".to_string(),
+                    is_checkbox: false,
+                    checked: None,
+                    surface_id: None,
+                },
+                crate::mc_data::trajectory::Item {
+                    text: "Older setup instruction that should not be active mission".to_string(),
+                    is_checkbox: false,
+                    checked: None,
+                    surface_id: None,
+                },
+                crate::mc_data::trajectory::Item {
+                    text: "Parked follow-up context".to_string(),
+                    is_checkbox: false,
+                    checked: None,
+                    surface_id: None,
+                },
+            ],
+        };
+        let mut lines = Vec::new();
+
+        render_mission_section(&mut lines, &section, 0, None);
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert_eq!(rendered[0], "## Mission");
+        assert_eq!(rendered[1], "- Active mission for the current conversation");
+        assert!(
+            rendered.iter().any(|line| line == "## Mission history"),
+            "extra mission bullets should move out of the active Mission slot: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("Older setup instruction")),
+            "older mission notes should still be visible as history: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn mission_section_stays_condensed_while_editing_active_mission() {
+        let mut items = vec![crate::mc_data::trajectory::Item {
+            text: "Active mission before edit".to_string(),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        }];
+        for idx in 1..=15 {
+            items.push(crate::mc_data::trajectory::Item {
+                text: format!("Older mission {idx:02}"),
+                is_checkbox: false,
+                checked: None,
+                surface_id: None,
+            });
+        }
+        let section = Section {
+            name: crate::mc_data::trajectory::SECTION_MISSION.to_string(),
+            items,
+        };
+        let edit_state = TrajectoryEditState {
+            mode: EditMode::Insert {
+                focus: InsertFocus::Item,
+            },
+            edit_buffer: "Edited active mission".to_string(),
+            cursor_col: 6,
+            ..TrajectoryEditState::default()
+        };
+        let mut lines = Vec::new();
+
+        render_mission_section(&mut lines, &section, 0, Some(&edit_state));
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert_eq!(rendered[0], "## Mission");
+        assert_eq!(rendered[1], "- Edited active mission");
+        assert!(
+            rendered.iter().any(|line| line == "## Mission history"),
+            "history remains outside the active Mission slot: {rendered:?}"
+        );
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|line| line.starts_with("- Older mission"))
+                .count(),
+            MISSION_HISTORY_MAX_VISIBLE_ITEMS,
+            "history should be capped while editing: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("more parked mission notes hidden")),
+            "hidden history count should remain visible: {rendered:?}"
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("Older mission 13")),
+            "old Mission items beyond the cap should stay hidden: {rendered:?}"
+        );
     }
 
     #[test]
@@ -1352,19 +1660,21 @@ workspace: bare
 
     #[test]
     fn nav_cursor_scrolls_viewport_into_view() {
-        // A Mission section longer than the viewport; the cursor on a late
-        // bullet must be visible (viewport follows the cursor), and the first
-        // bullet must have scrolled off-screen.
-        let mut md = String::from("---\n{}\n---\n\n## Mission\n");
+        // A Beads section longer than the viewport; the cursor on a late row
+        // must be visible (viewport follows the cursor), and the first row
+        // must have scrolled off-screen. Mission history is intentionally
+        // capped, so it is not a valid unbounded-scroll fixture.
+        let mut md = String::from(
+            "---\n{}\n---\n\n## Mission\n- active mission\n\n## Current surfaces\n\n## Beads\n",
+        );
         for i in 0..30 {
-            md.push_str(&format!("- mission bullet number {i:02}\n"));
+            md.push_str(&format!("- [ ] bead item number {i:02}\n"));
         }
-        md.push_str("\n## Current surfaces\n\n## Beads\n");
         let doc = TrajectoryDoc::parse(&md).unwrap();
 
         let mut state = TrajectoryEditState::default();
-        state.cursor_section = 0; // Mission
-        state.cursor_item = 27; // a late bullet, well past one screenful
+        state.cursor_section = 2; // Beads
+        state.cursor_item = 27; // a late row, well past one screenful
 
         let backend = TestBackend::new(60, 12);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1384,12 +1694,12 @@ workspace: bare
             .unwrap();
         let dump = buf_dump(&terminal);
         assert!(
-            dump.contains("mission bullet number 27"),
-            "cursor bullet should be visible: {dump}"
+            dump.contains("bead item number 27"),
+            "cursor row should be visible: {dump}"
         );
         assert!(
-            !dump.contains("mission bullet number 00"),
-            "viewport should have scrolled past the first bullet: {dump}"
+            !dump.contains("bead item number 00"),
+            "viewport should have scrolled past the first row: {dump}"
         );
     }
 }

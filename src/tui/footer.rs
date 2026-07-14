@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 /// Render the keyboard-shortcut footer line.
-pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus) {
+pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus, detail_has_trajectory: bool) {
     let key_style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
@@ -29,8 +29,21 @@ pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus) {
             ("^r", "reload"),
             ("q", "quit"),
         ],
+        Focus::Detail if detail_has_trajectory => &[
+            ("j/k", "cursor"),
+            ("⏎/i", "edit/act"),
+            ("pg/wheel", "scroll"),
+            ("h/esc", "back"),
+            (":", "cmd"),
+            ("s", "rescreen"),
+            ("r", "summarize"),
+            ("^r", "reload"),
+            ("n", "notes"),
+            ("q", "quit"),
+        ],
         Focus::Detail => &[
-            ("j/k", "scroll"),
+            ("j/k", "navigate"),
+            ("pg/wheel", "scroll"),
             ("h/esc", "back"),
             ("⏎", "switch ws"),
             (":", "cmd"),

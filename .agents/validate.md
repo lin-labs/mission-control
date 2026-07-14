@@ -567,6 +567,29 @@ branch):
 See AGENTS.shared.md "Sprint Completion Contract" for the cross-project
 codification.
 
+### F13 — LLM regen persists an empty Mission
+
+**Symptom**: the Detail pane renders `## Mission` followed by `(empty)` even
+though the workspace has human conversation or surface summaries.
+
+**Root cause**: prompt instructions requested Mission content, but the regen
+post-processor accepted a parseable model response whose Mission section had
+zero items. Prompt compliance alone was treated as the invariant.
+
+**Prevention checklist** for trajectory regen changes:
+
+1. Reconcile Mission after parsing the model response: last saved Mission
+   first, latest human ask second, compact session/surface summaries third,
+   and a short workspace fallback last.
+2. Keep every synthesized fallback bullet at or below 110 characters and cap
+   conversation-derived fallback at three bullets.
+3. Run `cargo test --test llm_regen -- --test-threads=1`; coverage must include
+   saved-human precedence, latest-ask fallback, conversation-summary fallback,
+   and the no-signal non-empty invariant.
+4. Tier 4: launch global `mc`, open an actually empty active workspace, press
+   `R`, wait for regen, and verify both the rendered pane and its on-disk
+   `trajectory.md` contain a Mission bullet.
+
 ---
 
 ## Per-area validation cheat sheets

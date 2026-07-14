@@ -57,6 +57,19 @@ fn build_prompt_contains_trajectory_text() {
         combined.contains("Build a thing"),
         "prompt should contain the trajectory content"
     );
+    assert!(
+        p.system
+            .contains("`## Mission` must never be empty"),
+        "prompt should require a non-empty Mission"
+    );
+    assert!(
+        p.system.contains("Human-authored Mission text is primary"),
+        "prompt should prioritize human Mission input"
+    );
+    assert!(
+        p.system.contains("Do not append instructions, old asks"),
+        "prompt should reject accumulated Mission bullets"
+    );
 }
 
 #[test]
@@ -217,6 +230,120 @@ async fn regenerate_parses_valid_trajectory_response() {
         doc.section("Mission").is_some(),
         "parsed doc should have a Mission section"
     );
+}
+
+fn mission_texts(doc: &mission_control::mc_data::trajectory::TrajectoryDoc) -> Vec<String> {
+    doc.section("Mission")
+        .map(|section| section.items.iter().map(|item| item.text.clone()).collect())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn regenerate_preserves_saved_human_mission_as_primary() {
+    let model_response = "---\nworkspace: test-ws\n---\n\n## Mission\n- Model guessed a different mission\n\n## Current surfaces\n\n## Beads\n";
+    let summarizer: Arc<dyn Summarizer> = Arc::new(MockSummarizer {
+        response: model_response.to_string(),
+    });
+    let inputs = RegenInputs {
+        workspace_name: "test-ws".to_string(),
+        current_trajectory: "## Mission\n- Ship the human-selected outcome\n".to_string(),
+        recent_events: vec![],
+        recent_user_explanations: vec![],
+        session_bullets: vec![],
+        surface_summaries: vec![],
+        tool_call_count: 0,
+        cmux_surface_order: vec![],
+        user_ask: Some("Do something newer".to_string()),
+    };
+
+    let doc = regenerate(&summarizer, &inputs).await.unwrap();
+    assert_eq!(
+        mission_texts(&doc).first().map(String::as_str),
+        Some("Ship the human-selected outcome")
+    );
+}
+
+#[tokio::test]
+async fn regenerate_fills_empty_mission_from_latest_human_ask() {
+    let empty_response = "---\nworkspace: test-ws\n---\n\n## Mission\n\n## Current surfaces\n\n## Beads\n";
+    let summarizer: Arc<dyn Summarizer> = Arc::new(MockSummarizer {
+        response: empty_response.to_string(),
+    });
+    let inputs = RegenInputs {
+        workspace_name: "test-ws".to_string(),
+        current_trajectory: "## Mission\n".to_string(),
+        recent_events: vec![],
+        recent_user_explanations: vec![],
+        session_bullets: vec![],
+        surface_summaries: vec![],
+        tool_call_count: 0,
+        cmux_surface_order: vec![],
+        user_ask: Some(
+            "Make Mission reliable and concise even when the model returns an empty section"
+                .to_string(),
+        ),
+    };
+
+    let doc = regenerate(&summarizer, &inputs).await.unwrap();
+    let mission = mission_texts(&doc);
+    assert_eq!(mission.len(), 1);
+    assert!(mission[0].contains("Make Mission reliable and concise"));
+    assert!(mission[0].chars().count() <= 110, "fallback must stay short");
+}
+
+#[tokio::test]
+async fn regenerate_fills_empty_mission_from_conversation_summaries() {
+    let empty_response = "---\nworkspace: test-ws\n---\n\n## Mission\n\n## Current surfaces\n\n## Beads\n";
+    let summarizer: Arc<dyn Summarizer> = Arc::new(MockSummarizer {
+        response: empty_response.to_string(),
+    });
+    let inputs = RegenInputs {
+        workspace_name: "test-ws".to_string(),
+        current_trajectory: "## Mission\n".to_string(),
+        recent_events: vec![],
+        recent_user_explanations: vec![],
+        session_bullets: vec![
+            "- Finish OpenAI provider integration".to_string(),
+            "- Verify the live cmux warning path".to_string(),
+        ],
+        surface_summaries: vec![(
+            "surface:2".to_string(),
+            "Rebuilding Mission Control".to_string(),
+        )],
+        tool_call_count: 0,
+        cmux_surface_order: vec![],
+        user_ask: None,
+    };
+
+    let doc = regenerate(&summarizer, &inputs).await.unwrap();
+    let mission = mission_texts(&doc);
+    assert!(!mission.is_empty(), "conversation fallback must populate Mission");
+    assert!(mission.len() <= 3, "fallback should remain compact: {mission:?}");
+    assert!(mission.iter().all(|item| item.chars().count() <= 110));
+    assert!(mission[0].contains("OpenAI provider integration"));
+}
+
+#[tokio::test]
+async fn regenerate_never_leaves_mission_empty_without_signals() {
+    let empty_response =
+        "---\nworkspace: test-ws\n---\n\n## Mission\n\n## Current surfaces\n\n## Beads\n";
+    let summarizer: Arc<dyn Summarizer> = Arc::new(MockSummarizer {
+        response: empty_response.to_string(),
+    });
+    let inputs = RegenInputs {
+        workspace_name: "test-ws".to_string(),
+        current_trajectory: "## Mission\n".to_string(),
+        recent_events: vec![],
+        recent_user_explanations: vec![],
+        session_bullets: vec![],
+        surface_summaries: vec![],
+        tool_call_count: 0,
+        cmux_surface_order: vec![],
+        user_ask: None,
+    };
+
+    let doc = regenerate(&summarizer, &inputs).await.unwrap();
+    assert_eq!(mission_texts(&doc), vec!["Continue work in test-ws"]);
 }
 
 #[tokio::test]

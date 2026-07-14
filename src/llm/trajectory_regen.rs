@@ -1,13 +1,16 @@
 use crate::llm::Summarizer;
 use crate::mc_data::events::Event;
-use crate::mc_data::trajectory::TrajectoryDoc;
+use crate::mc_data::trajectory::{Item, SECTION_MISSION, TrajectoryDoc};
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Hard cap on Mission bullets. The prompt asks the model to stay under this;
 /// `clean_mission` enforces it deterministically (and strips process-noise
 /// bullets) so a misbehaving model can't grow Mission unbounded.
 pub const MISSION_MAX_BULLETS: usize = 6;
+const MISSION_FALLBACK_MAX_BULLETS: usize = 3;
+const MISSION_BULLET_MAX_CHARS: usize = 110;
 
 pub struct RegenInputs {
     pub workspace_name: String,
@@ -42,8 +45,121 @@ pub async fn regenerate(
         .await?;
     let mut doc = TrajectoryDoc::parse(&response)
         .with_context(|| "LLM returned invalid markdown for trajectory regeneration")?;
-    clean_mission(&mut doc);
+    doc.ensure_sections();
+    reconcile_mission(&mut doc, inputs);
     Ok(doc)
+}
+
+/// Make Mission deterministic around the LLM:
+///
+/// 1. The last saved Mission is user-owned and remains authoritative.
+/// 2. A useful model-generated Mission is accepted when no saved Mission exists.
+/// 3. An empty model result is repaired from direct human input, then compact
+///    conversation summaries, and finally the workspace name.
+fn reconcile_mission(doc: &mut TrajectoryDoc, inputs: &RegenInputs) {
+    clean_mission(doc);
+
+    let saved_items = TrajectoryDoc::parse(&inputs.current_trajectory)
+        .ok()
+        .and_then(|saved| saved.section(SECTION_MISSION).cloned())
+        .map(|section| {
+            section
+                .items
+                .into_iter()
+                .filter(|item| !item.text.trim().is_empty())
+                .take(MISSION_MAX_BULLETS)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !saved_items.is_empty() {
+        doc.replace_section_items(SECTION_MISSION, saved_items);
+        return;
+    }
+
+    let generated_is_empty = doc
+        .section(SECTION_MISSION)
+        .map(|section| section.items.is_empty())
+        .unwrap_or(true);
+    if generated_is_empty {
+        doc.replace_section_items(SECTION_MISSION, fallback_mission_items(inputs));
+    }
+}
+
+fn fallback_mission_items(inputs: &RegenInputs) -> Vec<Item> {
+    if let Some(ask) = inputs.user_ask.as_deref().and_then(short_mission_bullet) {
+        return vec![mission_item(ask)];
+    }
+
+    if let Some(explanation) = inputs
+        .recent_user_explanations
+        .iter()
+        .rev()
+        .find_map(|text| short_mission_bullet(text))
+    {
+        return vec![mission_item(explanation)];
+    }
+
+    let mut bullets = Vec::new();
+    let mut seen = HashSet::new();
+    let summaries = inputs.session_bullets.iter().map(String::as_str).chain(
+        inputs
+            .surface_summaries
+            .iter()
+            .map(|(_, summary)| summary.as_str()),
+    );
+    for summary in summaries {
+        let Some(bullet) = short_mission_bullet(summary) else {
+            continue;
+        };
+        if seen.insert(bullet.to_lowercase()) {
+            bullets.push(mission_item(bullet));
+        }
+        if bullets.len() == MISSION_FALLBACK_MAX_BULLETS {
+            break;
+        }
+    }
+
+    if bullets.is_empty() {
+        let fallback = short_mission_bullet(&format!("Continue work in {}", inputs.workspace_name))
+            .unwrap_or_else(|| "Clarify the workspace mission".to_string());
+        bullets.push(mission_item(fallback));
+    }
+    bullets
+}
+
+fn mission_item(text: String) -> Item {
+    Item {
+        text,
+        is_checkbox: false,
+        checked: None,
+        surface_id: None,
+    }
+}
+
+fn short_mission_bullet(text: &str) -> Option<String> {
+    let mut text = text.trim();
+    if let Some(stripped) = text.strip_prefix("- [ ] ") {
+        text = stripped;
+    } else if let Some(stripped) = text.strip_prefix("- [x] ") {
+        text = stripped;
+    } else if let Some(stripped) = text.strip_prefix("- [X] ") {
+        text = stripped;
+    } else if let Some(stripped) = text.strip_prefix("- ") {
+        text = stripped;
+    }
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.chars().count() <= MISSION_BULLET_MAX_CHARS {
+        return Some(normalized);
+    }
+    let mut shortened = normalized
+        .chars()
+        .take(MISSION_BULLET_MAX_CHARS - 1)
+        .collect::<String>();
+    shortened.push('…');
+    Some(shortened)
 }
 
 /// Strip process-noise bullets from the Mission section and cap it at
@@ -91,14 +207,11 @@ pub fn build_prompt(inputs: &RegenInputs) -> RegenPrompt {
     system.push_str("  add -> user identified gap; preserve and build on it\n");
     system.push_str("  edit -> user rephrased; treat new phrasing as authoritative\n");
     system.push_str("  move -> user re-ordered; respect the priority signal\n");
-    system.push_str(&format!(
-        "- ## Mission is a SHORT list of at most {MISSION_MAX_BULLETS} bullets capturing \
-         the durable goal(s) and standing constraints for this workspace. Refine it IN \
-         PLACE: merge overlapping bullets, drop stale or redundant ones, keep only what \
-         still matters. NEVER add a bullet that merely restates activity, tool-call counts, \
-         or says a signal \"adds process only\" / \"adds process not scope\" — that is noise; \
-         omit it entirely. If nothing durable changed, leave Mission unchanged.\n"
-    ));
+    system.push_str("- `## Mission` must never be empty. Human-authored Mission text is primary: preserve its wording and keep it first.\n");
+    system.push_str("  When no saved Mission exists, write one very short bullet (under ~110 characters) from the user's latest ask.\n");
+    system.push_str("  If there is no latest ask, write up to three very short bullets summarizing the active conversations and surface focus.\n");
+    system.push_str("  Do not append instructions, old asks, process rules, subtask checklists, activity/tool-call counts, or \"adds process only\" / \"adds process not scope\" filler.\n");
+    system.push_str("  If prior work is still useful context, represent it as Beads done/open rows when grounded; otherwise leave it out.\n");
     system.push_str("- Each `## Current surfaces` line ends with `<!-- mc:surface:<sid> -->`.\n");
     system.push_str("  Preserve these markers exactly. Do not invent surface IDs.\n");
     system.push_str("- `## Beads` is sourced from repo-local Beads issues when available.\n");
