@@ -5,6 +5,98 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::time::Duration;
+use tokio::process::Command;
+
+const GCP_PROJECT: &str = "reflectionai";
+const GCP_SECRET: &str = "OPENAI_API_KEY_AGENTIC";
+const GCP_SECRET_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyResolution {
+    pub api_key: Option<String>,
+    pub warning: Option<String>,
+}
+
+/// Resolve an OpenAI key without persisting or logging it. Explicit CLI/env
+/// configuration wins; otherwise use the machine's gcloud authentication.
+pub async fn resolve_api_key(explicit: Option<String>) -> ApiKeyResolution {
+    let args = [
+        "secrets",
+        "versions",
+        "access",
+        "latest",
+        "--secret",
+        GCP_SECRET,
+        "--project",
+        GCP_PROJECT,
+    ];
+    resolve_api_key_with_command(explicit, "gcloud", &args, GCP_SECRET_TIMEOUT).await
+}
+
+async fn resolve_api_key_with_command(
+    explicit: Option<String>,
+    binary: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> ApiKeyResolution {
+    if let Some(key) = explicit
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+    {
+        return ApiKeyResolution {
+            api_key: Some(key),
+            warning: None,
+        };
+    }
+
+    let mut command = Command::new(binary);
+    command.args(args).kill_on_drop(true);
+    match tokio::time::timeout(timeout, command.output()).await {
+        Err(_) => ApiKeyResolution {
+            api_key: None,
+            warning: Some(
+                "OpenAI key unavailable: gcloud secret lookup timed out; authenticate gcloud and reload mc"
+                    .to_string(),
+            ),
+        },
+        Ok(Err(_)) => ApiKeyResolution {
+            api_key: None,
+            warning: Some(
+                "OpenAI key unavailable: could not run gcloud; install/authenticate gcloud and reload mc"
+                    .to_string(),
+            ),
+        },
+        Ok(Ok(output)) if !output.status.success() => ApiKeyResolution {
+            api_key: None,
+            warning: Some(format!(
+                "OpenAI key unavailable: gcloud secret lookup failed (exit {}); authenticate gcloud and reload mc",
+                output
+                    .status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "signal".to_string())
+            )),
+        },
+        Ok(Ok(output)) => {
+            let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if key.is_empty() {
+                ApiKeyResolution {
+                    api_key: None,
+                    warning: Some(
+                        "OpenAI key unavailable: gcloud secret lookup returned an empty value; reload mc after fixing access"
+                            .to_string(),
+                    ),
+                }
+            } else {
+                ApiKeyResolution {
+                    api_key: Some(key),
+                    warning: None,
+                }
+            }
+        }
+    }
+}
 
 pub struct OpenAISummarizer {
     client: Client,
@@ -193,4 +285,76 @@ fn parse_summary(text: &str) -> Result<Summary> {
         trajectory,
         next_steps,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn explicit_key_skips_external_lookup() {
+        let result = resolve_api_key_with_command(
+            Some("  explicit-key\n".into()),
+            "/definitely/missing/gcloud",
+            &[],
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(result.api_key.as_deref(), Some("explicit-key"));
+        assert_eq!(result.warning, None);
+    }
+
+    #[tokio::test]
+    async fn successful_lookup_trims_key() {
+        let result = resolve_api_key_with_command(
+            None,
+            "/bin/sh",
+            &["-c", "printf 'secret-from-gcloud\\n'"],
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(result.api_key.as_deref(), Some("secret-from-gcloud"));
+        assert_eq!(result.warning, None);
+    }
+
+    #[tokio::test]
+    async fn failed_lookup_is_sanitized() {
+        let result = resolve_api_key_with_command(
+            None,
+            "/bin/sh",
+            &["-c", "printf 'sensitive stderr' >&2; exit 7"],
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(result.api_key, None);
+        let warning = result.warning.unwrap();
+        assert!(warning.contains("exit 7"));
+        assert!(!warning.contains("sensitive"));
+    }
+
+    #[tokio::test]
+    async fn empty_lookup_is_non_fatal() {
+        let result = resolve_api_key_with_command(
+            None,
+            "/bin/sh",
+            &["-c", "printf '  \n'"],
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(result.api_key, None);
+        assert!(result.warning.unwrap().contains("empty value"));
+    }
+
+    #[tokio::test]
+    async fn timed_out_lookup_is_non_fatal() {
+        let result = resolve_api_key_with_command(
+            None,
+            "/bin/sh",
+            &["-c", "sleep 1"],
+            Duration::from_millis(5),
+        )
+        .await;
+        assert_eq!(result.api_key, None);
+        assert!(result.warning.unwrap().contains("timed out"));
+    }
 }

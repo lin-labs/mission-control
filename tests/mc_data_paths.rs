@@ -7,6 +7,14 @@ fn data_root_under_home_data_mission_control() {
 }
 
 #[test]
+fn local_config_lives_in_machine_state_root() {
+    assert_eq!(
+        paths::local_config_path(),
+        paths::data_root().join("config.json")
+    );
+}
+
+#[test]
 fn workspace_dir_uses_active_uuid() {
     let p = paths::workspace_dir("7f3a-uuid");
     assert!(p.ends_with("data/mission-control/active/7f3a-uuid"));

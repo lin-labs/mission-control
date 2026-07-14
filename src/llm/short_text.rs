@@ -1,46 +1,174 @@
-//! One-shot xAI Grok client for short string generations.
+//! One-shot provider client for short, structured string generations.
 //!
-//! Today's only caller is workspace goal-prefix generation
-//! (`MSC` for `mission-control`). The xAI API is OpenAI-compatible at
-//! `https://api.x.ai/v1`, so we use the chat completions shape with a
-//! tiny prompt and `max_tokens: 8` to keep the round-trip cheap.
+//! xAI uses its OpenAI-compatible Chat Completions endpoint. OpenAI uses the
+//! Responses API. The selected provider is machine-local and authoritative;
+//! callers retain their deterministic/no-result fallbacks when it fails.
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 const XAI_ENDPOINT: &str = "https://api.x.ai/v1/chat/completions";
+const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 /// Default xAI model. Their lineup shifts; this name is the current
 /// "small + fast" tier (verified live 2026-05-25 against
 /// https://api.x.ai/v1/models).
 const DEFAULT_MODEL: &str = "grok-4-fast-non-reasoning";
 
+#[derive(Clone)]
+pub struct ShortTextClient {
+    http: reqwest::Client,
+    transport: Transport,
+}
+
+#[derive(Clone)]
+enum Transport {
+    Xai { api_key: String },
+    Openai { api_key: String, model: String },
+}
+
 #[derive(Serialize)]
-struct Request<'a> {
+struct XaiRequest<'a> {
     model: &'a str,
-    messages: Vec<Message<'a>>,
+    messages: Vec<XaiMessage<'a>>,
     temperature: f32,
     max_tokens: u32,
 }
 
 #[derive(Serialize)]
-struct Message<'a> {
+struct XaiMessage<'a> {
     role: &'a str,
     content: &'a str,
 }
 
 #[derive(Deserialize)]
-struct Response {
-    choices: Vec<Choice>,
+struct XaiResponse {
+    choices: Vec<XaiChoice>,
 }
 
 #[derive(Deserialize)]
-struct Choice {
-    message: ChoiceMessage,
+struct XaiChoice {
+    message: XaiChoiceMessage,
 }
 
 #[derive(Deserialize)]
-struct ChoiceMessage {
+struct XaiChoiceMessage {
     content: String,
+}
+
+#[derive(Deserialize)]
+struct OpenaiResponse {
+    #[serde(default)]
+    output: Vec<OpenaiOutputItem>,
+}
+
+#[derive(Deserialize)]
+struct OpenaiOutputItem {
+    #[serde(default)]
+    content: Vec<OpenaiContentItem>,
+}
+
+#[derive(Deserialize)]
+struct OpenaiContentItem {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: String,
+}
+
+impl ShortTextClient {
+    pub fn xai(api_key: String) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            transport: Transport::Xai { api_key },
+        }
+    }
+
+    pub fn openai(api_key: String, model: String) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            transport: Transport::Openai { api_key, model },
+        }
+    }
+
+    pub fn provider_name(&self) -> &'static str {
+        match self.transport {
+            Transport::Xai { .. } => "xAI",
+            Transport::Openai { .. } => "OpenAI",
+        }
+    }
+
+    async fn complete(&self, user_prompt: &str, max_tokens: u32) -> Result<String> {
+        match &self.transport {
+            Transport::Xai { api_key } => {
+                let body = XaiRequest {
+                    model: DEFAULT_MODEL,
+                    messages: vec![XaiMessage {
+                        role: "user",
+                        content: user_prompt,
+                    }],
+                    temperature: 0.0,
+                    max_tokens,
+                };
+                let resp = self
+                    .http
+                    .post(XAI_ENDPOINT)
+                    .bearer_auth(api_key)
+                    .json(&body)
+                    .send()
+                    .await
+                    .context("xAI request failed")?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("xAI HTTP {}: {}", status, text);
+                }
+                let parsed: XaiResponse = resp.json().await.context("xAI parse")?;
+                parsed
+                    .choices
+                    .into_iter()
+                    .next()
+                    .map(|choice| choice.message.content)
+                    .ok_or_else(|| anyhow!("xAI returned no choices"))
+            }
+            Transport::Openai { api_key, model } => {
+                let body = json!({
+                    "model": model,
+                    "input": user_prompt,
+                    "instructions": "Follow the requested output format exactly.",
+                    "reasoning": { "effort": "none" },
+                    // Responses counts reasoning and visible output together;
+                    // 16 is the practical floor for even a three-letter reply.
+                    "max_output_tokens": max_tokens.max(16),
+                });
+                let resp = self
+                    .http
+                    .post(OPENAI_ENDPOINT)
+                    .bearer_auth(api_key)
+                    .json(&body)
+                    .send()
+                    .await
+                    .context("OpenAI request failed")?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("OpenAI HTTP {}: {}", status, text);
+                }
+                let parsed: OpenaiResponse = resp.json().await.context("OpenAI parse")?;
+                extract_openai_output_text(parsed)
+                    .ok_or_else(|| anyhow!("OpenAI returned no output_text"))
+            }
+        }
+    }
+}
+
+fn extract_openai_output_text(response: OpenaiResponse) -> Option<String> {
+    response
+        .output
+        .into_iter()
+        .flat_map(|item| item.content)
+        .find(|item| item.kind == "output_text" && !item.text.trim().is_empty())
+        .map(|item| item.text)
 }
 
 /// Generate a 3-letter uppercase prefix for a workspace name. Avoids any
@@ -51,7 +179,7 @@ struct ChoiceMessage {
 /// invalid output, second-try collision) returns an error; the caller is
 /// expected to fall through to the deterministic helper.
 pub async fn generate_workspace_prefix(
-    api_key: &str,
+    client: &ShortTextClient,
     workspace_name: &str,
     used_prefixes: &[String],
 ) -> Result<String> {
@@ -63,7 +191,10 @@ pub async fn generate_workspace_prefix(
 
     let attempt = |extra_avoid: Option<&str>| -> String {
         let avoid_clause = match extra_avoid {
-            Some(bad) => format!(" Also avoid '{}' (you suggested that and it was rejected).", bad),
+            Some(bad) => format!(
+                " Also avoid '{}' (you suggested that and it was rejected).",
+                bad
+            ),
             None => String::new(),
         };
         format!(
@@ -75,19 +206,20 @@ pub async fn generate_workspace_prefix(
     };
 
     // First try.
-    let raw = call_xai(api_key, &attempt(None), 8).await?;
+    let raw = client.complete(&attempt(None), 8).await?;
     if let Some(p) = validate(&raw, used_prefixes) {
         return Ok(p);
     }
 
     // Second try, telling the model what it just got wrong.
-    let raw2 = call_xai(api_key, &attempt(Some(&raw)), 8).await?;
+    let raw2 = client.complete(&attempt(Some(&raw)), 8).await?;
     if let Some(p) = validate(&raw2, used_prefixes) {
         return Ok(p);
     }
 
     Err(anyhow!(
-        "xAI returned invalid prefixes twice (last raw output: {:?})",
+        "{} returned invalid prefixes twice (last raw output: {:?})",
+        client.provider_name(),
         raw2.chars().take(40).collect::<String>()
     ))
 }
@@ -103,7 +235,7 @@ pub async fn generate_workspace_prefix(
 /// treated as the user action. Returns empty fields rather than guessing when
 /// no genuine user input/command is present.
 pub async fn infer_intent(
-    api_key: &str,
+    client: &ShortTextClient,
     transcript: &str,
 ) -> Result<crate::mc_data::surface_render::SurfaceIntentSummary> {
     // Cap input: the tail holds the most recent (and most relevant) turns.
@@ -127,7 +259,7 @@ pub async fn infer_intent(
          {{\"overall_goal\": <string|null>, \"latest_ask\": <string|null>}}.\n\n\
          Transcript:\n{tail}"
     );
-    let raw = call_xai(api_key, &prompt, 200).await?;
+    let raw = client.complete(&prompt, 200).await?;
     parse_intent(&raw)
 }
 
@@ -138,7 +270,7 @@ fn parse_intent(raw: &str) -> Result<crate::mc_data::surface_render::SurfaceInte
     let json = match (s.find('{'), s.rfind('}')) {
         (Some(a), Some(b)) if b > a => &s[a..=b],
         _ => anyhow::bail!(
-            "xai intent: no JSON object in {:?}",
+            "short-text intent: no JSON object in {:?}",
             s.chars().take(80).collect::<String>()
         ),
     };
@@ -149,7 +281,7 @@ fn parse_intent(raw: &str) -> Result<crate::mc_data::surface_render::SurfaceInte
         #[serde(default)]
         latest_ask: Option<String>,
     }
-    let parsed: RawIntent = serde_json::from_str(json).context("xai intent parse")?;
+    let parsed: RawIntent = serde_json::from_str(json).context("short-text intent parse")?;
     let clean = |o: Option<String>| {
         o.map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
@@ -163,7 +295,7 @@ fn parse_intent(raw: &str) -> Result<crate::mc_data::surface_render::SurfaceInte
 /// Summarize what the user is trying to accomplish across a session into one
 /// short line, for a surface's "overall" goal. Input is the session's user
 /// turns (most recent last). Returns a trimmed one-liner (<=90 chars-ish).
-pub async fn summarize_overall(api_key: &str, user_turns: &[String]) -> Result<String> {
+pub async fn summarize_overall(client: &ShortTextClient, user_turns: &[String]) -> Result<String> {
     if user_turns.is_empty() {
         anyhow::bail!("no user turns to summarize");
     }
@@ -186,7 +318,7 @@ pub async fn summarize_overall(api_key: &str, user_turns: &[String]) -> Result<S
          ultimately trying to accomplish overall — the session's goal, accounting \
          for how it has evolved. Output ONLY the line, no quotes, no prefix.\n\n{joined}"
     );
-    let raw = call_xai(api_key, &prompt, 64).await?;
+    let raw = client.complete(&prompt, 64).await?;
     let line = raw
         .trim()
         .trim_matches(|c| c == '"' || c == '`')
@@ -196,42 +328,9 @@ pub async fn summarize_overall(api_key: &str, user_turns: &[String]) -> Result<S
         .trim()
         .to_string();
     if line.is_empty() {
-        anyhow::bail!("xai returned empty overall summary");
+        anyhow::bail!("{} returned empty overall summary", client.provider_name());
     }
     Ok(line)
-}
-
-async fn call_xai(api_key: &str, user_prompt: &str, max_tokens: u32) -> Result<String> {
-    let body = Request {
-        model: DEFAULT_MODEL,
-        messages: vec![Message {
-            role: "user",
-            content: user_prompt,
-        }],
-        temperature: 0.0,
-        max_tokens,
-    };
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(XAI_ENDPOINT)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .context("xAI request failed")?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("xAI HTTP {}: {}", status, text);
-    }
-    let parsed: Response = resp.json().await.context("xAI parse")?;
-    let choice = parsed
-        .choices
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("xAI returned no choices"))?;
-    Ok(choice.message.content)
 }
 
 /// Returns the canonical prefix if `raw` cleans to a 3-letter uppercase code
@@ -253,8 +352,8 @@ pub fn validate(raw: &str, used: &[String]) -> Option<String> {
 }
 
 /// Deterministic fallback prefix derivation. Always returns *some* 3-letter
-/// code (or a digit-suffixed code on collision). Used when xAI is
-/// unavailable or returns garbage twice.
+/// code (or a digit-suffixed code on collision). Used when the selected
+/// provider is unavailable or returns garbage twice.
 pub fn deterministic_prefix(workspace_name: &str, used_prefixes: &[String]) -> String {
     // 1. Strip non-alphabetic, uppercase. Then prefer the first letter plus
     //    the next 2 consonants. Pad with vowels (then 'X') if too short.
@@ -322,6 +421,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provider_names_match_selected_transport() {
+        assert_eq!(ShortTextClient::xai("x".into()).provider_name(), "xAI");
+        assert_eq!(
+            ShortTextClient::openai("x".into(), "gpt-5.4-mini".into()).provider_name(),
+            "OpenAI"
+        );
+    }
+
+    #[test]
+    fn openai_response_extracts_output_text_content() {
+        let response: OpenaiResponse = serde_json::from_value(json!({
+            "output": [{
+                "type": "message",
+                "content": [
+                    {"type": "refusal", "text": ""},
+                    {"type": "output_text", "text": "MSC"}
+                ]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(extract_openai_output_text(response).as_deref(), Some("MSC"));
+    }
+
+    #[test]
+    fn openai_response_without_text_is_rejected() {
+        let response: OpenaiResponse = serde_json::from_value(json!({
+            "output": [{"type": "reasoning", "content": []}]
+        }))
+        .unwrap();
+        assert_eq!(extract_openai_output_text(response), None);
+    }
+
+    #[test]
     fn validate_accepts_3_uppercase_letters() {
         assert_eq!(validate("MSC", &[]), Some("MSC".to_string()));
     }
@@ -352,7 +484,7 @@ mod tests {
     #[test]
     fn deterministic_basic_consonant_walk() {
         // First letter + next 2 consonants, in order of appearance.
-        // (xAI usually picks nicer codes like "MSC" for mission-control;
+        // (A model usually picks nicer codes like "MSC" for mission-control;
         // this deterministic fallback skips repeats so produces "MSN".)
         let p = deterministic_prefix("mission-control", &[]);
         assert_eq!(p.len(), 3);
@@ -378,7 +510,7 @@ mod tests {
         let natural = deterministic_prefix("mc-tui", &[]);
         let expected = format!("{}2", natural);
         assert_eq!(
-            deterministic_prefix("mc-tui", &[natural.clone()]),
+            deterministic_prefix("mc-tui", std::slice::from_ref(&natural)),
             expected
         );
     }

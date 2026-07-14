@@ -1,4 +1,6 @@
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use serde::Deserialize;
 use std::path::PathBuf;
 
 /// Top-level CLI parser — subcommand optional; no subcommand launches the TUI.
@@ -67,9 +69,10 @@ pub enum Command {
     /// `active/` → `archived/`. Prints what changed.
     ArchiveClosed,
     /// Probe the local overall-summary path for a bound surface (by UUID):
-    /// resolve its cmux binding → read the transcript's user turns → xAI
-    /// summarize → write the persistent overall-summary cache. Prints the
-    /// result. Validates the path headlessly without driving the TUI.
+    /// resolve its cmux binding → read the transcript's user turns → summarize
+    /// with the configured provider → write the persistent overall-summary
+    /// cache. Prints the result. Validates the path headlessly without driving
+    /// the TUI.
     OverallProbe {
         /// cmux surface UUID (the `id` from `cmux tree --id-format both`).
         surface_uuid: String,
@@ -107,7 +110,7 @@ pub struct TuiConfig {
     pub openai_api_key: Option<String>,
 
     /// OpenAI model to use for summarization
-    #[arg(long, default_value = "gpt-5.0")]
+    #[arg(long, default_value = "gpt-5.4-mini")]
     pub model: String,
 
     /// Tool call count threshold before triggering LLM summarization
@@ -145,6 +148,40 @@ pub struct TuiConfig {
 
 /// Backwards-compatibility alias so existing code referencing `Config` keeps working.
 pub type Config = TuiConfig;
+
+/// Provider for short, structured generations such as workspace prefixes and
+/// per-surface intent summaries. The value comes from machine-local state, not
+/// command-line configuration, so different hosts can make different choices.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ShortTextProvider {
+    #[default]
+    Xai,
+    Openai,
+}
+
+/// Machine-local settings read from `~/data/mission-control/config.json`.
+/// Missing fields intentionally preserve historical behavior.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LocalConfig {
+    pub short_text_provider: ShortTextProvider,
+}
+
+impl LocalConfig {
+    pub fn load() -> Result<Self> {
+        Self::load_from(&crate::mc_data::paths::local_config_path())
+    }
+
+    pub fn load_from(path: &std::path::Path) -> Result<Self> {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
+    }
+}
 
 fn default_histories_dir() -> PathBuf {
     dirs::home_dir()
@@ -184,3 +221,33 @@ NEXT_STEPS:
 - [ ] <step 2>
 - [ ] <step 3>
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_local_config_preserves_xai_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = LocalConfig::load_from(&tmp.path().join("missing.json")).unwrap();
+        assert_eq!(config.short_text_provider, ShortTextProvider::Xai);
+    }
+
+    #[test]
+    fn local_config_selects_openai() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, r#"{"short_text_provider":"openai"}"#).unwrap();
+        let config = LocalConfig::load_from(&path).unwrap();
+        assert_eq!(config.short_text_provider, ShortTextProvider::Openai);
+    }
+
+    #[test]
+    fn invalid_local_provider_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, r#"{"short_text_provider":"other"}"#).unwrap();
+        let error = LocalConfig::load_from(&path).unwrap_err().to_string();
+        assert!(error.contains("parse"));
+    }
+}

@@ -120,6 +120,59 @@ struct BinaryStamp {
     modified: Option<std::time::SystemTime>,
 }
 
+struct ShortTextRuntime {
+    client: Option<crate::llm::short_text::ShortTextClient>,
+    warning: Option<String>,
+}
+
+fn append_warning(target: &mut Option<String>, warning: impl Into<String>) {
+    let warning = warning.into();
+    match target {
+        Some(existing) => {
+            existing.push_str(" | ");
+            existing.push_str(&warning);
+        }
+        None => *target = Some(warning),
+    }
+}
+
+/// Resolve machine-local provider choice and credentials once per launch or
+/// soft reload. The returned client is the only short-text provider invoked.
+async fn resolve_short_text_runtime(config: &mut Config) -> ShortTextRuntime {
+    let mut warning = None;
+    let local = match config::LocalConfig::load() {
+        Ok(local) => local,
+        Err(error) => {
+            append_warning(
+                &mut warning,
+                format!("invalid local config; using xAI default ({error:#})"),
+            );
+            config::LocalConfig::default()
+        }
+    };
+
+    let needs_openai_key =
+        local.short_text_provider == config::ShortTextProvider::Openai || !config.use_codex;
+    if needs_openai_key {
+        let resolution = crate::llm::openai::resolve_api_key(config.openai_api_key.take()).await;
+        config.openai_api_key = resolution.api_key;
+        if let Some(key_warning) = resolution.warning {
+            append_warning(&mut warning, key_warning);
+        }
+    }
+
+    let client = match local.short_text_provider {
+        config::ShortTextProvider::Xai => config
+            .xai_api_key
+            .as_ref()
+            .map(|key| crate::llm::short_text::ShortTextClient::xai(key.clone())),
+        config::ShortTextProvider::Openai => config.openai_api_key.as_ref().map(|key| {
+            crate::llm::short_text::ShortTextClient::openai(key.clone(), config.model.clone())
+        }),
+    };
+    ShortTextRuntime { client, warning }
+}
+
 impl BinaryStamp {
     fn capture() -> Option<Self> {
         let path = std::env::current_exe().ok()?;
@@ -195,6 +248,8 @@ async fn run_archive_closed(config: &Config) -> Result<()> {
 
 /// Validate the local overall-summary path end-to-end for one bound surface.
 async fn run_overall_probe(config: &Config, surface_uuid: &str) -> Result<()> {
+    let mut config = config.clone();
+    let runtime = resolve_short_text_runtime(&mut config).await;
     let bound = crate::mc_data::cmux_sessions::load_by_surface();
     let Some(b) = bound.get(surface_uuid) else {
         anyhow::bail!("no cmux binding for surface uuid {surface_uuid}");
@@ -211,11 +266,17 @@ async fn run_overall_probe(config: &Config, surface_uuid: &str) -> Result<()> {
     if let Some(last) = users.last() {
         println!("  last:  {}", last.chars().take(70).collect::<String>());
     }
-    let Some(key) = config.xai_api_key.clone() else {
-        anyhow::bail!("XAI_API_KEY not set");
+    let Some(client) = runtime.client else {
+        anyhow::bail!(
+            "short-text provider unavailable: {}",
+            runtime.warning.as_deref().unwrap_or("no API key")
+        );
     };
-    let summary = crate::llm::xai::summarize_overall(&key, &users).await?;
-    println!("\n── xAI overall summary ──\n  {summary}");
+    let summary = crate::llm::short_text::summarize_overall(&client, &users).await?;
+    println!(
+        "\n── {} overall summary ──\n  {summary}",
+        client.provider_name()
+    );
     crate::mc_data::overall_cache::put(tp, &summary, users.len())?;
     let cached = crate::mc_data::overall_cache::get(tp);
     println!("\ncached to disk: {:?}", cached.map(|(s, n)| (s, n)));
@@ -234,15 +295,20 @@ async fn run_remote_grab_probe(
     use crate::mc_data::remote_intent::RemoteWatch;
     use tokio::time::{Duration, sleep, timeout};
 
+    let mut config = config.clone();
+    let runtime = resolve_short_text_runtime(&mut config).await;
     let client = CmuxClient::new(config.cmux_bin.clone(), config.cmux_socket.clone());
     let mut watch = RemoteWatch::without_dump();
 
     println!("probing {surface_ref}: {iters} captures every {interval}s");
     for i in 0..iters {
-        let raw = timeout(Duration::from_secs(4), client.read_surface_text(surface_ref, 200))
-            .await
-            .ok()
-            .and_then(|r| r.ok());
+        let raw = timeout(
+            Duration::from_secs(4),
+            client.read_surface_text(surface_ref, 200),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok());
         match raw {
             Some(text) => {
                 let out = watch.apply("probe", surface_ref, &text);
@@ -270,16 +336,27 @@ async fn run_remote_grab_probe(
         t.join("\n")
     });
 
-    // Exercise the xAI inference path on the merged transcript.
-    if let (Some(text), Some(key)) = (transcript_text, config.xai_api_key.clone()) {
-        println!("\n── xAI inferred intent ──");
-        match crate::llm::xai::infer_intent(&key, &text).await {
+    // Exercise the configured short-text provider on the merged transcript.
+    if let (Some(text), Some(short_text_client)) = (transcript_text, runtime.client) {
+        println!(
+            "\n── {} inferred intent ──",
+            short_text_client.provider_name()
+        );
+        match crate::llm::short_text::infer_intent(&short_text_client, &text).await {
             Ok(intent) => {
-                println!("  overall: {}", intent.overall_goal.as_deref().unwrap_or("(none)"));
-                println!("  latest:  {}", intent.latest_ask.as_deref().unwrap_or("(none)"));
+                println!(
+                    "  overall: {}",
+                    intent.overall_goal.as_deref().unwrap_or("(none)")
+                );
+                println!(
+                    "  latest:  {}",
+                    intent.latest_ask.as_deref().unwrap_or("(none)")
+                );
             }
             Err(e) => println!("  inference failed: {e:#}"),
         }
+    } else if let Some(warning) = runtime.warning {
+        println!("\nwarning: {warning}");
     }
     Ok(())
 }
@@ -365,6 +442,11 @@ async fn run_summarize_cli(config: &Config) -> Result<()> {
     use crate::llm::openai::OpenAISummarizer;
     use anyhow::{Context, anyhow};
 
+    let mut config = config.clone();
+    let short_text_runtime = resolve_short_text_runtime(&mut config).await;
+    if let Some(warning) = short_text_runtime.warning.as_deref() {
+        eprintln!("warning: {warning}");
+    }
     let cmux_client = CmuxClient::new(config.cmux_bin.clone(), config.cmux_socket.clone());
 
     // Same picker as the TUI: Codex first (local auth, no API key), OpenAI
@@ -409,7 +491,7 @@ async fn run_summarize_cli(config: &Config) -> Result<()> {
 
     eprintln!("[2/4] applying snapshot (loads trajectory.md per workspace)…");
     let t = std::time::Instant::now();
-    app.apply_refresh_snapshot(snap, config.xai_api_key.as_deref())
+    app.apply_refresh_snapshot(snap, short_text_runtime.client.as_ref())
         .await;
     eprintln!("      → done ({:.1}s)", t.elapsed().as_secs_f64());
 
@@ -463,7 +545,8 @@ async fn run_tui(_tui_config: Config) -> Result<()> {
     loop {
         // Re-parse argv each iteration so a soft reload picks up any env-var
         // changes (e.g. OPENAI_API_KEY) — matches pre-subcommand behavior.
-        let config = config::Cli::parse().tui;
+        let mut config = config::Cli::parse().tui;
+        let short_text_runtime = resolve_short_text_runtime(&mut config).await;
         let cmux_client = CmuxClient::new(config.cmux_bin.clone(), config.cmux_socket.clone());
 
         // State lifecycle: migrate the legacy `.data/` root to `active/`, then
@@ -509,6 +592,8 @@ async fn run_tui(_tui_config: Config) -> Result<()> {
             &cmux_client,
             summarizer,
             classifier.as_ref(),
+            short_text_runtime.client,
+            short_text_runtime.warning,
         )
         .await;
 
@@ -533,12 +618,15 @@ async fn run_app(
     cmux_client: &CmuxClient,
     summarizer: Option<Arc<dyn Summarizer>>,
     classifier: Option<&TypeSafeClassifier>,
+    short_text_client: Option<crate::llm::short_text::ShortTextClient>,
+    global_warning: Option<String>,
 ) -> Result<AppControl> {
     let mut app = App::new();
+    app.global_warning = global_warning;
     app.refresh_workspaces(
         cmux_client,
         &config.histories_dir,
-        config.xai_api_key.as_deref(),
+        short_text_client.as_ref(),
     )
     .await?;
 
@@ -546,9 +634,8 @@ async fn run_app(
     let (screen_tx, mut screen_rx) = mpsc::unbounded_channel::<crate::tui::app::ScreenUpdate>();
 
     // Channel for remote (mosh/ssh) surface screen grabs (per-surface).
-    let (remote_tx, mut remote_rx) =
-        mpsc::unbounded_channel::<crate::tui::app::RemoteGrabUpdate>();
-    // Channel for xAI-inferred remote-surface intents (overall/latest).
+    let (remote_tx, mut remote_rx) = mpsc::unbounded_channel::<crate::tui::app::RemoteGrabUpdate>();
+    // Channel for provider-inferred remote-surface intents (overall/latest).
     let (remote_intent_tx, mut remote_intent_rx) =
         mpsc::unbounded_channel::<crate::tui::app::RemoteIntentUpdate>();
 
@@ -979,10 +1066,10 @@ async fn run_app(
                                 if app.focus == crate::tui::app::Focus::Sidebar {
                                     app.focus = crate::tui::app::Focus::Detail;
                                     // Opening the detail panel: generate/refresh the
-                                    // xAI "overall" summary for this workspace's bound
+                                    // configured-provider "overall" summary for bound
                                     // agent surfaces (change-gated).
-                                    if let Some(key) = config.xai_api_key.clone() {
-                                        app.spawn_overall_summaries(key);
+                                    if let Some(client) = short_text_client.clone() {
+                                        app.spawn_overall_summaries(client);
                                     }
                                 } else {
                                     // In detail focus, Enter switches to the workspace in cmux (fire-and-forget)
@@ -1243,14 +1330,14 @@ async fn run_app(
                 refresh_inflight = false;
                 match refresh_result {
                     Ok(snap) => {
-                        app.apply_refresh_snapshot(snap, config.xai_api_key.as_deref()).await;
+                        app.apply_refresh_snapshot(snap, short_text_client.as_ref()).await;
                         // Surfaces are loaded now — if the detail panel is open,
-                        // (re)generate the xAI "overall" summary for its bound
+                        // (re)generate the provider "overall" summary for its bound
                         // agent surfaces (change-gated). More reliable than the
                         // key-transition trigger, which can fire before the first
                         // refresh populates surfaces.
-                        if let Some(key) = config.xai_api_key.clone() {
-                            app.spawn_overall_summaries(key);
+                        if let Some(client) = short_text_client.clone() {
+                            app.spawn_overall_summaries(client);
                         }
                         // After applying, diff surface counts to detect
                         // detachments (cmux doesn't yet emit
@@ -1311,13 +1398,13 @@ async fn run_app(
 
             Some(update) = remote_rx.recv() => {
                 // Feed the merger; if the transcript grew enough, fire a
-                // change-gated xAI inference off the main loop to refresh the
+                // change-gated provider inference off the main loop to refresh the
                 // surface's overall/latest. Result flows back via remote_intent_rx.
                 if let Some((_ws, surface_ref, transcript)) = app.apply_remote_grab(update) {
-                    if let Some(key) = config.xai_api_key.clone() {
+                    if let Some(client) = short_text_client.clone() {
                         let tx = remote_intent_tx.clone();
                         tokio::spawn(async move {
-                            match crate::llm::xai::infer_intent(&key, &transcript).await {
+                            match crate::llm::short_text::infer_intent(&client, &transcript).await {
                                 Ok(intent) => {
                                     let _ = tx.send(crate::tui::app::RemoteIntentUpdate {
                                         surface_ref,

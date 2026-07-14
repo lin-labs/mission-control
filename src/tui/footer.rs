@@ -119,10 +119,18 @@ pub fn render_info_line(f: &mut Frame, area: Rect, info: Option<&str>) {
         return;
     }
     let text = truncate_left(info, area.width as usize);
-    let style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::BOLD);
+    let style = info_style(info);
     f.render_widget(Paragraph::new(text).style(style), area);
+}
+
+fn info_style(info: &str) -> Style {
+    Style::default()
+        .fg(if info.contains('⚠') {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        })
+        .add_modifier(Modifier::BOLD)
 }
 
 fn truncate_left(text: &str, max_chars: usize) -> String {
@@ -149,4 +157,23 @@ fn truncate_left(text: &str, max_chars: usize) -> String {
         .rev()
         .collect();
     format!("...{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_warning_info_is_yellow() {
+        assert_eq!(
+            info_style("workspace 1 · ⚠ OpenAI unavailable").fg,
+            Some(Color::Yellow)
+        );
+        assert_eq!(info_style("workspace 1").fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn warning_at_end_survives_left_truncation() {
+        assert!(truncate_left("workspace very-long-id · ⚠ auth required", 24).contains('⚠'));
+    }
 }
