@@ -136,6 +136,7 @@ pub struct LinearIssue {
 pub struct WorkspaceLinearView {
     pub project_id: String,
     pub required_labels: Vec<String>,
+    pub feature_name: Option<String>,
     pub issues: Vec<LinearIssue>,
     pub warning: Option<String>,
 }
@@ -726,6 +727,7 @@ mod tests {
         let view = WorkspaceLinearView {
             project_id: "project-id".into(),
             required_labels: vec!["group-grader".into()],
+            feature_name: Some("group-grader".into()),
             issues: vec![LinearIssue {
                 identifier: "MID-508".into(),
                 title: "Exact issue".into(),

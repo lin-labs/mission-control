@@ -25,6 +25,9 @@ pub struct LinearTarget {
     pub team_id: Option<String>,
     pub project_id: String,
     pub labels: Vec<String>,
+    /// Registered feature identity used to segment the projected list. This is
+    /// display metadata; the feature label above remains the query constraint.
+    pub feature_name: Option<String>,
 }
 
 /// A sanitized registry failure. It intentionally carries no file contents,
@@ -100,39 +103,116 @@ impl ProjectRegistry {
         self.resolve_project(project)
     }
 
-    /// Resolve a cmux workspace name to a uniquely matching platform feature.
-    /// This is secondary evidence for mixed-repo workspaces whose focused
-    /// surface can make cmux's `current_directory` point at a utility repo.
-    /// A conservative final-token singularization maps names such as
-    /// `group-graders` to the registered `group-grader` feature.
-    pub fn resolve_named_feature(&self, workspace_name: &str) -> TaskSource {
-        let key = unit_name_key(workspace_name);
-        if key.is_empty() {
-            return TaskSource::Unregistered;
+    /// Resolve the registered unit a workspace says it is about. Feature names
+    /// are more specific than project/platform names; title evidence precedes
+    /// description evidence. Ambiguous text intentionally returns
+    /// `Unregistered` so callers can fall through to authoritative path
+    /// evidence rather than guessing.
+    pub fn resolve_workspace_identity(&self, title: &str, description: Option<&str>) -> TaskSource {
+        match self.feature_identity_match(title, description) {
+            IdentityMatch::One(matched) => return self.resolve_feature(matched),
+            IdentityMatch::Ambiguous => return TaskSource::Unregistered,
+            IdentityMatch::None => {}
         }
-        let mut matches = self.data.platforms.iter().flat_map(|platform| {
-            platform
-                .features
-                .iter()
-                .filter(|feature| {
-                    feature
-                        .name
-                        .as_deref()
-                        .is_some_and(|name| unit_name_key(name) == key)
-                })
-                .map(move |feature| FeatureMatch {
-                    platform,
-                    feature,
+
+        match self.project_identity_match(title, description) {
+            IdentityMatch::One(IdentityUnit::Project(project)) => {
+                self.resolve_project(Some(ProjectMatch {
+                    project,
                     specificity: 0,
-                })
-        });
-        let Some(first) = matches.next() else {
-            return TaskSource::Unregistered;
-        };
-        if matches.next().is_some() {
-            return TaskSource::Unregistered;
+                }))
+            }
+            IdentityMatch::One(IdentityUnit::Platform(platform)) => self.resolve_platform(platform),
+            IdentityMatch::None | IdentityMatch::Ambiguous => TaskSource::Unregistered,
         }
-        self.resolve_feature(first)
+    }
+
+    fn feature_identity_match<'a>(
+        &'a self,
+        title: &str,
+        description: Option<&str>,
+    ) -> IdentityMatch<FeatureMatch<'a>> {
+        let title_matches = self.features_mentioned_in(title);
+        if !title_matches.is_empty() {
+            return disambiguate_features(title_matches, title, description);
+        }
+
+        let description_matches = description
+            .map(|text| self.features_mentioned_in(text))
+            .unwrap_or_default();
+        disambiguate_features(description_matches, title, description)
+    }
+
+    fn features_mentioned_in<'a>(&'a self, text: &str) -> Vec<FeatureMatch<'a>> {
+        self.data
+            .platforms
+            .iter()
+            .flat_map(|platform| {
+                platform.features.iter().filter_map(move |feature| {
+                    feature.name.as_deref().and_then(|name| {
+                        identity_mentions_unit(text, name).then(|| FeatureMatch {
+                            platform,
+                            feature,
+                            specificity: name_tokens(name).len(),
+                        })
+                    })
+                })
+            })
+            .collect()
+    }
+
+    fn project_identity_match<'a>(
+        &'a self,
+        title: &str,
+        description: Option<&str>,
+    ) -> IdentityMatch<IdentityUnit<'a>> {
+        let title_matches = self.units_mentioned_in(title);
+        if !title_matches.is_empty() {
+            return unique_identity_unit(title_matches);
+        }
+
+        let description_matches = description
+            .map(|text| self.units_mentioned_in(text))
+            .unwrap_or_default();
+        unique_identity_unit(description_matches)
+    }
+
+    fn units_mentioned_in<'a>(&'a self, text: &str) -> Vec<IdentityUnit<'a>> {
+        let mut units = Vec::new();
+        for project in &self.data.projects {
+            if let Some(name) = project.project.as_deref()
+                && identity_mentions_unit(text, name)
+            {
+                units.push((IdentityUnit::Project(project), name_tokens(name).len()));
+            }
+        }
+        for platform in &self.data.platforms {
+            let Some(name) = platform.name.as_deref() else {
+                continue;
+            };
+            if !identity_mentions_unit(text, name) {
+                continue;
+            }
+            // A same-name project is the project facet of this logical unit;
+            // resolving it preserves explicit project-tracker precedence and
+            // same-name platform inheritance.
+            if self.data.projects.iter().any(|project| {
+                project
+                    .project
+                    .as_deref()
+                    .is_some_and(|project_name| unit_name_key(project_name) == unit_name_key(name))
+            }) {
+                continue;
+            }
+            units.push((IdentityUnit::Platform(platform), name_tokens(name).len()));
+        }
+        let Some(max_specificity) = units.iter().map(|(_, specificity)| *specificity).max() else {
+            return Vec::new();
+        };
+        units
+            .into_iter()
+            .filter_map(|(unit, specificity)| (specificity == max_specificity).then_some(unit))
+            .collect()
     }
 
     fn best_project<'a>(&'a self, workspace: &Path) -> Option<ProjectMatch<'a>> {
@@ -215,9 +295,19 @@ impl ProjectRegistry {
         };
         if let Some(feature_name) = non_empty(matched.feature.name.as_deref()) {
             push_unique(&mut target.labels, feature_name);
+            target.feature_name = Some(feature_name.to_owned());
         }
         target.labels.sort();
         TaskSource::Linear(target)
+    }
+
+    fn resolve_platform(&self, platform: &PlatformEntry) -> TaskSource {
+        if platform.tracker.as_deref().unwrap_or("beads") != "linear" {
+            return TaskSource::Beads;
+        }
+        LinearTarget::try_from(platform.linear.clone().unwrap_or_default())
+            .map(TaskSource::Linear)
+            .unwrap_or(TaskSource::LinearUnavailable)
     }
 
     fn resolve_project(&self, matched: Option<ProjectMatch<'_>>) -> TaskSource {
@@ -387,6 +477,7 @@ impl TryFrom<RawLinear> for LinearTarget {
             team_id,
             project_id,
             labels,
+            feature_name: None,
         })
     }
 }
@@ -402,6 +493,64 @@ struct FeatureMatch<'a> {
     platform: &'a PlatformEntry,
     feature: &'a FeatureEntry,
     specificity: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum IdentityUnit<'a> {
+    Project(&'a ProjectEntry),
+    Platform(&'a PlatformEntry),
+}
+
+enum IdentityMatch<T> {
+    None,
+    One(T),
+    Ambiguous,
+}
+
+fn disambiguate_features<'a>(
+    mut matches: Vec<FeatureMatch<'a>>,
+    title: &str,
+    description: Option<&str>,
+) -> IdentityMatch<FeatureMatch<'a>> {
+    if matches.is_empty() {
+        return IdentityMatch::None;
+    }
+    let max_specificity = matches
+        .iter()
+        .map(|matched| matched.specificity)
+        .max()
+        .unwrap_or_default();
+    matches.retain(|matched| matched.specificity == max_specificity);
+    if matches.len() == 1 {
+        return IdentityMatch::One(matches[0]);
+    }
+
+    let platform_matches: Vec<_> = matches
+        .iter()
+        .copied()
+        .filter(|matched| {
+            matched.platform.name.as_deref().is_some_and(|name| {
+                identity_mentions_unit(title, name)
+                    || description.is_some_and(|text| identity_mentions_unit(text, name))
+            })
+        })
+        .collect();
+    if !platform_matches.is_empty() {
+        matches = platform_matches;
+    }
+    if matches.len() == 1 {
+        IdentityMatch::One(matches[0])
+    } else {
+        IdentityMatch::Ambiguous
+    }
+}
+
+fn unique_identity_unit(matches: Vec<IdentityUnit<'_>>) -> IdentityMatch<IdentityUnit<'_>> {
+    match matches.as_slice() {
+        [] => IdentityMatch::None,
+        [matched] => IdentityMatch::One(*matched),
+        _ => IdentityMatch::Ambiguous,
+    }
 }
 
 fn matching_root_specificity(relative: &Path, roots: &[String]) -> Option<usize> {
@@ -460,6 +609,48 @@ fn unit_name_key(value: &str) -> String {
         last.pop();
     }
     tokens.join("-")
+}
+
+fn identity_mentions_unit(identity: &str, unit_name: &str) -> bool {
+    let identity_tokens = name_tokens(identity);
+    let unit_tokens = name_tokens(unit_name);
+    if unit_tokens.is_empty() || unit_tokens.len() > identity_tokens.len() {
+        return false;
+    }
+    if identity_tokens
+        .windows(unit_tokens.len())
+        .any(|window| window == unit_tokens)
+    {
+        return true;
+    }
+
+    let singular_identity: Vec<_> = identity_tokens
+        .iter()
+        .map(|token| singular_name_token(token))
+        .collect();
+    let singular_unit: Vec<_> = unit_tokens
+        .iter()
+        .map(|token| singular_name_token(token))
+        .collect();
+    singular_identity
+        .windows(singular_unit.len())
+        .any(|window| window == singular_unit)
+}
+
+fn name_tokens(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn singular_name_token(token: &String) -> String {
+    let mut token = token.clone();
+    if token.len() > 3 && token.ends_with('s') && !token.ends_with("ss") {
+        token.pop();
+    }
+    token
 }
 
 #[cfg(test)]
@@ -535,6 +726,7 @@ platforms:
                 team_id: Some("team-1".into()),
                 project_id: "project-1".into(),
                 labels: vec!["platform".into()],
+                feature_name: None,
             })
         );
     }
@@ -569,6 +761,7 @@ platforms:
                 team_id: Some("team-1".into()),
                 project_id: "project-1".into(),
                 labels: vec!["configured".into(), "group-grader".into()],
+                feature_name: Some("group-grader".into()),
             })
         );
     }
@@ -590,16 +783,141 @@ platforms:
         );
 
         assert_eq!(
-            registry.resolve_named_feature("group-graders"),
+            registry.resolve_workspace_identity("group-graders", None),
             TaskSource::Linear(LinearTarget {
                 team_id: None,
                 project_id: "project-1".to_string(),
                 labels: vec!["group-grader".to_string()],
+                feature_name: Some("group-grader".to_string()),
             })
         );
         assert_eq!(
-            registry.resolve_named_feature("unrelated"),
+            registry.resolve_workspace_identity("unrelated", None),
             TaskSource::Unregistered
+        );
+    }
+
+    #[test]
+    fn title_or_description_resolves_the_registered_feature_identity() {
+        let (_temp, registry) = registry(
+            r#"
+projects:
+  - project: agents
+    path: ~/agents/blin-agents
+platforms:
+  - name: olympus
+    tracker: linear
+    linear:
+      project_id: project-1
+    features:
+      - name: group-grader
+        repo: ~/Projects/olympus
+        roots: [olympus/projects/minos/graders]
+"#,
+        );
+
+        for source in [
+            registry.resolve_workspace_identity("group-graders", None),
+            registry.resolve_workspace_identity(
+                "evaluation work",
+                Some("Build the group grader feature under the Olympus platform"),
+            ),
+        ] {
+            assert!(matches!(
+                source,
+                TaskSource::Linear(LinearTarget { labels, .. })
+                    if labels == ["group-grader".to_string()]
+            ));
+        }
+    }
+
+    #[test]
+    fn platform_context_disambiguates_duplicate_feature_names() {
+        let (_temp, registry) = registry(
+            r#"
+platforms:
+  - name: olympus
+    tracker: linear
+    linear:
+      project_id: olympus-project
+    features:
+      - name: grader
+  - name: academy
+    tracker: linear
+    linear:
+      project_id: academy-project
+    features:
+      - name: grader
+"#,
+        );
+
+        assert_eq!(
+            registry.resolve_workspace_identity("grader", None),
+            TaskSource::Unregistered
+        );
+        assert!(matches!(
+            registry.resolve_workspace_identity(
+                "grader",
+                Some("This is the Olympus platform feature")
+            ),
+            TaskSource::Linear(LinearTarget { project_id, .. })
+                if project_id == "olympus-project"
+        ));
+    }
+
+    #[test]
+    fn ambiguous_feature_identity_does_not_guess() {
+        let (_temp, registry) = registry(
+            r#"
+platforms:
+  - name: olympus
+    tracker: linear
+    linear:
+      project_id: project-1
+    features:
+      - name: group-grader
+      - name: trace-viewer
+"#,
+        );
+
+        assert_eq!(
+            registry.resolve_workspace_identity(
+                "group-grader trace-viewer",
+                Some("Two possible Olympus features")
+            ),
+            TaskSource::Unregistered
+        );
+    }
+
+    #[test]
+    fn longest_registered_unit_name_is_the_identity_match() {
+        let (_temp, registry) = registry(
+            r#"
+projects:
+  - project: olympus
+    path: ~/Projects/olympus
+  - project: wiki-olympus
+    path: ~/Projects/wiki-olympus
+    tracker: beads
+platforms:
+  - name: olympus
+    tracker: linear
+    linear:
+      project_id: project-1
+    features:
+      - name: grader
+      - name: group-grader
+"#,
+        );
+
+        assert!(matches!(
+            registry.resolve_workspace_identity("group graders", None),
+            TaskSource::Linear(LinearTarget { feature_name, .. })
+                if feature_name.as_deref() == Some("group-grader")
+        ));
+        assert_eq!(
+            registry.resolve_workspace_identity("wiki olympus", None),
+            TaskSource::Beads
         );
     }
 
@@ -627,6 +945,7 @@ projects:
                 team_id: Some("team-2".into()),
                 project_id: "project-2".into(),
                 labels: Vec::new(),
+                feature_name: None,
             })
         );
     }
@@ -720,6 +1039,7 @@ projects:
                 team_id: None,
                 project_id: "project-only".to_string(),
                 labels: vec![],
+                feature_name: None,
             })
         );
     }

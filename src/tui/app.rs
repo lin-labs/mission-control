@@ -802,27 +802,19 @@ fn resolve_task_sources(
     workspaces
         .iter()
         .map(|workspace| {
-            // An exact Linear path is authoritative. Otherwise, a uniquely
-            // matching Linear feature name stabilizes a mixed-repo workspace
-            // when cmux's focused-surface cwd temporarily points at a utility
-            // repo (for example group-graders -> group-grader).
-            let mut source = workspace
-                .current_directory
-                .as_deref()
-                .map(std::path::Path::new)
-                .map(|path| registry.resolve(path))
-                .unwrap_or(TaskSource::Unregistered);
-            if !matches!(
-                source,
-                TaskSource::Linear(_) | TaskSource::LinearUnavailable
-            ) {
-                let named_source = registry.resolve_named_feature(&workspace.name);
-                if matches!(
-                    named_source,
-                    TaskSource::Linear(_) | TaskSource::LinearUnavailable
-                ) {
-                    source = named_source;
-                }
+            // A workspace's declared identity owns its tracker even when the
+            // focused surface temporarily moves current_directory into a
+            // utility repo. Paths remain authoritative fallback evidence when
+            // title/description do not identify one registered unit.
+            let mut source = registry
+                .resolve_workspace_identity(&workspace.name, workspace.description.as_deref());
+            if source == TaskSource::Unregistered {
+                source = workspace
+                    .current_directory
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .map(|path| registry.resolve(path))
+                    .unwrap_or(TaskSource::Unregistered);
             }
             if source == TaskSource::Unregistered {
                 source = repo_roots_by_ws_id
@@ -855,6 +847,7 @@ async fn gather_linear_views(
                     WorkspaceLinearView {
                         project_id: String::new(),
                         required_labels: Vec::new(),
+                        feature_name: None,
                         issues: Vec::new(),
                         warning: Some(
                             "Linear unavailable: project registry coordinates are incomplete"
@@ -876,15 +869,18 @@ async fn gather_linear_views(
         let warning = key
             .warning
             .unwrap_or_else(|| "Linear unavailable: credential lookup failed".to_string());
-        for ((project_id, required_labels), workspace_ids) in grouped {
-            let view = WorkspaceLinearView {
-                project_id,
-                required_labels,
-                issues: Vec::new(),
-                warning: Some(warning.clone()),
-            };
-            for workspace_id in workspace_ids {
-                views.insert(workspace_id, view.clone());
+        for ((project_id, required_labels), workspace_targets) in grouped {
+            for (workspace_id, feature_name) in workspace_targets {
+                views.insert(
+                    workspace_id,
+                    WorkspaceLinearView {
+                        project_id: project_id.clone(),
+                        required_labels: required_labels.clone(),
+                        feature_name,
+                        issues: Vec::new(),
+                        warning: Some(warning.clone()),
+                    },
+                );
             }
         }
         return views;
@@ -892,35 +888,34 @@ async fn gather_linear_views(
 
     let client = LinearClient::new(api_key);
     let mut queries = tokio::task::JoinSet::new();
-    for ((project_id, required_labels), workspace_ids) in grouped {
+    for ((project_id, required_labels), workspace_targets) in grouped {
         let client = client.clone();
         queries.spawn(async move {
             let result = client.fetch_issues(&project_id, &required_labels).await;
-            (project_id, required_labels, workspace_ids, result)
+            (project_id, required_labels, workspace_targets, result)
         });
     }
     while let Some(result) = queries.join_next().await {
-        let Ok((project_id, required_labels, workspace_ids, result)) = result else {
+        let Ok((project_id, required_labels, workspace_targets, result)) = result else {
             // A task panic/cancellation is sanitized and scoped to the affected
             // query; it never brings down the TUI or exposes response data.
             continue;
         };
-        let view = match result {
-            Ok(issues) => WorkspaceLinearView {
-                project_id,
-                required_labels,
-                issues,
-                warning: None,
-            },
-            Err(error) => WorkspaceLinearView {
-                project_id,
-                required_labels,
-                issues: Vec::new(),
-                warning: Some(error.to_string()),
-            },
+        let (issues, warning) = match result {
+            Ok(issues) => (issues, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
         };
-        for workspace_id in workspace_ids {
-            views.insert(workspace_id, view.clone());
+        for (workspace_id, feature_name) in workspace_targets {
+            views.insert(
+                workspace_id,
+                WorkspaceLinearView {
+                    project_id: project_id.clone(),
+                    required_labels: required_labels.clone(),
+                    feature_name,
+                    issues: issues.clone(),
+                    warning: warning.clone(),
+                },
+            );
         }
     }
     views
@@ -928,16 +923,16 @@ async fn gather_linear_views(
 
 fn linear_query_groups(
     task_sources: &HashMap<String, crate::mc_data::project_registry::TaskSource>,
-) -> HashMap<(String, Vec<String>), Vec<String>> {
+) -> HashMap<(String, Vec<String>), Vec<(String, Option<String>)>> {
     use crate::mc_data::project_registry::TaskSource;
 
-    let mut grouped: HashMap<(String, Vec<String>), Vec<String>> = HashMap::new();
+    let mut grouped: HashMap<(String, Vec<String>), Vec<(String, Option<String>)>> = HashMap::new();
     for (workspace_id, source) in task_sources {
         if let TaskSource::Linear(target) = source {
             grouped
                 .entry((target.project_id.clone(), target.labels.clone()))
                 .or_default()
-                .push(workspace_id.clone());
+                .push((workspace_id.clone(), target.feature_name.clone()));
         }
     }
     grouped
@@ -3508,6 +3503,7 @@ fn retain_last_good_linear(
         && refreshed.issues.is_empty()
         && refreshed.project_id == previous.project_id
         && refreshed.required_labels == previous.required_labels
+        && refreshed.feature_name == previous.feature_name
         && !previous.issues.is_empty()
     {
         refreshed.issues.clone_from(&previous.issues);
@@ -3517,30 +3513,41 @@ fn retain_last_good_linear(
 fn linear_items_for_view(
     view: &crate::mc_data::linear::WorkspaceLinearView,
 ) -> Vec<crate::mc_data::trajectory::Item> {
+    let mut items = Vec::new();
+    if let Some(feature_name) = view.feature_name.as_deref() {
+        items.push(crate::mc_data::trajectory::Item {
+            text: format!("feature: {feature_name}"),
+            is_checkbox: false,
+            checked: None,
+            surface_id: None,
+        });
+    }
+
     if view.issues.is_empty() {
         let text = view
             .warning
             .as_deref()
             .map(|warning| format!("  ({warning})"))
             .unwrap_or_else(|| "No active Linear issues".to_string());
-        return vec![crate::mc_data::trajectory::Item {
+        items.push(crate::mc_data::trajectory::Item {
             text,
             is_checkbox: false,
             checked: None,
             surface_id: None,
-        }];
+        });
+        return items;
     }
 
-    let mut items: Vec<_> = view
-        .issues
-        .iter()
-        .map(|issue| crate::mc_data::trajectory::Item {
-            text: linear_issue_line(issue),
-            is_checkbox: false,
-            checked: None,
-            surface_id: None,
-        })
-        .collect();
+    items.extend(
+        view.issues
+            .iter()
+            .map(|issue| crate::mc_data::trajectory::Item {
+                text: linear_issue_line(issue),
+                is_checkbox: false,
+                checked: None,
+                surface_id: None,
+            }),
+    );
     if view.warning.is_some() {
         items.push(crate::mc_data::trajectory::Item {
             text: "  (stale — Linear refresh unavailable)".to_string(),
@@ -3662,6 +3669,7 @@ fn is_projected_task_row(text: &str) -> bool {
         }
     }
     t.starts_with("repo: ")
+        || t.starts_with("feature: ")
         || t.starts_with("No active beads")
         || t.starts_with("Beads unavailable")
         || t.starts_with("(no active beads)")
@@ -4021,18 +4029,18 @@ workspace: test-ws
         }
     }
 
-    fn test_linear_view(
-        identifier: &str,
-    ) -> crate::mc_data::linear::WorkspaceLinearView {
+    fn test_linear_view(identifier: &str) -> crate::mc_data::linear::WorkspaceLinearView {
         crate::mc_data::linear::WorkspaceLinearView {
             project_id: "project-1".to_string(),
             required_labels: vec!["group-grader".to_string()],
+            feature_name: Some("group-grader".to_string()),
             issues: vec![test_linear_issue(identifier)],
             warning: None,
         }
     }
 
     fn install_linear_view(app: &mut App, view: crate::mc_data::linear::WorkspaceLinearView) {
+        let cursor_item = usize::from(view.feature_name.is_some() && !view.issues.is_empty());
         let items = linear_items_for_view(&view);
         let ws = &mut app.workspaces[0];
         ws.linear = Some(view);
@@ -4043,7 +4051,7 @@ workspace: test-ws
             .replace_section_items(crate::mc_data::trajectory::SECTION_GOALS, items);
         ws.edit_state = Some(crate::tui::trajectory_edit::TrajectoryEditState {
             cursor_section: 2,
-            cursor_item: 0,
+            cursor_item,
             ..Default::default()
         });
     }
@@ -4166,6 +4174,27 @@ platforms:
             Some(TaskSource::Linear(target))
                 if target.labels == ["group-grader".to_string()]
         ));
+
+        let described_workspace = Workspace {
+            name: "evaluation".to_string(),
+            description: Some(
+                "This workspace builds the group grader feature under Olympus".to_string(),
+            ),
+            current_directory: Some(
+                temp.path()
+                    .join("agents/blin-agents")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            ..workspace("described", temp.path().join("agents/blin-agents"))
+        };
+        let described =
+            resolve_task_sources(&[described_workspace], &HashMap::new(), Some(&registry));
+        assert!(matches!(
+            described.get("described"),
+            Some(TaskSource::Linear(target))
+                if target.labels == ["group-grader".to_string()]
+        ));
     }
 
     #[test]
@@ -4180,6 +4209,7 @@ platforms:
                     team_id: Some(team_id.to_string()),
                     project_id: "project-1".to_string(),
                     labels: vec!["group-grader".to_string()],
+                    feature_name: Some("group-grader".to_string()),
                 }),
             );
         }
@@ -4213,6 +4243,7 @@ platforms:
         let unavailable = crate::mc_data::linear::WorkspaceLinearView {
             project_id: "project-1".to_string(),
             required_labels: vec![],
+            feature_name: None,
             issues: vec![],
             warning: Some("Linear unavailable: API request failed".to_string()),
         };
@@ -4257,6 +4288,7 @@ platforms:
         let mut same_target_failure = crate::mc_data::linear::WorkspaceLinearView {
             project_id: previous.project_id.clone(),
             required_labels: previous.required_labels.clone(),
+            feature_name: previous.feature_name.clone(),
             issues: vec![],
             warning: Some("Linear unavailable: API request failed".to_string()),
         };
@@ -4266,6 +4298,7 @@ platforms:
         let mut other_target_failure = crate::mc_data::linear::WorkspaceLinearView {
             project_id: "project-2".to_string(),
             required_labels: previous.required_labels.clone(),
+            feature_name: previous.feature_name.clone(),
             issues: vec![],
             warning: Some("Linear unavailable: API request failed".to_string()),
         };
@@ -4289,6 +4322,15 @@ platforms:
         assert!(dropped);
         assert_eq!(cleaned.len(), 1);
         assert_eq!(cleaned[0].text, "Keep this local goal");
+    }
+
+    #[test]
+    fn linear_rows_are_segmented_by_registered_feature_name() {
+        let items = linear_items_for_view(&test_linear_view("MID-508"));
+
+        assert_eq!(items[0].text, "feature: group-grader");
+        assert!(items[1].text.contains("MID-508"));
+        assert!(linear_desktop_url_for_row(&test_linear_view("MID-508"), &items[0].text).is_none());
     }
 
     #[test]
@@ -5186,9 +5228,15 @@ workspace: test-ws
             .unwrap()
             .section(crate::mc_data::trajectory::SECTION_GOALS)
             .unwrap();
-        assert_eq!(tasks.items.len(), 1);
-        assert!(tasks.items[0].text.contains("MID-508"));
-        assert!(!tasks.items[0].text.contains("model-owned"));
+        assert_eq!(tasks.items.len(), 2);
+        assert_eq!(tasks.items[0].text, "feature: group-grader");
+        assert!(tasks.items[1].text.contains("MID-508"));
+        assert!(
+            tasks
+                .items
+                .iter()
+                .all(|item| !item.text.contains("model-owned"))
+        );
     }
 
     #[test]
