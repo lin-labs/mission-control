@@ -14,6 +14,11 @@ use crate::mc_data::trajectory::{
 };
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::time::{Duration, Instant};
+
+/// Keep a toggled mission row in place long enough for the user to see and
+/// reverse the change before its section membership changes.
+pub const MISSION_RELOCATION_DELAY: Duration = Duration::from_secs(5);
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -41,6 +46,19 @@ pub enum MissionFocus {
     Active,
     HistoryHeader,
     HistoryItem(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MissionOrigin {
+    Active,
+    History,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingMissionMove {
+    origin: MissionOrigin,
+    index: usize,
+    due_at: Instant,
 }
 
 /// A pending line-level change produced by `handle_key`.
@@ -97,6 +115,9 @@ pub struct TrajectoryEditState {
     /// True only for a blank row created by `o`/`O` (or empty-section `i`) in
     /// Mission. Esc either removes it or commits it with the `[h]` marker.
     pub provisional_human_mission: bool,
+    /// Mission checkbox changes awaiting their delayed cross-section move.
+    /// While present, save/refresh paths preserve the row's original section.
+    pub(crate) pending_mission_moves: Vec<PendingMissionMove>,
 }
 
 impl Default for TrajectoryEditState {
@@ -113,7 +134,14 @@ impl Default for TrajectoryEditState {
             mission_history_expanded: false,
             mission_focus: MissionFocus::Active,
             provisional_human_mission: false,
+            pending_mission_moves: Vec::new(),
         }
+    }
+}
+
+impl TrajectoryEditState {
+    pub fn has_pending_mission_moves(&self) -> bool {
+        !self.pending_mission_moves.is_empty()
     }
 }
 
@@ -204,9 +232,7 @@ fn handle_nav_key(
                 .get(state.cursor_section)
                 .is_some_and(|section| section.name == SECTION_MISSION);
             if on_mission {
-                if let Some(action) = toggle_mission_completion(state, doc) {
-                    actions.push(action);
-                }
+                toggle_mission_completion_at(state, doc, Instant::now());
             } else if let Some(action) = delete_item(state, doc) {
                 actions.push(action);
             }
@@ -557,7 +583,13 @@ fn commit_insert(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> Ve
             if let Some(section) = doc.sections.get_mut(state.cursor_section)
                 && state.cursor_item < section.items.len()
             {
+                let removed_index = state.cursor_item;
                 section.items.remove(state.cursor_item);
+                adjust_pending_after_removal(
+                    &mut state.pending_mission_moves,
+                    MissionOrigin::Active,
+                    removed_index,
+                );
                 state.cursor_item = state.cursor_item.min(section.items.len().saturating_sub(1));
             }
             state.mode = EditMode::Nav;
@@ -617,12 +649,17 @@ pub fn save(
     // Update frontmatter snapshot number before saving.
     doc.frontmatter.snapshot = Some(n);
 
+    // Pending mission toggles are a UI preview until their grace period
+    // expires. Persist their original stable checkbox state so a file watcher
+    // or process restart cannot normalize them into the other section early.
+    let persisted_doc = stable_doc_for_persistence(doc, Some(state));
+
     // 1. Overwrite trajectory.md
     let traj_path = paths::trajectory_path(uuid);
-    doc.save_to_file(&traj_path)?;
+    persisted_doc.save_to_file(&traj_path)?;
 
     // 2. Write snapshot
-    write_snapshot(uuid, n, doc)?;
+    write_snapshot(uuid, n, &persisted_doc)?;
 
     // 3. Write input context
     let ctx = InputContext {
@@ -656,6 +693,43 @@ pub fn save(
     }
 
     Ok(n)
+}
+
+/// Clone a trajectory for a direct disk write without persisting transient
+/// checkbox previews. All non-editor projection writers must pass through this
+/// boundary (or skip the write while a preview is pending).
+pub fn stable_doc_for_persistence(
+    doc: &TrajectoryDoc,
+    state: Option<&TrajectoryEditState>,
+) -> TrajectoryDoc {
+    let mut doc = doc.clone();
+    let Some(state) = state else {
+        return doc;
+    };
+    let mission_index = doc
+        .sections
+        .iter()
+        .position(|section| section.name == SECTION_MISSION);
+    for pending in &state.pending_mission_moves {
+        match pending.origin {
+            MissionOrigin::Active => {
+                if let Some(item) = mission_index
+                    .and_then(|section| doc.sections.get_mut(section))
+                    .and_then(|section| section.items.get_mut(pending.index))
+                {
+                    item.is_checkbox = true;
+                    item.checked = Some(false);
+                }
+            }
+            MissionOrigin::History => {
+                if let Some(item) = doc.mission_history.get_mut(pending.index) {
+                    item.is_checkbox = true;
+                    item.checked = Some(true);
+                }
+            }
+        }
+    }
+    doc
 }
 
 fn action_to_event(action: &EditAction, snapshot: u32) -> Event {
@@ -900,63 +974,231 @@ fn toggle_checkbox(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> 
     })
 }
 
-fn toggle_mission_completion(
+fn toggle_mission_completion_at(
     state: &mut TrajectoryEditState,
     doc: &mut TrajectoryDoc,
-) -> Option<EditAction> {
+    now: Instant,
+) {
     match state.mission_focus {
         MissionFocus::Active => {
-            let mission = doc
+            let Some(mission) = doc
                 .sections
                 .iter_mut()
-                .find(|section| section.name == SECTION_MISSION)?;
-            if state.cursor_item >= mission.items.len() {
-                return None;
-            }
-            let mut item = mission.items.remove(state.cursor_item);
-            let before = item_display_text(&item, &item.text);
+                .find(|section| section.name == SECTION_MISSION)
+            else {
+                return;
+            };
+            let Some(item) = mission.items.get_mut(state.cursor_item) else {
+                return;
+            };
+            let pending = state.pending_mission_moves.iter().position(|pending| {
+                pending.origin == MissionOrigin::Active && pending.index == state.cursor_item
+            });
+
             item.is_checkbox = true;
-            item.checked = Some(true);
-            let after = item_display_text(&item, &item.text);
-            doc.mission_history.push(item);
-            if mission.items.is_empty() {
-                state.cursor_item = 0;
-                state.mission_focus = MissionFocus::HistoryHeader;
-            } else if state.cursor_item >= mission.items.len() {
-                state.cursor_item = mission.items.len() - 1;
+            if let Some(pending) = pending {
+                // A second toggle within the grace window restores the stable
+                // state and cancels the relocation entirely.
+                item.checked = Some(false);
+                state.pending_mission_moves.remove(pending);
+            } else if !item.checked.unwrap_or(false) {
+                item.checked = Some(true);
+                state.pending_mission_moves.push(PendingMissionMove {
+                    origin: MissionOrigin::Active,
+                    index: state.cursor_item,
+                    due_at: now + MISSION_RELOCATION_DELAY,
+                });
+            } else {
+                item.checked = Some(false);
             }
-            Some(EditAction::Check {
-                section: SECTION_MISSION.to_string(),
-                before,
-                after,
-            })
         }
         MissionFocus::HistoryItem(index) if state.mission_history_expanded => {
-            if index >= doc.mission_history.len() {
-                return None;
-            }
-            let mut item = doc.mission_history.remove(index);
-            let before = item_display_text(&item, &item.text);
+            let Some(item) = doc.mission_history.get_mut(index) else {
+                return;
+            };
+            let pending = state.pending_mission_moves.iter().position(|pending| {
+                pending.origin == MissionOrigin::History && pending.index == index
+            });
+
             item.is_checkbox = true;
-            item.checked = Some(false);
-            let after = item_display_text(&item, &item.text);
-            let mission = doc
-                .sections
-                .iter_mut()
-                .find(|section| section.name == SECTION_MISSION)?;
-            mission.items.push(item);
-            state.cursor_item = mission.items.len() - 1;
-            state.mission_focus = MissionFocus::Active;
-            if doc.mission_history.is_empty() {
-                state.mission_history_expanded = false;
+            if let Some(pending) = pending {
+                item.checked = Some(true);
+                state.pending_mission_moves.remove(pending);
+            } else if item.checked.unwrap_or(true) {
+                item.checked = Some(false);
+                state.pending_mission_moves.push(PendingMissionMove {
+                    origin: MissionOrigin::History,
+                    index,
+                    due_at: now + MISSION_RELOCATION_DELAY,
+                });
+            } else {
+                item.checked = Some(true);
             }
-            Some(EditAction::Uncheck {
-                section: SECTION_MISSION.to_string(),
-                before,
-                after,
-            })
         }
-        MissionFocus::HistoryHeader | MissionFocus::HistoryItem(_) => None,
+        MissionFocus::HistoryHeader | MissionFocus::HistoryItem(_) => {}
+    }
+}
+
+/// Relocate every mission row whose grace period has elapsed. Rows remain in
+/// their source section until this function is called at or after `due_at`.
+pub fn settle_pending_mission_moves_at(
+    state: &mut TrajectoryEditState,
+    doc: &mut TrajectoryDoc,
+    now: Instant,
+) -> Vec<EditAction> {
+    // A due move must never invalidate the row currently owned by the insert
+    // buffer. Leave the deadline due; the next tick after Esc settles it.
+    if matches!(state.mode, EditMode::Insert { .. }) {
+        return Vec::new();
+    }
+
+    let mut actions = Vec::new();
+
+    while let Some(pending_pos) = state
+        .pending_mission_moves
+        .iter()
+        .enumerate()
+        .filter(|(_, pending)| pending.due_at <= now)
+        .min_by_key(|(_, pending)| pending.due_at)
+        .map(|(index, _)| index)
+    {
+        let pending = state.pending_mission_moves.remove(pending_pos);
+        match pending.origin {
+            MissionOrigin::Active => {
+                let Some(mission_index) = doc
+                    .sections
+                    .iter()
+                    .position(|section| section.name == SECTION_MISSION)
+                else {
+                    continue;
+                };
+                if pending.index >= doc.sections[mission_index].items.len()
+                    || doc.sections[mission_index].items[pending.index].checked != Some(true)
+                {
+                    continue;
+                }
+                let item = &doc.sections[mission_index].items[pending.index];
+                let mut stable_before = item.clone();
+                stable_before.is_checkbox = true;
+                stable_before.checked = Some(false);
+                let before = item_display_text(&stable_before, &stable_before.text);
+                let after = item_display_text(item, &item.text);
+
+                let mut item = doc.sections[mission_index].items.remove(pending.index);
+                item.is_checkbox = true;
+                item.checked = Some(true);
+                doc.mission_history.push(item);
+                adjust_pending_after_removal(
+                    &mut state.pending_mission_moves,
+                    MissionOrigin::Active,
+                    pending.index,
+                );
+                adjust_mission_focus_after_active_removal(state, doc, pending.index);
+                actions.push(EditAction::Check {
+                    section: SECTION_MISSION.to_string(),
+                    before,
+                    after,
+                });
+            }
+            MissionOrigin::History => {
+                if pending.index >= doc.mission_history.len()
+                    || doc.mission_history[pending.index].checked != Some(false)
+                {
+                    continue;
+                }
+                let item = &doc.mission_history[pending.index];
+                let mut stable_before = item.clone();
+                stable_before.is_checkbox = true;
+                stable_before.checked = Some(true);
+                let before = item_display_text(&stable_before, &stable_before.text);
+                let after = item_display_text(item, &item.text);
+
+                let mut item = doc.mission_history.remove(pending.index);
+                item.is_checkbox = true;
+                item.checked = Some(false);
+                let Some(mission) = doc
+                    .sections
+                    .iter_mut()
+                    .find(|section| section.name == SECTION_MISSION)
+                else {
+                    continue;
+                };
+                mission.items.push(item);
+                adjust_pending_after_removal(
+                    &mut state.pending_mission_moves,
+                    MissionOrigin::History,
+                    pending.index,
+                );
+                adjust_mission_focus_after_history_removal(state, doc, pending.index);
+                actions.push(EditAction::Uncheck {
+                    section: SECTION_MISSION.to_string(),
+                    before,
+                    after,
+                });
+            }
+        }
+    }
+
+    actions
+}
+
+fn adjust_pending_after_removal(
+    pending_moves: &mut [PendingMissionMove],
+    origin: MissionOrigin,
+    removed_index: usize,
+) {
+    for pending in pending_moves {
+        if pending.origin == origin && pending.index > removed_index {
+            pending.index -= 1;
+        }
+    }
+}
+
+fn adjust_mission_focus_after_active_removal(
+    state: &mut TrajectoryEditState,
+    doc: &TrajectoryDoc,
+    removed_index: usize,
+) {
+    let cursor_is_on_mission = doc
+        .sections
+        .get(state.cursor_section)
+        .is_some_and(|section| section.name == SECTION_MISSION);
+    if !cursor_is_on_mission || state.mission_focus != MissionFocus::Active {
+        return;
+    }
+    let active_len = doc
+        .section(SECTION_MISSION)
+        .map(|section| section.items.len())
+        .unwrap_or(0);
+    if active_len == 0 {
+        state.cursor_item = 0;
+        state.mission_focus = MissionFocus::HistoryHeader;
+    } else if state.cursor_item > removed_index {
+        state.cursor_item -= 1;
+    } else if state.cursor_item >= active_len {
+        state.cursor_item = active_len - 1;
+    }
+}
+
+fn adjust_mission_focus_after_history_removal(
+    state: &mut TrajectoryEditState,
+    doc: &TrajectoryDoc,
+    removed_index: usize,
+) {
+    let MissionFocus::HistoryItem(focused_index) = state.mission_focus else {
+        return;
+    };
+    if doc.mission_history.is_empty() {
+        state.mission_history_expanded = false;
+        state.mission_focus = MissionFocus::Active;
+        state.cursor_item = doc
+            .section(SECTION_MISSION)
+            .map(|section| section.items.len().saturating_sub(1))
+            .unwrap_or(0);
+    } else if focused_index > removed_index {
+        state.mission_focus = MissionFocus::HistoryItem(focused_index - 1);
+    } else if focused_index >= doc.mission_history.len() {
+        state.mission_focus = MissionFocus::HistoryItem(doc.mission_history.len() - 1);
     }
 }
 
@@ -1001,6 +1243,13 @@ fn insert_item_below(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
             surface_id: None,
         },
     );
+    if is_mission {
+        adjust_pending_after_insertion(
+            &mut state.pending_mission_moves,
+            MissionOrigin::Active,
+            insert_pos,
+        );
+    }
     state.cursor_item = insert_pos;
     state.mode = EditMode::Insert {
         focus: InsertFocus::Item,
@@ -1034,6 +1283,13 @@ fn insert_item_above(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) {
             surface_id: None,
         },
     );
+    if is_mission {
+        adjust_pending_after_insertion(
+            &mut state.pending_mission_moves,
+            MissionOrigin::Active,
+            insert_pos,
+        );
+    }
     state.cursor_item = insert_pos;
     state.mode = EditMode::Insert {
         focus: InsertFocus::Item,
@@ -1090,6 +1346,14 @@ fn move_item_down(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> O
     }
     let before = item_display_text(&section.items[idx], &section.items[idx].text.clone());
     section.items.swap(idx, idx + 1);
+    if section.name == SECTION_MISSION {
+        adjust_pending_after_swap(
+            &mut state.pending_mission_moves,
+            MissionOrigin::Active,
+            idx,
+            idx + 1,
+        );
+    }
     state.cursor_item += 1;
     Some(EditAction::Move {
         section: section.name.clone(),
@@ -1105,11 +1369,49 @@ fn move_item_up(state: &mut TrajectoryEditState, doc: &mut TrajectoryDoc) -> Opt
     }
     let before = item_display_text(&section.items[idx], &section.items[idx].text.clone());
     section.items.swap(idx, idx - 1);
+    if section.name == SECTION_MISSION {
+        adjust_pending_after_swap(
+            &mut state.pending_mission_moves,
+            MissionOrigin::Active,
+            idx,
+            idx - 1,
+        );
+    }
     state.cursor_item -= 1;
     Some(EditAction::Move {
         section: section.name.clone(),
         before,
     })
+}
+
+fn adjust_pending_after_insertion(
+    pending_moves: &mut [PendingMissionMove],
+    origin: MissionOrigin,
+    inserted_index: usize,
+) {
+    for pending in pending_moves {
+        if pending.origin == origin && pending.index >= inserted_index {
+            pending.index += 1;
+        }
+    }
+}
+
+fn adjust_pending_after_swap(
+    pending_moves: &mut [PendingMissionMove],
+    origin: MissionOrigin,
+    first: usize,
+    second: usize,
+) {
+    for pending in pending_moves {
+        if pending.origin != origin {
+            continue;
+        }
+        if pending.index == first {
+            pending.index = second;
+        } else if pending.index == second {
+            pending.index = first;
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1539,11 +1841,45 @@ workspace: test-ws
     }
 
     #[test]
-    fn x_completes_active_mission_without_deleting_it() {
+    fn x_marks_active_mission_in_place_before_delayed_move() {
         let mut doc = make_doc();
         let mut state = TrajectoryEditState::default();
 
         let actions = handle_key(&mut state, &mut doc, key(KeyCode::Char('x')));
+
+        assert!(actions.is_empty());
+        assert_eq!(doc.section(SECTION_MISSION).unwrap().items.len(), 1);
+        assert_eq!(
+            doc.section(SECTION_MISSION).unwrap().items[0].checked,
+            Some(true)
+        );
+        assert!(doc.mission_history.is_empty());
+        assert_eq!(state.mission_focus, MissionFocus::Active);
+        assert_eq!(state.cursor_item, 0);
+        assert!(state.has_pending_mission_moves());
+    }
+
+    #[test]
+    fn active_mission_moves_only_when_five_second_deadline_is_reached() {
+        let mut doc = make_doc();
+        let mut state = TrajectoryEditState::default();
+        let started_at = Instant::now();
+
+        toggle_mission_completion_at(&mut state, &mut doc, started_at);
+        let early = settle_pending_mission_moves_at(
+            &mut state,
+            &mut doc,
+            started_at + MISSION_RELOCATION_DELAY - Duration::from_millis(1),
+        );
+        assert!(early.is_empty());
+        assert_eq!(doc.section(SECTION_MISSION).unwrap().items.len(), 1);
+        assert!(doc.mission_history.is_empty());
+
+        let actions = settle_pending_mission_moves_at(
+            &mut state,
+            &mut doc,
+            started_at + MISSION_RELOCATION_DELAY,
+        );
 
         assert!(doc.section(SECTION_MISSION).unwrap().items.is_empty());
         assert_eq!(doc.mission_history.len(), 1);
@@ -1554,15 +1890,119 @@ workspace: test-ws
     }
 
     #[test]
-    fn uppercase_x_revives_completed_mission() {
+    fn settling_mission_preserves_cursor_after_navigating_to_beads() {
         let mut doc = make_doc();
         let mut state = TrajectoryEditState::default();
-        handle_key(&mut state, &mut doc, key(KeyCode::Char('x')));
+        let started_at = Instant::now();
+        toggle_mission_completion_at(&mut state, &mut doc, started_at);
+
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('j')));
+        assert_eq!(state.cursor_section, 2);
+        assert_eq!(state.cursor_item, 1);
+        assert_eq!(state.mission_focus, MissionFocus::Active);
+
+        let actions = settle_pending_mission_moves_at(
+            &mut state,
+            &mut doc,
+            started_at + MISSION_RELOCATION_DELAY,
+        );
+
+        assert!(matches!(actions.as_slice(), [EditAction::Check { .. }]));
+        assert_eq!(state.cursor_section, 2);
+        assert_eq!(state.cursor_item, 1);
+        assert_eq!(state.mission_focus, MissionFocus::Active);
+        assert_eq!(doc.sections[2].items[1].text, "sprint-02");
+    }
+
+    #[test]
+    fn due_mission_waits_for_single_row_insert_and_event_uses_edited_text() {
+        let mut doc = make_doc();
+        let mut state = TrajectoryEditState::default();
+        let started_at = Instant::now();
+        toggle_mission_completion_at(&mut state, &mut doc, started_at);
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+        state.edit_buffer = "Build the edited investment agent".to_string();
+
+        let due_at = started_at + MISSION_RELOCATION_DELAY;
+        assert!(settle_pending_mission_moves_at(&mut state, &mut doc, due_at).is_empty());
+        assert_eq!(doc.section(SECTION_MISSION).unwrap().items.len(), 1);
+        assert!(doc.mission_history.is_empty());
+        assert!(state.has_pending_mission_moves());
+
+        let edit_actions = handle_key(&mut state, &mut doc, key(KeyCode::Esc));
+        assert!(matches!(edit_actions.as_slice(), [EditAction::Edit { .. }]));
+        let actions = settle_pending_mission_moves_at(&mut state, &mut doc, due_at);
+
+        assert_eq!(
+            doc.mission_history[0].text,
+            "Build the edited investment agent"
+        );
+        let [EditAction::Check { before, after, .. }] = actions.as_slice() else {
+            panic!("expected one Check action, got {actions:?}");
+        };
+        assert_eq!(before, "- [ ] Build the edited investment agent");
+        assert_eq!(after, "- [x] Build the edited investment agent");
+        assert!(!before.contains("Build investment agent"));
+    }
+
+    #[test]
+    fn due_mission_waits_while_another_row_is_in_insert_mode() {
+        let mut doc = make_doc();
+        doc.sections[0].items.push(Item {
+            text: "Keep editing this row".to_string(),
+            is_checkbox: true,
+            checked: Some(false),
+            surface_id: None,
+        });
+        let mut state = TrajectoryEditState::default();
+        let started_at = Instant::now();
+        toggle_mission_completion_at(&mut state, &mut doc, started_at);
+        state.cursor_item = 1;
+        handle_key(&mut state, &mut doc, key(KeyCode::Char('i')));
+
+        let due_at = started_at + MISSION_RELOCATION_DELAY;
+        assert!(settle_pending_mission_moves_at(&mut state, &mut doc, due_at).is_empty());
+        assert_eq!(doc.section(SECTION_MISSION).unwrap().items.len(), 2);
+        assert!(doc.mission_history.is_empty());
+
+        handle_key(&mut state, &mut doc, key(KeyCode::Esc));
+        let actions = settle_pending_mission_moves_at(&mut state, &mut doc, due_at);
+        assert!(matches!(actions.as_slice(), [EditAction::Check { .. }]));
+        assert_eq!(doc.section(SECTION_MISSION).unwrap().items.len(), 1);
+        assert_eq!(
+            doc.section(SECTION_MISSION).unwrap().items[0].text,
+            "Keep editing this row"
+        );
+        assert_eq!(doc.mission_history[0].text, "Build investment agent");
+    }
+
+    #[test]
+    fn uppercase_x_marks_history_in_place_then_revives_after_delay() {
+        let mut doc = make_doc();
+        let mut state = TrajectoryEditState::default();
+        let started_at = Instant::now();
+        toggle_mission_completion_at(&mut state, &mut doc, started_at);
+        settle_pending_mission_moves_at(
+            &mut state,
+            &mut doc,
+            started_at + MISSION_RELOCATION_DELAY,
+        );
         state.mission_history_expanded = true;
         state.mission_focus = MissionFocus::HistoryItem(0);
 
         let actions = handle_key(&mut state, &mut doc, shift_key('X'));
 
+        assert!(actions.is_empty());
+        assert_eq!(doc.mission_history.len(), 1);
+        assert_eq!(doc.mission_history[0].checked, Some(false));
+        assert!(doc.section(SECTION_MISSION).unwrap().items.is_empty());
+        assert_eq!(state.mission_focus, MissionFocus::HistoryItem(0));
+
+        doc.mission_history[0].text = "Revive the edited completed mission".to_string();
+        let due_at = state.pending_mission_moves[0].due_at;
+        let actions = settle_pending_mission_moves_at(&mut state, &mut doc, due_at);
         assert!(doc.mission_history.is_empty());
         assert_eq!(doc.section(SECTION_MISSION).unwrap().items.len(), 1);
         assert_eq!(
@@ -1570,14 +2010,103 @@ workspace: test-ws
             Some(false)
         );
         assert_eq!(state.mission_focus, MissionFocus::Active);
-        assert!(matches!(actions.as_slice(), [EditAction::Uncheck { .. }]));
+        let [EditAction::Uncheck { before, after, .. }] = actions.as_slice() else {
+            panic!("expected one Uncheck action, got {actions:?}");
+        };
+        assert_eq!(before, "- [x] Revive the edited completed mission");
+        assert_eq!(after, "- [ ] Revive the edited completed mission");
+    }
+
+    #[test]
+    fn second_x_during_grace_period_cancels_relocation() {
+        let mut doc = make_doc();
+        let mut state = TrajectoryEditState::default();
+        let started_at = Instant::now();
+
+        toggle_mission_completion_at(&mut state, &mut doc, started_at);
+        toggle_mission_completion_at(&mut state, &mut doc, started_at + Duration::from_secs(1));
+
+        assert_eq!(
+            doc.section(SECTION_MISSION).unwrap().items[0].checked,
+            Some(false)
+        );
+        assert!(!state.has_pending_mission_moves());
+        let actions = settle_pending_mission_moves_at(
+            &mut state,
+            &mut doc,
+            started_at + Duration::from_secs(10),
+        );
+        assert!(actions.is_empty());
+        assert_eq!(doc.section(SECTION_MISSION).unwrap().items.len(), 1);
+        assert!(doc.mission_history.is_empty());
+    }
+
+    #[test]
+    fn multiple_pending_missions_settle_without_index_drift() {
+        let mut doc = make_doc();
+        doc.sections
+            .iter_mut()
+            .find(|section| section.name == SECTION_MISSION)
+            .unwrap()
+            .items
+            .push(Item {
+                text: "Ship the dashboard".to_string(),
+                is_checkbox: true,
+                checked: Some(false),
+                surface_id: None,
+            });
+        let mut state = TrajectoryEditState::default();
+        let started_at = Instant::now();
+
+        toggle_mission_completion_at(&mut state, &mut doc, started_at);
+        state.cursor_item = 1;
+        toggle_mission_completion_at(&mut state, &mut doc, started_at);
+        let actions = settle_pending_mission_moves_at(
+            &mut state,
+            &mut doc,
+            started_at + MISSION_RELOCATION_DELAY,
+        );
+
+        assert_eq!(actions.len(), 2);
+        assert!(doc.section(SECTION_MISSION).unwrap().items.is_empty());
+        assert_eq!(doc.mission_history.len(), 2);
+        assert_eq!(doc.mission_history[0].text, "Build investment agent");
+        assert_eq!(doc.mission_history[1].text, "Ship the dashboard");
+        assert!(!state.has_pending_mission_moves());
+    }
+
+    #[test]
+    fn pending_checkbox_preview_is_not_normalized_when_persisted() {
+        let mut doc = make_doc();
+        let mut state = TrajectoryEditState::default();
+        toggle_mission_completion_at(&mut state, &mut doc, Instant::now());
+        assert_eq!(
+            doc.section(SECTION_MISSION).unwrap().items[0].checked,
+            Some(true)
+        );
+
+        let persisted = stable_doc_for_persistence(&doc, Some(&state));
+        let reparsed = TrajectoryDoc::parse(&persisted.to_markdown()).unwrap();
+
+        assert_eq!(reparsed.section(SECTION_MISSION).unwrap().items.len(), 1);
+        assert_eq!(
+            reparsed.section(SECTION_MISSION).unwrap().items[0].checked,
+            Some(false)
+        );
+        assert!(reparsed.mission_history.is_empty());
     }
 
     #[test]
     fn enter_toggles_mission_history_fold() {
         let mut doc = make_doc();
         let mut state = TrajectoryEditState::default();
-        handle_key(&mut state, &mut doc, key(KeyCode::Char('x')));
+        let started_at = Instant::now();
+        toggle_mission_completion_at(&mut state, &mut doc, started_at);
+        settle_pending_mission_moves_at(
+            &mut state,
+            &mut doc,
+            started_at + MISSION_RELOCATION_DELAY,
+        );
 
         handle_key(&mut state, &mut doc, key(KeyCode::Enter));
         assert!(state.mission_history_expanded);
@@ -1934,15 +2463,18 @@ workspace: test-ws
     fn x_still_deletes_in_one_keypress() {
         let mut doc = TrajectoryDoc::default();
         doc.ensure_sections();
-        doc.sections[0].items.push(Item {
+        doc.sections[2].items.push(Item {
             text: "x".to_string(),
             is_checkbox: false,
             checked: None,
             surface_id: None,
         });
-        let mut state = TrajectoryEditState::default();
+        let mut state = TrajectoryEditState {
+            cursor_section: 2,
+            ..Default::default()
+        };
         handle_key(&mut state, &mut doc, key(KeyCode::Char('x')));
-        assert_eq!(doc.sections[0].items.len(), 0);
+        assert_eq!(doc.sections[2].items.len(), 0);
     }
 
     // ── Part 1: block edit keys on Current surfaces ──────────────────────────

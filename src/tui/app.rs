@@ -1276,9 +1276,9 @@ impl App {
     }
 
     pub async fn apply_beads_refresh_snapshot(&mut self, snap: BeadsRefreshSnapshot) {
-        self.apply_beads_refresh_snapshot_with_saver(snap, |uuid, doc| {
+        self.apply_beads_refresh_snapshot_with_saver(snap, |uuid, stable_doc| {
             let traj_path = crate::mc_data::paths::trajectory_path(uuid);
-            if let Err(e) = doc.save_to_file(&traj_path) {
+            if let Err(e) = stable_doc.save_to_file(&traj_path) {
                 eprintln!("save trajectory after beads refresh ({uuid}): {e:?}");
             }
         });
@@ -1324,7 +1324,11 @@ impl App {
             }
 
             doc.replace_section_items(crate::mc_data::trajectory::SECTION_GOALS, beads_items);
-            save(&ws_state.workspace.uuid, doc);
+            let persisted = crate::tui::trajectory_edit::stable_doc_for_persistence(
+                doc,
+                ws_state.edit_state.as_ref(),
+            );
+            save(&ws_state.workspace.uuid, &persisted);
         }
     }
 
@@ -1479,7 +1483,12 @@ impl App {
                         .get(&ws.uuid)
                         .and_then(|s| s.as_ref())
                         .is_some();
-                    in_insert || in_peek
+                    let has_pending_mission_move = old_edit_states
+                        .get(&ws.uuid)
+                        .and_then(|s| s.as_ref())
+                        .map(|s| s.has_pending_mission_moves())
+                        .unwrap_or(false);
+                    in_insert || in_peek || has_pending_mission_move
                 };
                 let trajectory = if is_actively_user_owned {
                     old_trajectories.get(&ws.uuid).cloned().flatten()
@@ -1574,6 +1583,11 @@ impl App {
                 .as_ref()
                 .map(|s| matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. }))
                 .unwrap_or(false)
+                || ws_state
+                    .edit_state
+                    .as_ref()
+                    .map(|s| s.has_pending_mission_moves())
+                    .unwrap_or(false)
                 || ws_state.peek_state.is_some()
             {
                 continue;
@@ -1612,8 +1626,12 @@ impl App {
                 continue;
             }
             doc.replace_section_items(crate::mc_data::trajectory::SECTION_MISSION, goal_items);
+            let persisted = crate::tui::trajectory_edit::stable_doc_for_persistence(
+                doc,
+                ws_state.edit_state.as_ref(),
+            );
             let traj_path = crate::mc_data::paths::trajectory_path(&ws_state.workspace.uuid);
-            if let Err(e) = doc.save_to_file(&traj_path) {
+            if let Err(e) = persisted.save_to_file(&traj_path) {
                 eprintln!(
                     "seed Mission from description ({}): {e:?}",
                     ws_state.workspace.uuid
@@ -1887,8 +1905,12 @@ impl App {
                 doc.replace_section_items(crate::mc_data::trajectory::SECTION_GOALS, items);
             }
 
+            let persisted = crate::tui::trajectory_edit::stable_doc_for_persistence(
+                doc,
+                ws_state.edit_state.as_ref(),
+            );
             let traj_path = crate::mc_data::paths::trajectory_path(&ws_state.workspace.uuid);
-            if let Err(e) = doc.save_to_file(&traj_path) {
+            if let Err(e) = persisted.save_to_file(&traj_path) {
                 eprintln!(
                     "save trajectory after surface refresh ({}): {e:?}",
                     ws_state.workspace.uuid
@@ -2328,7 +2350,10 @@ impl App {
         let is_editing = self.workspaces[idx]
             .edit_state
             .as_ref()
-            .map(|s| matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. }))
+            .map(|s| {
+                matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. })
+                    || s.has_pending_mission_moves()
+            })
             .unwrap_or(false);
         if is_editing {
             return;
@@ -2378,7 +2403,10 @@ impl App {
                 let is_editing = ws
                     .edit_state
                     .as_ref()
-                    .map(|s| matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. }))
+                    .map(|s| {
+                        matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. })
+                            || s.has_pending_mission_moves()
+                    })
                     .unwrap_or(false);
                 if is_editing {
                     return false;
@@ -2515,7 +2543,10 @@ impl App {
         let is_editing = self.workspaces[idx]
             .edit_state
             .as_ref()
-            .map(|s| matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. }))
+            .map(|s| {
+                matches!(s.mode, crate::tui::trajectory_edit::EditMode::Insert { .. })
+                    || s.has_pending_mission_moves()
+            })
             .unwrap_or(false);
         if is_editing {
             // Clear in-flight flag so the next tick can retry.
@@ -3360,6 +3391,85 @@ impl App {
         doc.sort_tasks_if_long();
         let n = crate::tui::trajectory_edit::save(&uuid, doc, state, actions)?;
         Ok(Some(n))
+    }
+
+    /// Commit due mission checkbox relocations for every workspace. Each row
+    /// stays in its original section for the five-second grace period; this is
+    /// the only periodic path that crosses it into Mission History or Mission.
+    ///
+    /// Returns `(workspace_ref, active_mission_text)` pairs so the event loop
+    /// can mirror the settled Mission back to cmux without blocking the tick.
+    pub fn settle_pending_mission_moves_at(&mut self, now: Instant) -> Vec<(String, String)> {
+        self.settle_pending_mission_moves_with_saver(now, |uuid, doc, state, actions| {
+            crate::tui::trajectory_edit::save(uuid, doc, state, actions).map(|_| ())
+        })
+    }
+
+    fn settle_pending_mission_moves_with_saver<F>(
+        &mut self,
+        now: Instant,
+        mut save: F,
+    ) -> Vec<(String, String)>
+    where
+        F: FnMut(
+            &str,
+            &mut crate::mc_data::trajectory::TrajectoryDoc,
+            &crate::tui::trajectory_edit::TrajectoryEditState,
+            &[crate::tui::trajectory_edit::EditAction],
+        ) -> anyhow::Result<()>,
+    {
+        let mut settled = Vec::new();
+        for ws in &mut self.workspaces {
+            let (Some(doc), Some(state)) = (ws.trajectory.as_mut(), ws.edit_state.as_mut()) else {
+                continue;
+            };
+            // Settle copy-on-write: the live preview and pending timer remain
+            // intact unless every persistence step succeeds.
+            let mut next_doc = doc.clone();
+            let mut next_state = state.clone();
+            let actions = crate::tui::trajectory_edit::settle_pending_mission_moves_at(
+                &mut next_state,
+                &mut next_doc,
+                now,
+            );
+            if actions.is_empty() {
+                continue;
+            }
+
+            next_doc.sort_tasks_if_long();
+            if let Err(error) = save(
+                &ws.workspace.uuid,
+                &mut next_doc,
+                &next_state,
+                &actions,
+            ) {
+                eprintln!(
+                    "settle_pending_mission_moves({}): {error:?}",
+                    ws.workspace.uuid
+                );
+                continue;
+            }
+
+            let description = next_doc
+                .section(crate::mc_data::trajectory::SECTION_MISSION)
+                .map(|section| {
+                    section
+                        .items
+                        .iter()
+                        .map(|item| item.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            *doc = next_doc;
+            *state = next_state;
+            settled.push((ws.workspace.ref_id.clone(), description));
+        }
+        settled
+    }
+
+    pub fn settle_pending_mission_moves(&mut self) -> Vec<(String, String)> {
+        self.settle_pending_mission_moves_at(Instant::now())
     }
 
     /// Spawn a fire-and-forget task to push the current Mission section back to
@@ -4525,6 +4635,109 @@ platforms:
         assert_eq!(beads.items[1].checked, Some(false));
     }
 
+    #[tokio::test]
+    async fn refresh_projection_persists_stable_mission_preview_and_cancel() {
+        struct HomeGuard(Option<std::ffi::OsString>);
+        impl Drop for HomeGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => unsafe { std::env::set_var("HOME", value) },
+                    None => unsafe { std::env::remove_var("HOME") },
+                }
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard(std::env::var_os("HOME"));
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.handle_trajectory_key(key(KeyCode::Char('x')));
+        let workspace = app.workspaces[0].workspace.clone();
+        let snapshot = |surface_title: &str| {
+            let mut surfaces_map = HashMap::new();
+            surfaces_map.insert(
+                workspace.ref_id.clone(),
+                vec![SurfaceInfo {
+                    title: surface_title.to_string(),
+                    ref_id: "surface:stable-preview".to_string(),
+                    uuid: None,
+                    pane_ref: None,
+                    tty: None,
+                    kind: crate::mc_data::surface_kind::SurfaceKind::Shell,
+                    selected: true,
+                    focused: true,
+                    active: true,
+                    index: Some(0),
+                    index_in_pane: Some(0),
+                    surface_type: None,
+                }],
+            );
+            RefreshSnapshot {
+                workspaces: vec![workspace.clone()],
+                surfaces_map,
+                sessions_by_ws_id: HashMap::new(),
+                beads_by_ws_id: HashMap::new(),
+                linear_by_ws_id: HashMap::new(),
+                surface_intents_by_ws_id: HashMap::new(),
+            }
+        };
+
+        let first = snapshot("first projected surface");
+        app.apply_refresh_snapshot(first, None).await;
+        assert_eq!(
+            app.workspaces[0]
+                .trajectory
+                .as_ref()
+                .unwrap()
+                .section(crate::mc_data::trajectory::SECTION_MISSION)
+                .unwrap()
+                .items[0]
+                .checked,
+            Some(true)
+        );
+        let persisted = crate::mc_data::trajectory::TrajectoryDoc::load_from_file(
+            &crate::mc_data::paths::trajectory_path("test-uuid-1"),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted
+                .section(crate::mc_data::trajectory::SECTION_MISSION)
+                .unwrap()
+                .items[0]
+                .checked,
+            Some(false)
+        );
+        assert!(persisted.mission_history.is_empty());
+
+        app.handle_trajectory_key(key(KeyCode::Char('x')));
+        let second = snapshot("second projected surface");
+        app.apply_refresh_snapshot(second, None).await;
+        let persisted = crate::mc_data::trajectory::TrajectoryDoc::load_from_file(
+            &crate::mc_data::paths::trajectory_path("test-uuid-1"),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted
+                .section(crate::mc_data::trajectory::SECTION_MISSION)
+                .unwrap()
+                .items[0]
+                .checked,
+            Some(false)
+        );
+        assert!(persisted.mission_history.is_empty());
+        assert!(
+            persisted
+                .section(crate::mc_data::trajectory::SECTION_CURRENT_SURFACES)
+                .unwrap()
+                .items[0]
+                .text
+                .contains("second projected surface")
+        );
+    }
+
     #[test]
     fn beads_refresh_targets_collect_visible_beads_repos() {
         let repo_a = std::path::PathBuf::from("/tmp/repo-a");
@@ -4611,6 +4824,86 @@ platforms:
         assert!(beads.items[1].text.contains("new-1"));
         assert!(beads.items[1].text.contains("Newly created issue"));
         assert!(beads.items.iter().all(|i| !i.text.contains("old-1")));
+    }
+
+    #[test]
+    fn beads_refresh_persists_stable_mission_during_preview_and_after_cancel() {
+        let repo = std::path::PathBuf::from("/tmp/repo-live");
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.handle_trajectory_key(key(KeyCode::Char('x')));
+
+        let snapshot = |generation, id: &str| {
+            let mut beads_by_ws_id = HashMap::new();
+            beads_by_ws_id.insert(
+                "test-uuid-1".to_string(),
+                crate::mc_data::beads::WorkspaceBeadsView {
+                    repos: vec![crate::mc_data::beads::BeadsView {
+                        repo_path: repo.clone(),
+                        source: crate::mc_data::beads::BeadsSource::BdList,
+                        issues: vec![test_bead_issue(id, "Fresh issue", "2026-06-04T19:00:00Z")],
+                    }],
+                    repo_by_surface_ref: HashMap::new(),
+                },
+            );
+            BeadsRefreshSnapshot {
+                generation,
+                beads_by_ws_id,
+            }
+        };
+
+        let mut saved_preview = None;
+        app.apply_beads_refresh_snapshot_with_saver(
+            snapshot(app.beads_generation, "new-1"),
+            |_, doc| saved_preview = Some(doc.clone()),
+        );
+
+        let live_mission = app.workspaces[0]
+            .trajectory
+            .as_ref()
+            .unwrap()
+            .section(crate::mc_data::trajectory::SECTION_MISSION)
+            .unwrap();
+        assert_eq!(live_mission.items[0].checked, Some(true));
+        let restarted = crate::mc_data::trajectory::TrajectoryDoc::parse(
+            &saved_preview.unwrap().to_markdown(),
+        )
+        .unwrap();
+        assert_eq!(
+            restarted
+                .section(crate::mc_data::trajectory::SECTION_MISSION)
+                .unwrap()
+                .items[0]
+                .checked,
+            Some(false)
+        );
+        assert!(restarted.mission_history.is_empty());
+
+        // Cancelling within the grace period leaves the same stable restart
+        // state, and a subsequent real Beads write can persist normally.
+        app.handle_trajectory_key(key(KeyCode::Char('x')));
+        assert!(!app.workspaces[0]
+            .edit_state
+            .as_ref()
+            .unwrap()
+            .has_pending_mission_moves());
+        let mut saved_after_cancel = None;
+        app.apply_beads_refresh_snapshot_with_saver(
+            snapshot(app.beads_generation, "new-2"),
+            |_, doc| saved_after_cancel = Some(doc.clone()),
+        );
+        let restarted = crate::mc_data::trajectory::TrajectoryDoc::parse(
+            &saved_after_cancel.unwrap().to_markdown(),
+        )
+        .unwrap();
+        assert_eq!(
+            restarted
+                .section(crate::mc_data::trajectory::SECTION_MISSION)
+                .unwrap()
+                .items[0]
+                .checked,
+            Some(false)
+        );
+        assert!(restarted.mission_history.is_empty());
     }
 
     #[tokio::test]
@@ -5097,6 +5390,78 @@ workspace: test-ws
     }
 
     #[test]
+    fn workspaces_due_for_regen_excludes_pending_mission_relocation() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.workspaces[0].regen.events_since_last_regen = 15;
+        app.handle_trajectory_key(key(KeyCode::Char('x')));
+
+        assert!(
+            app.workspaces[0]
+                .edit_state
+                .as_ref()
+                .unwrap()
+                .has_pending_mission_moves()
+        );
+        assert!(
+            app.workspaces_due_for_regen().is_empty(),
+            "regen must not normalize a checked Mission preview before its deadline"
+        );
+    }
+
+    #[test]
+    fn failed_settle_save_keeps_preview_and_retries_the_due_move() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.handle_trajectory_key(key(KeyCode::Char('x')));
+        let due_at = Instant::now() + std::time::Duration::from_secs(6);
+
+        let settled = app.settle_pending_mission_moves_with_saver(
+            due_at,
+            |_, _, _, _| anyhow::bail!("deterministic save failure"),
+        );
+        assert!(settled.is_empty());
+        let live_doc = app.workspaces[0].trajectory.as_ref().unwrap();
+        assert_eq!(
+            live_doc
+                .section(crate::mc_data::trajectory::SECTION_MISSION)
+                .unwrap()
+                .items[0]
+                .checked,
+            Some(true)
+        );
+        assert!(live_doc.mission_history.is_empty());
+        assert!(app.workspaces[0]
+            .edit_state
+            .as_ref()
+            .unwrap()
+            .has_pending_mission_moves());
+
+        let mut saved_actions = 0;
+        let settled = app.settle_pending_mission_moves_with_saver(
+            due_at,
+            |_, _, _, actions| {
+                saved_actions = actions.len();
+                Ok(())
+            },
+        );
+        assert_eq!(saved_actions, 1);
+        assert_eq!(settled.len(), 1);
+        let live_doc = app.workspaces[0].trajectory.as_ref().unwrap();
+        assert!(
+            live_doc
+                .section(crate::mc_data::trajectory::SECTION_MISSION)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        assert_eq!(live_doc.mission_history.len(), 1);
+        assert!(!app.workspaces[0]
+            .edit_state
+            .as_ref()
+            .unwrap()
+            .has_pending_mission_moves());
+    }
+
+    #[test]
     fn workspaces_due_for_regen_excludes_in_flight() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
         app.workspaces[0].regen.events_since_last_regen = 15;
@@ -5298,6 +5663,38 @@ workspace: test-ws
             !goal_items.iter().any(|t| t.contains("Should not appear")),
             "trajectory should NOT be replaced while in insert mode"
         );
+    }
+
+    #[test]
+    fn apply_regenerated_trajectory_skips_pending_mission_relocation() {
+        use crate::mc_data::trajectory::TrajectoryDoc;
+
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        app.workspaces[0].regen.regen_in_flight = true;
+        app.handle_trajectory_key(key(KeyCode::Char('x')));
+
+        let new_doc = TrajectoryDoc::parse(
+            "---\nworkspace: test-ws\n---\n\n## Mission\n- Should not appear\n\n## Current surfaces\n\n## Beads\n",
+        )
+        .unwrap();
+        app.apply_regenerated_trajectory("test-uuid-1", new_doc);
+
+        let mission = app.workspaces[0]
+            .trajectory
+            .as_ref()
+            .unwrap()
+            .section(crate::mc_data::trajectory::SECTION_MISSION)
+            .unwrap();
+        assert_eq!(mission.items[0].text, "Build investment agent");
+        assert_eq!(mission.items[0].checked, Some(true));
+        assert!(
+            app.workspaces[0]
+                .edit_state
+                .as_ref()
+                .unwrap()
+                .has_pending_mission_moves()
+        );
+        assert!(!app.workspaces[0].regen.regen_in_flight);
     }
 
     // ── T10: D dismissal confirmation ─────────────────────────────────────────

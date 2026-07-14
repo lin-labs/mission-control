@@ -1567,6 +1567,19 @@ async fn run_app(
 
 
             _ = peek_tick.tick() => {
+                for (workspace_ref, description) in app.settle_pending_mission_moves() {
+                    let client = cmux_client.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = client
+                            .set_workspace_description(&workspace_ref, &description)
+                            .await
+                        {
+                            eprintln!(
+                                "set_workspace_description({workspace_ref}) after mission settle: {error:?}"
+                            );
+                        }
+                    });
+                }
                 if let Some((uuid, surface_ref)) = app.peek_needs_poll() {
                     let uuid = uuid.to_string();
                     let surface_ref = surface_ref.to_string();
