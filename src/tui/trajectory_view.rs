@@ -789,7 +789,11 @@ fn render_mission_section<'a>(
                 cursor_line = Some(lines.len() as u16);
             }
             lines.push(mission_item_line(
-                "- [ ] ",
+                if item.checked.unwrap_or(false) {
+                    "- [x] "
+                } else {
+                    "- [ ] "
+                },
                 &item.text,
                 active_cursor,
                 active_insert,
@@ -834,7 +838,17 @@ fn render_mission_section<'a>(
             if cursor {
                 cursor_line = Some(lines.len() as u16);
             }
-            let mut line = mission_item_line("- [x] ", &item.text, cursor, None, focused);
+            let mut line = mission_item_line(
+                if item.checked.unwrap_or(true) {
+                    "- [x] "
+                } else {
+                    "- [ ] "
+                },
+                &item.text,
+                cursor,
+                None,
+                focused,
+            );
             if !cursor {
                 for span in &mut line.spans {
                     span.style = span.style.fg(Color::DarkGray);
@@ -983,6 +997,43 @@ workspace: predinvest
                 .iter()
                 .any(|line| line.contains("Finished mission 15"))
         );
+    }
+
+    #[test]
+    fn pending_mission_toggles_render_in_place_before_relocation() {
+        let section = Section {
+            name: crate::mc_data::trajectory::SECTION_MISSION.to_string(),
+            items: vec![crate::mc_data::trajectory::Item {
+                text: "Just completed".to_string(),
+                is_checkbox: true,
+                checked: Some(true),
+                surface_id: None,
+            }],
+        };
+        let history = vec![crate::mc_data::trajectory::Item {
+            text: "Just revived".to_string(),
+            is_checkbox: true,
+            checked: Some(false),
+            surface_id: None,
+        }];
+        let edit_state = TrajectoryEditState {
+            mission_history_expanded: true,
+            ..TrajectoryEditState::default()
+        };
+        let mut lines = Vec::new();
+
+        let _ = render_mission_section(
+            &mut lines,
+            &section,
+            &history,
+            0,
+            Some(&edit_state),
+            true,
+        );
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert!(rendered.iter().any(|line| line == "- [x] Just completed"));
+        assert!(rendered.iter().any(|line| line == "- [ ] Just revived"));
     }
 
     #[test]
