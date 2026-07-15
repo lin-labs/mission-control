@@ -95,6 +95,11 @@ Meta-patterns observed so far:
   process at a fresh temporary auth config (for example `CLOUDSDK_CONFIG`) and
   live-launch the TUI. This verifies the non-fatal warning path without
   disturbing the user's real authenticated profile.
+- **Exercise every credential source without printing secrets**. For shell
+  startup files, use an isolated `ZDOTDIR` fixture to prove the exact startup
+  semantics, authenticate the real key with an HTTP-status-only probe, rerun
+  the F6 help-output guard, then reload the pinned `mc` and verify its loaded
+  executable inode matches the release artifact.
 - **File-logged diagnostics for TUI bugs**. The TUI captures stderr to
   the alt-screen, so `eprintln!` is invisible to the user. Writing to
   `/tmp/mc-peek-debug.log` (or similar) with `OpenOptions::append`
