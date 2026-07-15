@@ -815,12 +815,20 @@ async fn run_app(
     let (refresh_tx, mut refresh_rx) =
         mpsc::channel::<anyhow::Result<crate::tui::app::RefreshSnapshot>>(4);
     let mut refresh_inflight: bool = false;
+    let (mesh_refresh_tx, mut mesh_refresh_rx) =
+        mpsc::channel::<crate::mc_data::arcmux_mesh::MeshFetch>(4);
+    let mut mesh_refresh_inflight: bool = false;
     let (beads_refresh_tx, mut beads_refresh_rx) =
         mpsc::channel::<crate::tui::app::BeadsRefreshSnapshot>(4);
     let mut beads_refresh_inflight: bool = false;
     let (linear_open_tx, mut linear_open_rx) = mpsc::channel::<Result<(), String>>(4);
 
     let mut refresh_interval = interval(Duration::from_secs(30));
+    let mut mesh_refresh_interval = interval_at(
+        TokioInstant::now() + Duration::from_secs(5),
+        Duration::from_secs(5),
+    );
+    mesh_refresh_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut beads_refresh_interval = interval(Duration::from_secs(5));
     let mut screen_interval = interval(Duration::from_secs(15));
     let mut remote_grab_interval = interval(Duration::from_secs(5));
@@ -842,7 +850,7 @@ async fn run_app(
     let mut prev_surface_counts: HashMap<String, u32> = HashMap::new();
 
     // Channel for peek-mode screen-poll results: (workspace_uuid, screen_text)
-    let (peek_tx, mut peek_rx) = mpsc::channel::<(String, String)>(64);
+    let (peek_tx, mut peek_rx) = mpsc::channel::<(String, String, u64, String)>(64);
 
     // Tick for peek-mode polling (~200ms; cheap because peek_needs_poll is a no-op
     // unless a workspace is actually in peek mode and past its poll deadline).
@@ -1457,6 +1465,25 @@ async fn run_app(
                 }
             }
 
+            _ = mesh_refresh_interval.tick() => {
+                // Mesh activity/freshness is volatile and must feel local. Poll
+                // only arcmux's three loopback projections on this short cadence;
+                // never drag the full cmux/session/tracker refresh down to 5s.
+                // The full gather fetches mesh state only at its end, so this
+                // independent cadence cannot be overwritten by a snapshot that
+                // sat stale during slow session parsing.
+                if !mesh_refresh_inflight {
+                    mesh_refresh_inflight = true;
+                    let tx = mesh_refresh_tx.clone();
+                    tokio::spawn(async move {
+                        let fetch = crate::mc_data::arcmux_mesh::ArcmuxMeshClient::default()
+                            .fetch()
+                            .await;
+                        let _ = tx.send(fetch).await;
+                    });
+                }
+            }
+
             _ = beads_refresh_interval.tick() => {
                 if !beads_refresh_inflight && !refresh_inflight {
                     let targets = app.beads_refresh_targets();
@@ -1510,6 +1537,11 @@ async fn run_app(
                         eprintln!("refresh: gather failed: {e:?}");
                     }
                 }
+            }
+
+            Some(mesh_fetch) = mesh_refresh_rx.recv() => {
+                mesh_refresh_inflight = false;
+                app.apply_mesh_fetch(mesh_fetch);
             }
 
             Some(result) = linear_open_rx.recv() => {
@@ -1591,7 +1623,7 @@ async fn run_app(
             }
 
             _ = peek_tick.tick() => {
-                if let Some((uuid, surface_ref)) = app.peek_needs_poll() {
+                if let Some((uuid, surface_ref, peek_id)) = app.peek_needs_poll() {
                     let uuid = uuid.to_string();
                     let surface_ref = surface_ref.to_string();
                     let uses_cmux = app.workspaces.iter()
@@ -1616,7 +1648,7 @@ async fn run_app(
                             .ok()
                             .and_then(|r| r.ok())
                             .unwrap_or_default();
-                            let _ = tx.send((uuid, result)).await;
+                            let _ = tx.send((uuid, surface_ref, peek_id, result)).await;
                         });
                     } else {
                         // Agent source: read the session log synchronously and
@@ -1626,8 +1658,8 @@ async fn run_app(
                 }
             }
 
-            Some((uuid, screen_text)) = peek_rx.recv() => {
-                app.apply_peek_screen_update(&uuid, screen_text);
+            Some((uuid, surface_ref, peek_id, screen_text)) = peek_rx.recv() => {
+                app.apply_peek_screen_update(&uuid, &surface_ref, peek_id, screen_text);
             }
 
             _ = regen_tick.tick() => {

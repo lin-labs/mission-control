@@ -714,6 +714,9 @@ impl WorkspaceState {
 
     /// Derive the host from session or surface titles.
     pub fn host_name(&self) -> String {
+        if self.has_local_agent_surface() && self.has_active_remote_surfaces() {
+            return "mixed".to_string();
+        }
         let mut devices: Vec<&str> = self
             .remote_surfaces
             .values()
@@ -766,16 +769,166 @@ fn retain_remote_surfaces_as_stale(
     old: &HashMap<String, crate::mc_data::arcmux_mesh::RemoteSurfaceState>,
     surfaces: &[SurfaceInfo],
 ) -> HashMap<String, crate::mc_data::arcmux_mesh::RemoteSurfaceState> {
-    let mut stale = old.clone();
-    for remote in stale.values_mut() {
-        remote.mark_stale();
+    rekey_remote_surfaces(old, surfaces, true)
+}
+
+fn rekey_remote_surfaces(
+    old: &HashMap<String, crate::mc_data::arcmux_mesh::RemoteSurfaceState>,
+    surfaces: &[SurfaceInfo],
+    mark_stale: bool,
+) -> HashMap<String, crate::mc_data::arcmux_mesh::RemoteSurfaceState> {
+    // `surface:N` is a transient cmux ref and can be renumbered. Retain only
+    // by the stable surface UUID carried by both the binding and current cmux
+    // inventory, then re-key the state under the current ref. This preserves
+    // exact identity through a projection outage without title/cwd guessing.
+    let mut stale = HashMap::new();
+    for surface in surfaces {
+        let Some(surface_uuid) = surface.uuid.as_deref() else {
+            continue;
+        };
+        let Some(previous) = old
+            .values()
+            .find(|state| state.surface_uuid.eq_ignore_ascii_case(surface_uuid))
+        else {
+            continue;
+        };
+        let mut retained = previous.clone();
+        if mark_stale {
+            retained.mark_stale();
+        }
+        stale.insert(surface.ref_id.clone(), retained);
     }
-    stale.retain(|surface_ref, _| {
-        surfaces
-            .iter()
-            .any(|surface| &surface.ref_id == surface_ref)
-    });
     stale
+}
+
+fn fold_gone_remote_rows(workspace: &mut WorkspaceState) {
+    let gone: std::collections::HashSet<&str> = workspace
+        .remote_surfaces
+        .iter()
+        .filter_map(|(surface_ref, state)| {
+            (state.freshness == crate::mc_data::arcmux_mesh::RemoteFreshness::Gone)
+                .then_some(surface_ref.as_str())
+        })
+        .collect();
+    if gone.is_empty() {
+        return;
+    }
+    let Some(doc) = workspace.trajectory.as_mut() else {
+        return;
+    };
+    let Some(section_idx) = doc
+        .sections
+        .iter()
+        .position(|section| section.name == crate::mc_data::trajectory::SECTION_CURRENT_SURFACES)
+    else {
+        return;
+    };
+    let cursor_before = workspace
+        .edit_state
+        .as_ref()
+        .filter(|edit| edit.cursor_section == section_idx)
+        .map(|edit| edit.cursor_item);
+    let section = &mut doc.sections[section_idx];
+    let removed_before_cursor = cursor_before
+        .map(|cursor| {
+            section
+                .items
+                .iter()
+                .take(cursor)
+                .filter(|item| {
+                    item.surface_id
+                        .as_deref()
+                        .is_some_and(|surface_ref| gone.contains(surface_ref))
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let before = section.items.len();
+    section.items.retain(|item| {
+        !item
+            .surface_id
+            .as_deref()
+            .is_some_and(|surface_ref| gone.contains(surface_ref))
+    });
+    if section.items.len() == before {
+        return;
+    }
+
+    let Some(edit) = workspace.edit_state.as_mut() else {
+        return;
+    };
+    if edit.cursor_section != section_idx {
+        return;
+    }
+    if !section.items.is_empty() {
+        edit.cursor_item = edit
+            .cursor_item
+            .saturating_sub(removed_before_cursor)
+            .min(section.items.len() - 1);
+        return;
+    }
+    // Move an orphaned cursor to another visible section. If the document is
+    // otherwise empty, leave it on the Current header; Enter explicitly no-ops
+    // on a header with no item.
+    if let Some(next) = (section_idx + 1..doc.sections.len())
+        .chain(0..section_idx)
+        .find(|idx| !doc.sections[*idx].items.is_empty())
+    {
+        edit.cursor_section = next;
+        edit.cursor_item = 0;
+    } else {
+        edit.cursor_item = 0;
+    }
+}
+
+fn merge_remote_projection(
+    mut next: HashMap<String, crate::mc_data::arcmux_mesh::RemoteSurfaceState>,
+    old: &HashMap<String, crate::mc_data::arcmux_mesh::RemoteSurfaceState>,
+    surfaces: &[SurfaceInfo],
+    partial: bool,
+) -> HashMap<String, crate::mc_data::arcmux_mesh::RemoteSurfaceState> {
+    if partial {
+        for (surface_ref, stale) in retain_remote_surfaces_as_stale(old, surfaces) {
+            next.entry(surface_ref).or_insert(stale);
+        }
+    }
+    next
+}
+
+fn repair_bound_remote_peek(workspace: &mut WorkspaceState) {
+    let Some(surface_uuid) = workspace
+        .peek_state
+        .as_ref()
+        .and_then(|peek| peek.surface_uuid.as_deref())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Some(surface) = workspace.surfaces.iter().find(|surface| {
+        surface
+            .uuid
+            .as_deref()
+            .is_some_and(|uuid| uuid.eq_ignore_ascii_case(&surface_uuid))
+    }) else {
+        workspace.peek_state = None;
+        return;
+    };
+    let Some(remote) = workspace.remote_surfaces.get(&surface.ref_id) else {
+        workspace.peek_state = None;
+        return;
+    };
+    if remote.freshness == crate::mc_data::arcmux_mesh::RemoteFreshness::Gone {
+        workspace.peek_state = None;
+        return;
+    }
+    if let Some(peek) = workspace.peek_state.as_mut() {
+        if peek.surface_ref != surface.ref_id {
+            peek.surface_ref = surface.ref_id.clone();
+            peek.polling = false;
+        }
+        peek.workspace_ref = workspace.workspace.ref_id.clone();
+        peek.surface_label = remote.stable_title(&remote.locator.session_id);
+    }
 }
 
 /// Derived workspace status: is the agent baking or waiting for me?
@@ -819,6 +972,9 @@ pub struct App {
     pub global_warning: Option<String>,
     /// Sanitized health warning from the local arcmux loopback consumer.
     pub mesh_warning: Option<String>,
+    /// Completion time of the last applied mesh fetch. Full refreshes and the
+    /// five-second poll can overlap; older results must never win the race.
+    last_mesh_observed_at: Option<std::time::Instant>,
     session_to_workspace: HashMap<String, String>,
     workspace_index: HashMap<String, usize>,
     bullet_hashes: HashMap<PathBuf, u64>,
@@ -850,6 +1006,8 @@ pub struct RefreshSnapshot {
         HashMap<String, HashMap<String, crate::mc_data::session_log::ConversationIntent>>,
     pub remote_mesh: Option<crate::mc_data::arcmux_mesh::RemoteMeshSnapshot>,
     pub mesh_warning: Option<String>,
+    pub mesh_partial: bool,
+    pub mesh_observed_at: std::time::Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -1092,13 +1250,6 @@ async fn gather_refresh_snapshot_inner(
     histories_dir: &std::path::Path,
     strict: bool,
 ) -> Result<RefreshSnapshot> {
-    // Read only arcmux's local projection. The client performs three
-    // concurrent GETs and never triggers a remote sync.
-    let mesh_task = tokio::spawn(async {
-        crate::mc_data::arcmux_mesh::ArcmuxMeshClient::default()
-            .fetch()
-            .await
-    });
     let workspaces = client.list_workspaces().await?;
     let expected_window_ref = workspaces.iter().find_map(|ws| ws.window_ref.as_deref());
     let mut surfaces_reliable = true;
@@ -1363,12 +1514,14 @@ async fn gather_refresh_snapshot_inner(
             (ws_id, intents)
         })
         .collect();
-    let mesh_fetch = mesh_task
-        .await
-        .unwrap_or_else(|_| crate::mc_data::arcmux_mesh::MeshFetch {
-            snapshot: None,
-            warning: Some("arcmux mesh reader unavailable".to_string()),
-        });
+    // Fetch mesh state at the END of the potentially slow workspace/session
+    // gather. A snapshot captured at the beginning could be several seconds
+    // older than the dedicated five-second runtime poll by the time it is
+    // applied. These are still only three concurrent loopback GETs with no
+    // remote sync side effect.
+    let mesh_fetch = crate::mc_data::arcmux_mesh::ArcmuxMeshClient::default()
+        .fetch()
+        .await;
 
     Ok(RefreshSnapshot {
         workspaces,
@@ -1379,6 +1532,8 @@ async fn gather_refresh_snapshot_inner(
         surface_intents_by_ws_id,
         remote_mesh: mesh_fetch.snapshot,
         mesh_warning: mesh_fetch.warning,
+        mesh_partial: mesh_fetch.partial,
+        mesh_observed_at: mesh_fetch.observed_at,
     })
 }
 
@@ -1392,6 +1547,7 @@ impl App {
             detail_scroll: 0,
             global_warning: None,
             mesh_warning: None,
+            last_mesh_observed_at: None,
             session_to_workspace: HashMap::new(),
             workspace_index: HashMap::new(),
             bullet_hashes: HashMap::new(),
@@ -1440,6 +1596,40 @@ impl App {
                 eprintln!("save trajectory after beads refresh ({uuid}): {e:?}");
             }
         });
+    }
+
+    /// Apply the small, read-only arcmux mesh projection independently of the
+    /// full 30-second workspace refresh. Runtime activity and connectivity are
+    /// volatile display state: update them every five seconds without touching
+    /// trajectory.md or re-running cmux/session/tracker discovery.
+    pub fn apply_mesh_fetch(&mut self, fetch: crate::mc_data::arcmux_mesh::MeshFetch) {
+        if self
+            .last_mesh_observed_at
+            .is_some_and(|last| fetch.observed_at <= last)
+        {
+            return;
+        }
+        self.last_mesh_observed_at = Some(fetch.observed_at);
+        self.mesh_warning = fetch.warning;
+        for workspace in &mut self.workspaces {
+            workspace.remote_surfaces = if let Some(mesh) = fetch.snapshot.as_ref() {
+                let next =
+                    mesh.resolve_workspace(&workspace.workspace.uuid, &workspace.surfaces);
+                merge_remote_projection(
+                    next,
+                    &workspace.remote_surfaces,
+                    &workspace.surfaces,
+                    fetch.partial,
+                )
+            } else {
+                retain_remote_surfaces_as_stale(
+                    &workspace.remote_surfaces,
+                    &workspace.surfaces,
+                )
+            };
+            fold_gone_remote_rows(workspace);
+            repair_bound_remote_peek(workspace);
+        }
     }
 
     fn apply_beads_refresh_snapshot_with_saver<F>(
@@ -1510,8 +1700,9 @@ impl App {
             surface_intents_by_ws_id,
             remote_mesh,
             mesh_warning,
+            mesh_partial,
+            mesh_observed_at,
         } = snap;
-        self.mesh_warning = mesh_warning;
         self.beads_generation = self.beads_generation.wrapping_add(1);
 
         let old_counts: HashMap<String, u32> = self
@@ -1613,15 +1804,14 @@ impl App {
                     beads_by_ws_id.remove(&ws.uuid)
                 };
                 let surfaces = surfaces_map.get(&ws.ref_id).cloned().unwrap_or_default();
-                let remote_surfaces = if let Some(mesh) = remote_mesh.as_ref() {
-                    mesh.resolve_workspace(&ws.uuid, &surfaces)
-                } else {
-                    let old = old_remote_surfaces
-                        .get(&ws.uuid)
-                        .cloned()
-                        .unwrap_or_default();
-                    retain_remote_surfaces_as_stale(&old, &surfaces)
-                };
+                // Preserve the latest already-applied runtime projection while
+                // rebuilding stable workspace state. The full gather's mesh
+                // result is applied after this rebuild with monotonic ordering.
+                let old = old_remote_surfaces
+                    .get(&ws.uuid)
+                    .cloned()
+                    .unwrap_or_default();
+                let remote_surfaces = rekey_remote_surfaces(&old, &surfaces, false);
                 let tool_call_count = old_counts.get(&ws.uuid).copied().unwrap_or(0);
                 let screen_preview = old_previews.get(&ws.uuid).cloned().flatten();
                 // Reuse existing insights (parsed from full 100-line capture)
@@ -1717,6 +1907,21 @@ impl App {
                 }
             })
             .collect();
+
+        self.apply_mesh_fetch(crate::mc_data::arcmux_mesh::MeshFetch {
+            snapshot: remote_mesh,
+            warning: mesh_warning,
+            partial: mesh_partial,
+            observed_at: mesh_observed_at,
+        });
+        // Even when that embedded fetch lost the monotonic race, the rebuild
+        // may have reloaded trajectory.md from disk. Re-fold any already-known
+        // gone identities so an older full snapshot cannot briefly resurrect a
+        // ghost row/cursor until the next five-second poll.
+        for workspace in &mut self.workspaces {
+            fold_gone_remote_rows(workspace);
+            repair_bound_remote_peek(workspace);
+        }
 
         // Preserve cmux's native tab order — `list-workspaces` returns workspaces
         // in the same order they appear in the cmux window, so the sidebar
@@ -2970,28 +3175,27 @@ impl App {
             let section = doc.sections.get(sec_idx);
             if let Some(sec) = section {
                 if sec.name == SECTION_CURRENT_SURFACES {
-                    let item = sec.items.get(item_idx);
+                    let Some(item) = sec.items.get(item_idx) else {
+                        return vec![];
+                    };
                     // Use surface_id if present; fall back to workspace ref_id.
                     let surface_ref = item
-                        .and_then(|i| i.surface_id.as_deref())
+                        .surface_id
+                        .as_deref()
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| ws.workspace.ref_id.clone());
-                    let surface_label = item
-                        .map(|i| {
-                            if let Some(ref sid) = i.surface_id {
-                                format!("{} ({})", i.text.as_str(), sid)
-                            } else {
-                                i.text.clone()
-                            }
-                        })
-                        .unwrap_or_else(|| ws.workspace.ref_id.clone());
+                    let surface_label = if let Some(ref sid) = item.surface_id {
+                        format!("{} ({})", item.text.as_str(), sid)
+                    } else {
+                        item.text.clone()
+                    };
                     // Detect Agent vs Shell source using the two-step resolver.
                     // Per-workspace identity for a peek: agent kind + position
                     // among same-kind surfaces over the workspace's flat surface
                     // list (cmux's `index_in_pane` is per-pane so two panes can
                     // both have idx=0; we don't use it here).
                     let surface_id_for_lookup =
-                        item.and_then(|i| i.surface_id.as_deref()).unwrap_or("");
+                        item.surface_id.as_deref().unwrap_or("");
                     let this_surface = ws
                         .surfaces
                         .iter()
@@ -3055,12 +3259,17 @@ impl App {
                         // Shell or Unknown: read this surface's own screen.
                         crate::tui::peek_view::PeekSource::Shell
                     };
-                    ws.peek_state = Some(crate::tui::peek_view::PeekState::new(
+                    let mut peek = crate::tui::peek_view::PeekState::new(
                         ws.workspace.ref_id.clone(),
                         surface_ref,
                         surface_label,
                         source,
-                    ));
+                    );
+                    peek.surface_uuid = ws
+                        .remote_surfaces
+                        .get(surface_id_for_lookup)
+                        .map(|remote| remote.surface_uuid.clone());
+                    ws.peek_state = Some(peek);
                     return vec![];
                 }
             }
@@ -3248,10 +3457,18 @@ impl App {
     }
 
     /// Apply a screen update to the active peek state for the given workspace.
-    pub fn apply_peek_screen_update(&mut self, workspace_uuid: &str, screen_text: String) {
+    pub fn apply_peek_screen_update(
+        &mut self,
+        workspace_uuid: &str,
+        surface_ref: &str,
+        peek_id: u64,
+        screen_text: String,
+    ) {
         if let Some(&idx) = self.workspace_index.get(workspace_uuid) {
             if let Some(peek) = self.workspaces[idx].peek_state.as_mut() {
-                peek.ingest_screen(&screen_text);
+                if peek.id == peek_id && peek.surface_ref == surface_ref {
+                    peek.ingest_screen(&screen_text);
+                }
             }
         }
     }
@@ -3261,11 +3478,11 @@ impl App {
     /// surface ref is what `cmux rpc surface.read_text` accepts, giving us
     /// per-surface content (vs `read-screen --workspace` which collapses
     /// every surface onto one stream). See F11 in `.agents/validate.md`.
-    pub fn peek_needs_poll(&self) -> Option<(&str, &str)> {
+    pub fn peek_needs_poll(&self) -> Option<(&str, &str, u64)> {
         let ws = self.workspaces.get(self.selected)?;
         let peek = ws.peek_state.as_ref()?;
         if peek.should_poll() {
-            Some((&ws.workspace.uuid, &peek.surface_ref))
+            Some((&ws.workspace.uuid, &peek.surface_ref, peek.id))
         } else {
             None
         }
@@ -4722,7 +4939,7 @@ platforms:
             "surface:idle".to_string(),
             remote_state("idle", "idle", RemoteFreshness::Fresh),
         );
-        assert_eq!(ws.agent_state(), AgentState::Idle);
+        assert_eq!(ws.agent_state(), AgentState::NeedsMe);
 
         ws.remote_surfaces.clear();
         ws.remote_surfaces.insert(
@@ -4760,7 +4977,7 @@ platforms:
 
         assert_eq!(ws.agent_name(), "claude");
         assert_eq!(ws.working_dir(), "~/Projects/local");
-        assert_eq!(ws.host_name(), "devbox");
+        assert_eq!(ws.host_name(), "mixed");
     }
 
     #[test]
@@ -4842,6 +5059,144 @@ platforms:
     }
 
     #[test]
+    fn mesh_failure_rekeys_retained_binding_by_stable_surface_uuid() {
+        let mut old = HashMap::new();
+        old.insert(
+            "surface:14".to_string(),
+            remote_state(
+                "surface:14",
+                "working",
+                crate::mc_data::arcmux_mesh::RemoteFreshness::Fresh,
+            ),
+        );
+        let surfaces = vec![SurfaceInfo {
+            title: "renumbered".to_string(),
+            ref_id: "surface:99".to_string(),
+            uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            pane_ref: None,
+            tty: None,
+            kind: crate::mc_data::surface_kind::SurfaceKind::Remote,
+            selected: false,
+            focused: false,
+            active: false,
+            index: None,
+            index_in_pane: None,
+            surface_type: Some("terminal".to_string()),
+        }];
+
+        let retained = retain_remote_surfaces_as_stale(&old, &surfaces);
+        assert!(!retained.contains_key("surface:14"));
+        assert_eq!(
+            retained["surface:99"].freshness,
+            crate::mc_data::arcmux_mesh::RemoteFreshness::Stale
+        );
+    }
+
+    #[test]
+    fn partial_mesh_projection_retains_unmatched_exact_binding_as_stale() {
+        let mut old = HashMap::new();
+        old.insert(
+            "surface:14".to_string(),
+            remote_state(
+                "surface:14",
+                "working",
+                crate::mc_data::arcmux_mesh::RemoteFreshness::Fresh,
+            ),
+        );
+        let surfaces = vec![SurfaceInfo {
+            title: "exact".to_string(),
+            ref_id: "surface:14".to_string(),
+            uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            pane_ref: None,
+            tty: None,
+            kind: crate::mc_data::surface_kind::SurfaceKind::Remote,
+            selected: false,
+            focused: false,
+            active: false,
+            index: None,
+            index_in_pane: None,
+            surface_type: Some("terminal".to_string()),
+        }];
+
+        let partial = merge_remote_projection(HashMap::new(), &old, &surfaces, true);
+        assert_eq!(
+            partial["surface:14"].freshness,
+            crate::mc_data::arcmux_mesh::RemoteFreshness::Stale
+        );
+        let clean = merge_remote_projection(HashMap::new(), &old, &surfaces, false);
+        assert!(clean.is_empty());
+    }
+
+    #[test]
+    fn gone_fold_repairs_cursor_for_removed_and_surviving_rows() {
+        let doc = r#"---
+workspace: test-ws
+---
+
+## Mission
+- Demo
+
+## Current surfaces
+- A <!-- mc:surface:surface:a -->
+- B <!-- mc:surface:surface:b -->
+- C <!-- mc:surface:surface:c -->
+
+## Beads
+- task
+"#;
+        for (cursor_before, expected_text, expected_cursor) in
+            [(0, "B", 0usize), (1, "B", 0usize), (2, "C", 1usize)]
+        {
+            let mut workspace = make_ws(doc);
+            workspace.edit_state = Some(crate::tui::trajectory_edit::TrajectoryEditState {
+                cursor_section: 1,
+                cursor_item: cursor_before,
+                ..Default::default()
+            });
+            workspace.remote_surfaces.insert(
+                "surface:a".to_string(),
+                remote_state(
+                    "surface:a",
+                    "exited",
+                    crate::mc_data::arcmux_mesh::RemoteFreshness::Gone,
+                ),
+            );
+
+            fold_gone_remote_rows(&mut workspace);
+
+            let section = workspace
+                .trajectory
+                .as_ref()
+                .unwrap()
+                .section(crate::mc_data::trajectory::SECTION_CURRENT_SURFACES)
+                .unwrap();
+            let edit = workspace.edit_state.as_ref().unwrap();
+            assert_eq!(edit.cursor_item, expected_cursor);
+            assert_eq!(section.items[edit.cursor_item].text, expected_text);
+        }
+    }
+
+    #[test]
+    fn older_mesh_result_cannot_overwrite_newer_warning_or_state() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let older = std::time::Instant::now();
+        let newer = older + std::time::Duration::from_millis(1);
+        app.apply_mesh_fetch(crate::mc_data::arcmux_mesh::MeshFetch {
+            snapshot: None,
+            warning: Some("newer".to_string()),
+            partial: false,
+            observed_at: newer,
+        });
+        app.apply_mesh_fetch(crate::mc_data::arcmux_mesh::MeshFetch {
+            snapshot: None,
+            warning: Some("older".to_string()),
+            partial: false,
+            observed_at: older,
+        });
+        assert_eq!(app.mesh_warning.as_deref(), Some("newer"));
+    }
+
+    #[test]
     fn bound_remote_peek_uses_exact_cmux_surface_not_local_transcript() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
         let ws = &mut app.workspaces[0];
@@ -4875,7 +5230,94 @@ platforms:
 
         let peek = app.workspaces[0].peek_state.as_ref().expect("peek");
         assert_eq!(peek.surface_ref, "sid-42");
+        assert_eq!(
+            peek.surface_uuid.as_deref(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
         assert!(matches!(peek.source, crate::tui::peek_view::PeekSource::Shell));
+    }
+
+    #[test]
+    fn bound_remote_peek_rekeys_by_uuid_and_closes_when_identity_disappears() {
+        let mut workspace = make_ws(SAMPLE_WITH_SURFACE);
+        workspace.surfaces.push(SurfaceInfo {
+            title: "remote".to_string(),
+            ref_id: "surface:old".to_string(),
+            uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            pane_ref: None,
+            tty: None,
+            kind: crate::mc_data::surface_kind::SurfaceKind::Remote,
+            selected: true,
+            focused: true,
+            active: true,
+            index: None,
+            index_in_pane: None,
+            surface_type: Some("terminal".to_string()),
+        });
+        workspace.remote_surfaces.insert(
+            "surface:old".to_string(),
+            remote_state(
+                "surface:old",
+                "working",
+                crate::mc_data::arcmux_mesh::RemoteFreshness::Fresh,
+            ),
+        );
+        let mut peek = crate::tui::peek_view::PeekState::new(
+            workspace.workspace.ref_id.clone(),
+            "surface:old".to_string(),
+            "old".to_string(),
+            crate::tui::peek_view::PeekSource::Shell,
+        );
+        peek.surface_uuid = Some("11111111-1111-4111-8111-111111111111".to_string());
+        peek.polling = true;
+        workspace.peek_state = Some(peek);
+
+        workspace.surfaces[0].ref_id = "surface:new".to_string();
+        let remote = workspace.remote_surfaces.remove("surface:old").unwrap();
+        workspace
+            .remote_surfaces
+            .insert("surface:new".to_string(), remote);
+        repair_bound_remote_peek(&mut workspace);
+        let peek = workspace.peek_state.as_ref().expect("rekeyed peek");
+        assert_eq!(peek.surface_ref, "surface:new");
+        assert!(!peek.polling);
+
+        workspace.surfaces.clear();
+        repair_bound_remote_peek(&mut workspace);
+        assert!(workspace.peek_state.is_none());
+    }
+
+    #[test]
+    fn late_peek_poll_cannot_contaminate_new_view() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let old = crate::tui::peek_view::PeekState::new(
+            "workspace:3".to_string(),
+            "surface:a".to_string(),
+            "A".to_string(),
+            crate::tui::peek_view::PeekSource::Shell,
+        );
+        let old_id = old.id;
+        app.workspaces[0].peek_state = Some(crate::tui::peek_view::PeekState::new(
+            "workspace:3".to_string(),
+            "surface:b".to_string(),
+            "B".to_string(),
+            crate::tui::peek_view::PeekSource::Shell,
+        ));
+
+        app.apply_peek_screen_update(
+            "test-uuid-1",
+            "surface:a",
+            old_id,
+            "wrong surface".to_string(),
+        );
+        assert!(
+            app.workspaces[0]
+                .peek_state
+                .as_ref()
+                .unwrap()
+                .screen_buffer
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5026,6 +5468,8 @@ platforms:
             surface_intents_by_ws_id: HashMap::new(),
             remote_mesh: None,
             mesh_warning: None,
+            mesh_partial: false,
+            mesh_observed_at: std::time::Instant::now(),
         };
         let mut app = App::new();
         app.apply_refresh_snapshot(snap, None).await;
@@ -5095,6 +5539,8 @@ platforms:
                 surface_intents_by_ws_id: HashMap::new(),
                 remote_mesh: None,
                 mesh_warning: None,
+                mesh_partial: false,
+                mesh_observed_at: std::time::Instant::now(),
             }
         };
 

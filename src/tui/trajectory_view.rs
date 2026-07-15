@@ -50,7 +50,7 @@ fn glyph_kind(c: char) -> Option<SurfaceKind> {
 /// `{glyph} {label} · ` slice gets the kind color. When `dim` is set the
 /// glyph+label span carries `Modifier::DIM` so a "just-exited" agent
 /// surface still renders with the agent glyph but visually de-emphasized.
-fn surface_row_spans<'a>(text: &'a str, dim: bool, base_style: Style) -> Vec<Span<'a>> {
+fn surface_row_spans(text: &str, dim: bool, base_style: Style) -> Vec<Span<'static>> {
     // Find the first whitespace char (between glyph and label).
     let mut chars = text.chars();
     let first = chars.next();
@@ -70,15 +70,18 @@ fn surface_row_spans<'a>(text: &'a str, dim: bool, base_style: Style) -> Vec<Spa
         if dim {
             glyph_style = glyph_style.add_modifier(Modifier::DIM);
         }
-        spans.push(Span::styled(&text[..head_end], glyph_style));
-        spans.push(Span::styled(&text[head_end..badge_start], base_style));
+        spans.push(Span::styled(text[..head_end].to_string(), glyph_style));
+        spans.push(Span::styled(
+            text[head_end..badge_start].to_string(),
+            base_style,
+        ));
     } else {
         // Row doesn't lead with a known glyph → render as a plain row.
-        spans.push(Span::styled(&text[..badge_start], base_style));
+        spans.push(Span::styled(text[..badge_start].to_string(), base_style));
     }
     if badge_start < text.len() {
         spans.push(Span::styled(
-            &text[badge_start..],
+            text[badge_start..].to_string(),
             base_style.fg(Color::DarkGray),
         ));
     }
@@ -133,17 +136,22 @@ fn nav_cursor_style(focused: bool) -> Style {
     }
 }
 
-fn surface_item_lines<'a>(
+fn surface_item_lines(
     prefix: &str,
-    text: &'a str,
+    text: &str,
     dim: bool,
     base: Style,
     cursor: bool,
     focused: bool,
     inner_width: usize,
     remote: Option<&crate::mc_data::arcmux_mesh::RemoteSurfaceState>,
-) -> Vec<Line<'a>> {
-    let (main, overall, ask) = split_surface_intent(text);
+) -> Vec<Line<'static>> {
+    let (stored_main, overall, ask) = split_surface_intent(text);
+    // The stable trajectory row may have been projected up to 30 seconds ago.
+    // For an exact mesh binding, derive the visible agent/title from the
+    // five-second runtime snapshot so a new binding feels local immediately.
+    let runtime_main = remote.map(|state| remote_surface_main(stored_main, state));
+    let main = runtime_main.as_deref().unwrap_or(stored_main);
     let offline = remote.is_some_and(|state| state.freshness.is_offline());
     let row_base = if offline {
         base.fg(Color::DarkGray).add_modifier(Modifier::DIM)
@@ -199,12 +207,28 @@ fn surface_item_lines<'a>(
     lines
 }
 
+fn remote_surface_main(
+    stored_main: &str,
+    state: &crate::mc_data::arcmux_mesh::RemoteSurfaceState,
+) -> String {
+    let without_badge = crate::mc_data::surface_render::strip_badge(stored_main);
+    let suffix = &stored_main[without_badge.len()..];
+    let kind = state.surface_kind();
+    format!(
+        "{} {} · {}{}",
+        kind.glyph(),
+        kind.label(),
+        state.stable_title(&state.locator.session_id),
+        suffix
+    )
+}
+
 /// Push an `overall:`/`latest:` field as 1–`MAX_FIELD_LINES` wrapped lines:
 /// the label leads the first line, continuation lines are indented to align
 /// under the value. Pre-wrapping to the available width (rather than leaning on
 /// the Paragraph's own wrap) lets us cap the field at `MAX_FIELD_LINES`.
-fn push_field_lines<'a>(
-    lines: &mut Vec<Line<'a>>,
+fn push_field_lines(
+    lines: &mut Vec<Line<'static>>,
     label: &'static str,
     value: &str,
     base: Style,
@@ -542,6 +566,20 @@ pub fn render_with_hints(
                 // cursor. Only the editor's insert mode (blocked here anyway)
                 // falls through to the single-line path below.
                 if section.name == SECTION_CURRENT_SURFACES && !is_insert_cursor {
+                    let remote = item
+                        .surface_id
+                        .as_deref()
+                        .and_then(|surface_ref| hints.remote_surfaces.get(surface_ref));
+                    // Gone is a volatile mesh state and therefore never gets
+                    // persisted into trajectory.md. Fold the row immediately
+                    // on the five-second mesh refresh instead of waiting for
+                    // the next 30-second stable projection pass.
+                    if remote.is_some_and(|state| {
+                        state.freshness
+                            == crate::mc_data::arcmux_mesh::RemoteFreshness::Gone
+                    }) {
+                        continue;
+                    }
                     let dim = item
                         .surface_id
                         .as_deref()
@@ -556,9 +594,7 @@ pub fn render_with_hints(
                         is_cursor && !in_insert,
                         focused,
                         body_inner.width as usize,
-                        item.surface_id
-                            .as_deref()
-                            .and_then(|surface_ref| hints.remote_surfaces.get(surface_ref)),
+                        remote,
                     ));
                     continue;
                 }
@@ -1824,6 +1860,10 @@ workspace: t3
             .unwrap();
 
         let dump = buf_dump(&terminal);
+        assert!(
+            dump.contains("codex · remote-codex · devbox/root"),
+            "runtime identity did not replace the stable row: {dump}"
+        );
         assert!(dump.contains("working · fresh"), "runtime badge missing: {dump}");
         assert!(dump.contains("s-working · healthy"), "locator line missing: {dump}");
         assert!(
@@ -1831,6 +1871,85 @@ workspace: t3
             "safe current work missing: {dump}"
         );
         assert_eq!(doc.to_markdown(), original, "volatile hints mutated trajectory");
+    }
+
+    #[test]
+    fn gone_remote_folds_on_runtime_refresh_without_mutating_document() {
+        let doc = TrajectoryDoc::parse(T3_SAMPLE).unwrap();
+        let original = doc.to_markdown();
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hints = RenderHints::default();
+        hints.remote_surfaces.insert(
+            "surface:22".to_string(),
+            crate::mc_data::arcmux_mesh::RemoteSurfaceState {
+                surface_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+                workspace_uuid: "22222222-2222-4222-8222-222222222222".to_string(),
+                locator: crate::mc_data::arcmux_mesh::RemoteSessionLocator {
+                    schema_version: 1,
+                    device_id: "devbox".to_string(),
+                    profile_scope: "root".to_string(),
+                    session_id: "s-gone".to_string(),
+                    transport_binding_id: None,
+                },
+                name: Some("gone-remote".to_string()),
+                agent: Some("codex".to_string()),
+                state: Some("exited".to_string()),
+                health: Some("healthy".to_string()),
+                launch_cwd: None,
+                current_work: None,
+                freshness: crate::mc_data::arcmux_mesh::RemoteFreshness::Gone,
+            },
+        );
+
+        terminal
+            .draw(|f| {
+                render_with_hints(
+                    f,
+                    Rect::new(0, 0, 120, 20),
+                    Some(&doc),
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    &hints,
+                )
+            })
+            .unwrap();
+
+        let dump = buf_dump(&terminal);
+        assert!(!dump.contains("codex · shell"), "gone row remained: {dump}");
+        assert_eq!(doc.to_markdown(), original);
+    }
+
+    #[test]
+    fn remote_runtime_without_name_uses_clean_nonduplicating_fallback() {
+        let state = crate::mc_data::arcmux_mesh::RemoteSurfaceState {
+            surface_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            workspace_uuid: "22222222-2222-4222-8222-222222222222".to_string(),
+            locator: crate::mc_data::arcmux_mesh::RemoteSessionLocator {
+                schema_version: 1,
+                device_id: "devbox".to_string(),
+                profile_scope: "root".to_string(),
+                session_id: "s-no-name".to_string(),
+                transport_binding_id: None,
+            },
+            name: None,
+            agent: Some("codex".to_string()),
+            state: Some("idle".to_string()),
+            health: Some("healthy".to_string()),
+            launch_cwd: None,
+            current_work: None,
+            freshness: crate::mc_data::arcmux_mesh::RemoteFreshness::Fresh,
+        };
+        assert_eq!(
+            remote_surface_main(
+                "▲ codex · old title · devbox/root   ← goal:ship it",
+                &state,
+            ),
+            "▲ codex · s-no-name · devbox/root   ← goal:ship it"
+        );
     }
 
     #[test]
@@ -1878,7 +1997,7 @@ workspace: t3
 
         let dump = buf_dump(&terminal);
         assert!(dump.contains("working · stale"));
-        let style = cell_style(&terminal, "codex · shell", '▲').unwrap();
+        let style = cell_style(&terminal, "codex · s-working · devbox/root", '▲').unwrap();
         assert!(style.add_modifier.contains(Modifier::DIM));
     }
 

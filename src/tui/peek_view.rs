@@ -11,7 +11,10 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+static NEXT_PEEK_ID: AtomicU64 = AtomicU64::new(1);
 
 // ──────────────────────────────────────────────────────────────────────────────
 // State
@@ -38,6 +41,9 @@ pub enum PeekSource {
 /// State for peek mode (reading a surface's screen).
 #[derive(Debug, Clone)]
 pub struct PeekState {
+    /// Unique view generation. Async poll results must match this exact id so
+    /// a late response from a prior peek cannot contaminate a newly opened one.
+    pub id: u64,
     /// The workspace ref (e.g., "workspace:3") used to call `cmux read-screen`.
     /// `read-screen` rejects surface refs — passing one yields "Workspace not
     /// found" — so this must be the workspace ref, not the surface ref.
@@ -46,6 +52,9 @@ pub struct PeekState {
     /// future use (e.g., when cmux adds a per-surface read-screen) and for
     /// debugging; not currently passed to read-screen.
     pub surface_ref: String,
+    /// Stable cmux UUID for exact bound-remote re-keying across `surface:N`
+    /// renumbering. Unbound/local peeks leave this unset.
+    pub surface_uuid: Option<String>,
     /// Human-readable label shown in the peek title bar.
     pub surface_label: String,
     /// Whether this peek reads a session log (Agent) or live cmux screen (Shell).
@@ -78,8 +87,10 @@ impl PeekState {
         source: PeekSource,
     ) -> Self {
         Self {
+            id: NEXT_PEEK_ID.fetch_add(1, Ordering::Relaxed),
             workspace_ref,
             surface_ref,
+            surface_uuid: None,
             surface_label,
             source,
             scroll_offset: 0,

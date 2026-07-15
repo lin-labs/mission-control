@@ -12,7 +12,7 @@ use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const LOOPBACK_BASE: &str = "http://127.0.0.1:7777/mesh/";
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
@@ -39,7 +39,7 @@ impl RemoteSessionLocator {
             && self
                 .transport_binding_id
                 .as_deref()
-                .is_none_or(|value| safe_text(value, 128).is_some())
+                .is_none_or(valid_id)
     }
 
     fn identity(&self) -> RemoteSessionIdentity {
@@ -147,8 +147,11 @@ impl RemoteSurfaceState {
             return RemoteActivity::Idle;
         }
         match self.state_label() {
-            "waiting" | "needs_input" | "blocked" => RemoteActivity::Actionable,
-            "working" | "starting" => RemoteActivity::Working,
+            // arcmux's native `idle` means the agent is ready after a turn,
+            // which is the same human-facing state as waiting for input.
+            "idle" | "waiting" | "needs_input" | "blocked" | "stuck" | "escalated"
+            | "failed" => RemoteActivity::Actionable,
+            "working" | "starting" | "handshaking" => RemoteActivity::Working,
             _ => RemoteActivity::Idle,
         }
     }
@@ -164,7 +167,14 @@ impl RemoteSurfaceState {
 pub struct RemoteMeshSnapshot {
     bindings: HashMap<String, SurfaceBinding>,
     sessions: HashMap<RemoteSessionIdentity, SessionProjection>,
-    peer_connected: HashMap<String, bool>,
+    peer_states: HashMap<String, PeerConnectionState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerConnectionState {
+    Connected,
+    Connecting,
+    Offline,
 }
 
 impl RemoteMeshSnapshot {
@@ -181,26 +191,31 @@ impl RemoteMeshSnapshot {
             let Some(surface_uuid) = surface.uuid.as_deref() else {
                 continue;
             };
-            let Some(binding) = self.bindings.get(surface_uuid) else {
+            let Some(binding) = self.bindings.get(&surface_uuid.to_ascii_lowercase()) else {
                 continue;
             };
-            if binding.workspace_id != workspace_uuid {
+            if !binding.workspace_id.eq_ignore_ascii_case(workspace_uuid) {
                 continue;
             }
             let projection = self.sessions.get(&binding.locator.identity());
             let metadata = projection.map(|p| &p.metadata);
-            let freshness = projection.map(|p| p.freshness).unwrap_or_else(|| {
-                if self
-                    .peer_connected
-                    .get(&binding.locator.device_id)
-                    .copied()
-                    .unwrap_or(false)
-                {
+            // Peer connectivity is the effective freshness ceiling. Cached
+            // session projections intentionally survive a disconnect, so a
+            // projection that still says `fresh` must not make an offline
+            // device look live. `gone` remains terminal regardless of peer
+            // state so history never reappears as syncing/stale.
+            let projected_freshness = projection.map(|p| p.freshness);
+            let peer_state = self.peer_states.get(&binding.locator.device_id).copied();
+            let freshness = match (projected_freshness, peer_state) {
+                (Some(RemoteFreshness::Gone), _) => RemoteFreshness::Gone,
+                (Some(value), Some(PeerConnectionState::Connected)) => value,
+                (Some(_), Some(PeerConnectionState::Connecting)) => RemoteFreshness::Syncing,
+                (Some(_), Some(PeerConnectionState::Offline) | None) => RemoteFreshness::Stale,
+                (None, Some(PeerConnectionState::Connected | PeerConnectionState::Connecting)) => {
                     RemoteFreshness::Syncing
-                } else {
-                    RemoteFreshness::Stale
                 }
-            });
+                (None, Some(PeerConnectionState::Offline) | None) => RemoteFreshness::Stale,
+            };
             resolved.insert(
                 surface.ref_id.clone(),
                 RemoteSurfaceState {
@@ -221,10 +236,25 @@ impl RemoteMeshSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MeshFetch {
     pub snapshot: Option<RemoteMeshSnapshot>,
     pub warning: Option<String>,
+    /// True when the top-level projection was valid but one or more records
+    /// were skipped. Consumers retain unmatched exact identities as stale.
+    pub partial: bool,
+    pub observed_at: Instant,
+}
+
+impl Default for MeshFetch {
+    fn default() -> Self {
+        Self {
+            snapshot: None,
+            warning: None,
+            partial: false,
+            observed_at: Instant::now(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -243,7 +273,10 @@ impl ArcmuxMeshClient {
     pub fn new(base: &str) -> Result<Self, &'static str> {
         let base = Url::parse(base).map_err(|_| "invalid arcmux loopback URL")?;
         if base.scheme() != "http"
-            || !matches!(base.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+            || !matches!(
+                base.host_str(),
+                Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+            )
         {
             return Err("arcmux mesh consumer requires a loopback HTTP URL");
         }
@@ -259,6 +292,10 @@ impl ArcmuxMeshClient {
     /// Fetch the three read-only mesh projections concurrently. There is no
     /// POST/sync side effect and no per-binding request fanout.
     pub async fn fetch(&self) -> MeshFetch {
+        // Capture ordering before any request starts. If this fetch stalls and
+        // a newer poll completes first, the late older result must be rejected
+        // by App rather than receiving a misleadingly new completion stamp.
+        let observed_at = Instant::now();
         let (status, sessions, bindings) = tokio::join!(
             self.get_value("status"),
             self.get_value("sessions"),
@@ -275,6 +312,8 @@ impl ArcmuxMeshClient {
             return MeshFetch {
                 snapshot: None,
                 warning: Some(format!("arcmux mesh unavailable ({endpoint})")),
+                partial: false,
+                observed_at,
             };
         }
         let (Ok(status), Ok(sessions), Ok(bindings)) = (status, sessions, bindings) else {
@@ -284,6 +323,8 @@ impl ArcmuxMeshClient {
             return MeshFetch {
                 snapshot: None,
                 warning: Some("arcmux mesh projection malformed".to_string()),
+                partial: false,
+                observed_at,
             };
         }
         let decoded = decode_snapshot(&status, &sessions, &bindings);
@@ -296,6 +337,8 @@ impl ArcmuxMeshClient {
                     if decoded.skipped == 1 { "" } else { "s" }
                 )
             }),
+            partial: decoded.skipped > 0,
+            observed_at,
         }
     }
 
@@ -348,10 +391,13 @@ fn decode_snapshot(status: &Value, sessions: &Value, bindings: &Value) -> Decode
     {
         match serde_json::from_value::<PeerStatus>(value.clone()) {
             Ok(peer) if valid_id(&peer.peer_id) && valid_peer_state(&peer.state) => {
-                out.peer_connected.insert(
-                    peer.peer_id,
-                    matches!(peer.state.as_str(), "connected" | "connecting"),
-                );
+                let state = match peer.state.as_str() {
+                    "connected" => PeerConnectionState::Connected,
+                    "connecting" => PeerConnectionState::Connecting,
+                    "disconnected" | "error" => PeerConnectionState::Offline,
+                    _ => unreachable!("peer state was validated"),
+                };
+                out.peer_states.insert(peer.peer_id, state);
             }
             _ => skipped += 1,
         }
@@ -385,8 +431,14 @@ fn decode_snapshot(status: &Value, sessions: &Value, bindings: &Value) -> Decode
         .flatten()
     {
         match serde_json::from_value::<SurfaceBinding>(value.clone()) {
-            Ok(binding) if binding.valid() && !out.bindings.contains_key(&binding.surface_id) => {
-                out.bindings.insert(binding.surface_id.clone(), binding);
+            Ok(binding)
+                if binding.valid()
+                    && !out
+                        .bindings
+                        .contains_key(&binding.surface_id.to_ascii_lowercase()) =>
+            {
+                out.bindings
+                    .insert(binding.surface_id.to_ascii_lowercase(), binding);
             }
             _ => skipped += 1,
         }
@@ -414,6 +466,8 @@ struct SurfaceBinding {
     workspace_id: String,
     locator: RemoteSessionLocator,
     source: String,
+    created_at: String,
+    updated_at: String,
 }
 
 impl SurfaceBinding {
@@ -426,6 +480,8 @@ impl SurfaceBinding {
             && valid_uuid(&self.workspace_id)
             && self.locator.valid()
             && safe_text(&self.source, 64).is_some()
+            && valid_timestamp(&self.created_at)
+            && valid_timestamp(&self.updated_at)
     }
 }
 
@@ -434,6 +490,8 @@ struct RawSessionProjection {
     schema_version: u32,
     locator: RemoteSessionLocator,
     metadata: Value,
+    received_at: String,
+    freshness_changed_at: String,
     source_epoch: String,
     source_revision: u64,
     freshness: RemoteFreshness,
@@ -446,13 +504,16 @@ impl RawSessionProjection {
             && valid_id(&self.source_epoch)
             && self.source_revision > 0
             && self.metadata.is_object()
+            && valid_timestamp(&self.received_at)
+            && valid_timestamp(&self.freshness_changed_at)
+            && serde_json::from_value::<RawSessionMetadata>(self.metadata.clone()).is_ok()
     }
 
     fn into_projection(self) -> SessionProjection {
-        let metadata = serde_json::from_value::<RawSessionMetadata>(self.metadata)
-            .ok()
-            .map(SessionMetadata::from)
-            .unwrap_or_default();
+        let metadata = SessionMetadata::from(
+            serde_json::from_value::<RawSessionMetadata>(self.metadata)
+                .expect("metadata was validated before conversion"),
+        );
         SessionProjection {
             locator: self.locator,
             metadata,
@@ -558,14 +619,32 @@ fn valid_id(value: &str) -> bool {
 }
 
 fn valid_profile_scope(value: &str) -> bool {
-    value == "root"
-        || value
-            .strip_prefix("profile:")
-            .is_some_and(|name| valid_id(name))
+    if value == "root" {
+        return true;
+    }
+    let Some(name) = value.strip_prefix("profile:") else {
+        return false;
+    };
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'_' | b'-')
+            })
 }
 
 fn valid_peer_state(value: &str) -> bool {
     matches!(value, "connected" | "connecting" | "disconnected" | "error")
+}
+
+fn valid_timestamp(value: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(value.trim()).is_ok()
 }
 
 fn valid_uuid(value: &str) -> bool {
@@ -693,7 +772,58 @@ mod tests {
         assert_eq!(state.locator.device_id, "labs");
         assert_eq!(state.locator.profile_scope, "profile:boyan");
         assert_eq!(state.state.as_deref(), Some("idle"));
+        assert_eq!(state.activity(), RemoteActivity::Actionable);
+    }
+
+    #[test]
+    fn native_arcmux_states_map_to_human_activity() {
+        let mut state = RemoteSurfaceState {
+            surface_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            workspace_uuid: "22222222-2222-4222-8222-222222222222".to_string(),
+            locator: RemoteSessionLocator {
+                schema_version: 1,
+                device_id: "devbox".to_string(),
+                profile_scope: "root".to_string(),
+                session_id: "s-native".to_string(),
+                transport_binding_id: None,
+            },
+            name: None,
+            agent: Some("codex".to_string()),
+            state: None,
+            health: None,
+            launch_cwd: None,
+            current_work: None,
+            freshness: RemoteFreshness::Fresh,
+        };
+        for native in ["working", "starting", "handshaking"] {
+            state.state = Some(native.to_string());
+            assert_eq!(state.activity(), RemoteActivity::Working, "{native}");
+        }
+        for native in ["idle", "stuck", "escalated", "failed"] {
+            state.state = Some(native.to_string());
+            assert_eq!(state.activity(), RemoteActivity::Actionable, "{native}");
+        }
+        state.state = Some("exited".to_string());
         assert_eq!(state.activity(), RemoteActivity::Idle);
+    }
+
+    #[test]
+    fn uuid_join_is_case_insensitive_but_still_exact() {
+        let mut bindings = fixture("bindings");
+        bindings["surface_bindings"][0]["surface_id"] =
+            serde_json::json!("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA");
+        bindings["surface_bindings"][0]["workspace_id"] =
+            serde_json::json!("BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB");
+        let decoded = decode_snapshot(&fixture("status"), &fixture("sessions"), &bindings);
+        let states = decoded.snapshot.resolve_workspace(
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            &[surface(
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "surface:case",
+                "ignored",
+            )],
+        );
+        assert!(states.contains_key("surface:case"));
     }
 
     #[test]
@@ -745,6 +875,56 @@ mod tests {
     }
 
     #[test]
+    fn peer_state_caps_cached_projection_freshness() {
+        let surface = surface(
+            "11111111-1111-4111-8111-111111111111",
+            "surface:14",
+            "ignored",
+        );
+        let workspace = "22222222-2222-4222-8222-222222222222";
+
+        let disconnected = serde_json::json!({
+            "peers":[{"peer_id":"devbox","state":"disconnected"}]
+        });
+        let decoded = decode_snapshot(
+            &disconnected,
+            &fixture("sessions"),
+            &fixture("bindings"),
+        );
+        assert_eq!(
+            decoded
+                .snapshot
+                .resolve_workspace(workspace, std::slice::from_ref(&surface))["surface:14"]
+                .freshness,
+            RemoteFreshness::Stale
+        );
+
+        let connecting = serde_json::json!({
+            "peers":[{"peer_id":"devbox","state":"connecting"}]
+        });
+        let decoded = decode_snapshot(
+            &connecting,
+            &fixture("sessions"),
+            &fixture("bindings"),
+        );
+        assert_eq!(
+            decoded
+                .snapshot
+                .resolve_workspace(workspace, std::slice::from_ref(&surface))["surface:14"]
+                .freshness,
+            RemoteFreshness::Syncing
+        );
+
+        let mut gone_sessions = fixture("sessions");
+        gone_sessions["sessions"][0]["freshness"] = serde_json::json!("gone");
+        let decoded = decode_snapshot(&connecting, &gone_sessions, &fixture("bindings"));
+        assert_eq!(
+            decoded.snapshot.resolve_workspace(workspace, &[surface])["surface:14"].freshness,
+            RemoteFreshness::Gone
+        );
+    }
+
+    #[test]
     fn reconnect_refreshes_same_locator_without_retargeting() {
         let decoded = decode_snapshot(
             &fixture("status"),
@@ -785,6 +965,26 @@ mod tests {
         let decoded = decode_snapshot(&fixture("status"), &sessions, &fixture("bindings"));
         assert_eq!(decoded.skipped, 1);
         assert_eq!(decoded.snapshot.sessions.len(), 2);
+    }
+
+    #[test]
+    fn malformed_metadata_and_required_timestamps_skip_with_warning_count() {
+        let mut sessions = fixture("sessions");
+        sessions["sessions"][0]["metadata"]["agent"] = serde_json::json!(["codex"]);
+        sessions["sessions"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("received_at");
+        let mut bindings = fixture("bindings");
+        bindings["surface_bindings"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("updated_at");
+
+        let decoded = decode_snapshot(&fixture("status"), &sessions, &bindings);
+        assert_eq!(decoded.skipped, 3);
+        assert!(decoded.snapshot.sessions.is_empty());
+        assert_eq!(decoded.snapshot.bindings.len(), 1);
     }
 
     #[test]
@@ -850,5 +1050,23 @@ mod tests {
         assert!(ArcmuxMeshClient::new("https://devbox:7777/mesh/").is_err());
         let local = ArcmuxMeshClient::new("http://127.0.0.1:7777/mesh/").unwrap();
         assert_eq!(local.base.host_str(), Some("127.0.0.1"));
+        assert!(ArcmuxMeshClient::new("http://[::1]:7777/mesh/").is_ok());
+    }
+
+    #[test]
+    fn locator_validation_matches_arcmux_profile_and_transport_rules() {
+        let locator = |profile: &str, transport: Option<&str>| RemoteSessionLocator {
+            schema_version: 1,
+            device_id: "devbox".to_string(),
+            profile_scope: profile.to_string(),
+            session_id: "s-1".to_string(),
+            transport_binding_id: transport.map(str::to_string),
+        };
+        assert!(locator("root", None).valid());
+        assert!(locator("profile:boyan_dev-1", Some("binding-1")).valid());
+        assert!(!locator("profile:Boyan", None).valid());
+        assert!(!locator("profile:-boyan", None).valid());
+        assert!(!locator("profile:boyan-", None).valid());
+        assert!(!locator("profile:boyan", Some("not a safe id")).valid());
     }
 }
