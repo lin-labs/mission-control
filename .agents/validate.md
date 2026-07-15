@@ -658,6 +658,32 @@ directory. A stale or redirected store therefore won over the project registry.
    Linear issues under `## Linear`, highlight one issue, press Enter, and
    confirm the installed Linear app opens that exact identifier.
 
+### F16 — Remote surface identity drifts or disappears while offline
+
+**Symptom**: Mission Control shows the wrong remote agent/session, binds a
+similarly named local surface, or drops a remote row as soon as its peer
+disconnects.
+
+**Prevention checklist** for arcmux mesh consumers:
+
+1. Join only exact cmux surface UUID + workspace UUID + arcmux locator
+   (`device_id`, `profile_scope`, `session_id`). Never infer identity from a
+   title, cwd, session name, or newest workspace session.
+2. Read only arcmux's loopback `status`, `sessions`, and `surface-bindings`
+   projections. Never trigger sync per refresh, read a raw remote store, or
+   connect directly to a remote host.
+3. Render fresh rows normally, syncing/stale rows dimmed and retained, and gone
+   rows folded out of Current. An endpoint failure retains last-known exact
+   bindings as stale instead of retargeting or deleting them.
+4. A bound remote peek reads its exact local cmux surface. Never fall back to a
+   workspace-local transcript for a bound remote row.
+5. Optional current-work text requires the exact producer provenance and must
+   be single-line, bounded, and control-stripped. Skip malformed records and
+   expose only bounded, sanitized warnings.
+6. Run focused exact-binding, mixed local/remote, stale/reconnect,
+   malformed/missing projection, workspace-isolation, and no-title-inference
+   tests. Tier 4 must include a real ref/devbox disconnect and reconnect.
+
 ---
 
 ## Per-area validation cheat sheets

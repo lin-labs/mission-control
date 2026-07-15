@@ -68,6 +68,7 @@ pub fn render_detail(
                 hints.dim_surface_refs.insert(s.ref_id.clone());
             }
         }
+        hints.remote_surfaces = ws.remote_surfaces.clone();
         if ws.linear.is_some() {
             hints.task_section_title = Some("Linear".to_string());
         }

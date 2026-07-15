@@ -34,12 +34,9 @@ pub fn render_sidebar(
             };
             let leader_str = format!("{} ", leader);
 
-            let host_badge = ws
-                .session
-                .as_ref()
-                .and_then(|s| s.frontmatter.host.as_deref())
-                .filter(|h| *h != "mbp")
-                .map(|h| format!(" [{}]", h))
+            let host = ws.host_name();
+            let host_badge = (!host.is_empty() && host != "mbp")
+                .then(|| format!(" [{}]", host))
                 .unwrap_or_default();
 
             let accent_color =
@@ -131,6 +128,7 @@ fn status_indicator(ws: &WorkspaceState) -> (&str, Color) {
         AgentState::Working => ("\u{25cf}", Color::Green), // ● baking
         AgentState::NeedsMe => ("\u{26a0}", Color::Yellow), // ⚠ needs you
         AgentState::Idle => ("\u{25cb}", Color::DarkGray), // ○ nothing happening
+        AgentState::Stale => ("\u{25cc}", Color::DarkGray), // ◌ retained remote, offline
     }
 }
 
@@ -183,6 +181,7 @@ mod tests {
             },
             session: None,
             surfaces: Vec::new(),
+            remote_surfaces: std::collections::HashMap::new(),
             screen_preview: None,
             screen_insights: ScreenInsights::default(),
             tool_call_count: 0,
@@ -217,6 +216,27 @@ mod tests {
             .collect()
     }
 
+    fn stale_remote() -> crate::mc_data::arcmux_mesh::RemoteSurfaceState {
+        crate::mc_data::arcmux_mesh::RemoteSurfaceState {
+            surface_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            workspace_uuid: "workspace-1".to_string(),
+            locator: crate::mc_data::arcmux_mesh::RemoteSessionLocator {
+                schema_version: 1,
+                device_id: "devbox".to_string(),
+                profile_scope: "root".to_string(),
+                session_id: "s-remote".to_string(),
+                transport_binding_id: None,
+            },
+            name: Some("remote".to_string()),
+            agent: Some("codex".to_string()),
+            state: Some("working".to_string()),
+            health: Some("healthy".to_string()),
+            launch_cwd: None,
+            current_work: None,
+            freshness: crate::mc_data::arcmux_mesh::RemoteFreshness::Stale,
+        }
+    }
+
     #[test]
     fn each_workspace_is_exactly_one_row() {
         let workspaces = vec![
@@ -244,6 +264,27 @@ mod tests {
         // Adjacent workspaces are exactly 1 row apart (no gap, no borders).
         assert_eq!(beta_y - alpha_y, 1, "beta should be 1 row below alpha");
         assert_eq!(gamma_y - beta_y, 1, "gamma should be 1 row below beta");
+    }
+
+    #[test]
+    fn remote_workspace_shows_device_badge_and_offline_indicator() {
+        let mut workspace = test_workspace_state("remote-work", None);
+        workspace
+            .remote_surfaces
+            .insert("surface:14".to_string(), stale_remote());
+        let backend = TestBackend::new(40, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|f| render_sidebar(f, Rect::new(0, 0, 40, 5), &[workspace], 0, true))
+            .unwrap();
+
+        let row = (0..5)
+            .map(|y| buf_row(&terminal, y))
+            .find(|row| row.contains("remote-work"))
+            .expect("workspace row");
+        assert!(row.contains("◌"), "offline indicator missing: {row}");
+        assert!(row.contains("[devbox]"), "device badge missing: {row}");
     }
 
     #[test]

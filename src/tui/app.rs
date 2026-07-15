@@ -400,6 +400,9 @@ pub struct WorkspaceState {
     pub workspace: Workspace,
     pub session: Option<SessionFile>,
     pub surfaces: Vec<SurfaceInfo>,
+    /// Exact arcmux mesh state keyed by the local cmux `surface:N` ref. The
+    /// join is authorized only by stable surface/workspace UUID bindings.
+    pub remote_surfaces: HashMap<String, crate::mc_data::arcmux_mesh::RemoteSurfaceState>,
     pub screen_preview: Option<String>,
     pub screen_insights: ScreenInsights,
     pub tool_call_count: u32,
@@ -485,71 +488,86 @@ pub struct RemoteIntentUpdate {
 const OVERALL_SUMMARY_EVERY: usize = 4;
 
 impl WorkspaceState {
-    /// Whether this workspace has an AI agent surface (Claude Code, Codex, etc.)
-    /// Checks screen insights (full capture), surface titles, and screen preview.
-    pub fn has_agent_surface(&self) -> bool {
-        // Screen insights are parsed from the full 100-line capture
-        if self.screen_insights.agent.is_some() {
-            return true;
-        }
-        // Direct surface title check
-        self.surfaces.iter().any(|s| {
-            let t = s.title.to_lowercase();
-            t.contains("claude") || t.contains("codex") || t.contains("opencode")
-        })
-    }
-
     /// Whether this workspace is a window onto a remote host: any surface has a
     /// mosh/ssh client in the foreground. Remote panes often lack local mux
     /// protocol state, so this gates the TypeSafe classifier, which we only
     /// spend on remote workspaces.
     pub fn is_remote(&self) -> bool {
-        self.surfaces
-            .iter()
-            .any(|s| s.kind == crate::mc_data::surface_kind::SurfaceKind::Remote)
+        self.has_active_remote_surfaces()
+            || self
+                .surfaces
+                .iter()
+                .any(|s| s.kind == crate::mc_data::surface_kind::SurfaceKind::Remote)
+    }
+
+    /// Legacy terminal inference is used only for unbound mosh/ssh surfaces.
+    /// Bound remotes get their state from the mesh projection instead.
+    fn needs_remote_screen_inference(&self) -> bool {
+        self.is_remote()
+            && self.surfaces.iter().any(|s| {
+                s.kind == crate::mc_data::surface_kind::SurfaceKind::Remote
+                    && !self.remote_surfaces.contains_key(&s.ref_id)
+            })
     }
 
     /// The arcmux turn contract for this workspace's bound session, when it
     /// carries goal artifacts worth showing. Authoritative agent-written state.
     pub fn turn_contract(&self) -> Option<&crate::mc_data::mux_state::TurnContract> {
+        if self.has_active_remote_surfaces() && !self.has_local_agent_surface() {
+            return None;
+        }
         self.mux_status.as_ref().and_then(|s| s.contract())
     }
 
     /// Derive the agent name from mux state, session, screen insights, or surface titles.
     pub fn agent_name(&self) -> &str {
-        if let Some(ref status) = self.mux_status {
-            if !status.agent.is_empty() {
-                return &status.agent;
+        if !self.has_active_remote_surfaces() || self.has_local_agent_surface() {
+            if let Some(ref status) = self.mux_status {
+                if !status.agent.is_empty() {
+                    return &status.agent;
+                }
             }
-        }
-        if let Some(ref session) = self.session {
-            if let Some(ref agent) = session.frontmatter.agent {
+            if let Some(ref session) = self.session {
+                if let Some(ref agent) = session.frontmatter.agent {
+                    return agent;
+                }
+            }
+            if let Some(ref agent) = self.screen_insights.agent {
                 return agent;
             }
-        }
-        // Screen insights (parsed from full 100-line capture)
-        if let Some(ref agent) = self.screen_insights.agent {
-            return agent;
-        }
-        // Check surface titles
-        for s in &self.surfaces {
-            let t = s.title.to_lowercase();
-            if t.contains("claude") {
-                return "claude";
-            }
-            if t.contains("codex") {
-                return "codex";
-            }
-            if t.contains("opencode") {
-                return "opencode";
+            for s in &self.surfaces {
+                if self.remote_surfaces.contains_key(&s.ref_id) {
+                    continue;
+                }
+                let t = s.title.to_lowercase();
+                if t.contains("claude") {
+                    return "claude";
+                }
+                if t.contains("codex") {
+                    return "codex";
+                }
+                if t.contains("opencode") {
+                    return "opencode";
+                }
             }
         }
-        ""
+        self.active_remote_surfaces()
+            .into_iter()
+            .find_map(|(_, remote)| remote.agent.as_deref())
+            .unwrap_or("")
     }
 
     /// Get working directory from screen insights or surface titles.
     pub fn working_dir(&self) -> &str {
-        if let Some(ref dir) = self.screen_insights.working_dir {
+        if !self.has_active_remote_surfaces() || self.has_local_agent_surface() {
+            if let Some(ref dir) = self.screen_insights.working_dir {
+                return dir;
+            }
+        } else if let Some(dir) = self
+            .active_remote_surfaces()
+            .into_iter()
+            .find_map(|(_, remote)| remote.launch_cwd.as_deref())
+        {
             return dir;
         }
         // Derive from non-agent surface titles
@@ -572,10 +590,89 @@ impl WorkspaceState {
     /// Derive the agent state: is it baking or waiting for me?
     /// Priority: mux protocol state > TypeSafe classification > screen activity > surface detection.
     pub fn agent_state(&self) -> AgentState {
+        let local = self.local_agent_state();
+        let mut actionable = local == AgentState::NeedsMe;
+        let mut working = local == AgentState::Working;
+        let mut stale = false;
+        for remote in self.remote_surfaces.values() {
+            match remote.freshness {
+                crate::mc_data::arcmux_mesh::RemoteFreshness::Fresh => match remote.activity() {
+                    crate::mc_data::arcmux_mesh::RemoteActivity::Actionable => actionable = true,
+                    crate::mc_data::arcmux_mesh::RemoteActivity::Working => working = true,
+                    crate::mc_data::arcmux_mesh::RemoteActivity::Idle => {}
+                },
+                crate::mc_data::arcmux_mesh::RemoteFreshness::Syncing
+                | crate::mc_data::arcmux_mesh::RemoteFreshness::Stale => stale = true,
+                crate::mc_data::arcmux_mesh::RemoteFreshness::Gone => {}
+            }
+        }
+        if actionable {
+            AgentState::NeedsMe
+        } else if working {
+            AgentState::Working
+        } else if stale {
+            AgentState::Stale
+        } else {
+            AgentState::Idle
+        }
+    }
+
+    fn has_local_agent_surface(&self) -> bool {
+        self.surfaces.iter().any(|s| {
+            if self.remote_surfaces.contains_key(&s.ref_id) {
+                return false;
+            }
+            let t = s.title.to_ascii_lowercase();
+            s.kind.is_agent()
+                || t.contains("claude")
+                || t.contains("codex")
+                || t.contains("opencode")
+        })
+    }
+
+    fn has_active_remote_surfaces(&self) -> bool {
+        self.remote_surfaces
+            .values()
+            .any(|remote| remote.freshness != crate::mc_data::arcmux_mesh::RemoteFreshness::Gone)
+    }
+
+    /// Stable active-remote ordering prevents header identity and cwd from
+    /// flickering when a workspace contains multiple bound remote surfaces.
+    /// Actionable work wins, then working, then idle/offline; surface ref is
+    /// the deterministic tie-breaker. Gone rows are folded history.
+    fn active_remote_surfaces(
+        &self,
+    ) -> Vec<(&str, &crate::mc_data::arcmux_mesh::RemoteSurfaceState)> {
+        let mut remotes: Vec<_> = self
+            .remote_surfaces
+            .iter()
+            .filter(|(_, remote)| {
+                remote.freshness != crate::mc_data::arcmux_mesh::RemoteFreshness::Gone
+            })
+            .map(|(surface_ref, remote)| (surface_ref.as_str(), remote))
+            .collect();
+        remotes.sort_by_key(|(surface_ref, remote)| {
+            let priority = match remote.activity() {
+                crate::mc_data::arcmux_mesh::RemoteActivity::Actionable => 0,
+                crate::mc_data::arcmux_mesh::RemoteActivity::Working => 1,
+                crate::mc_data::arcmux_mesh::RemoteActivity::Idle => 2,
+            };
+            (priority, *surface_ref)
+        });
+        remotes
+    }
+
+    fn local_agent_state(&self) -> AgentState {
+        // Workspace-wide screen/session facts are unsafe for an all-remote
+        // workspace: they can describe whichever local surface was newest.
+        // Keep them only when there is no exact remote binding, or when a
+        // distinct local agent surface also exists.
+        let local_fallbacks_allowed =
+            !self.has_active_remote_surfaces() || self.has_local_agent_surface();
         // Central mux state is the authoritative activity source. Native hooks
         // write exactly one protocol store via `arcmux hook`; mc only reads
         // these JSON docs and does not infer working/idle from hook event names.
-        if let Some(ref status) = self.mux_status {
+        if local_fallbacks_allowed && let Some(ref status) = self.mux_status {
             if status.working {
                 return AgentState::Working;
             }
@@ -586,7 +683,7 @@ impl WorkspaceState {
         }
 
         // TypeSafe AI classification (sub-100ms, high confidence)
-        if let Some(ref cls) = self.classification {
+        if local_fallbacks_allowed && let Some(ref cls) = self.classification {
             if cls.state_confidence > 0.6 {
                 return match cls.state.as_str() {
                     "working" => AgentState::Working,
@@ -597,7 +694,7 @@ impl WorkspaceState {
         }
 
         // Derive from screen activity
-        if let Some(ref activity) = self.screen_insights.activity {
+        if local_fallbacks_allowed && let Some(ref activity) = self.screen_insights.activity {
             // Ongoing: contains ellipsis or parenthesized timing
             // e.g., "✻ Puzzling… (2m 30s)" or "• Working (54s · esc to interrupt)"
             if activity.contains('…') || activity.contains('(') {
@@ -608,7 +705,7 @@ impl WorkspaceState {
         }
 
         // Agent detected but no activity → waiting for input
-        if self.has_agent_surface() {
+        if self.has_local_agent_surface() {
             AgentState::NeedsMe
         } else {
             AgentState::Idle
@@ -616,10 +713,24 @@ impl WorkspaceState {
     }
 
     /// Derive the host from session or surface titles.
-    pub fn host_name(&self) -> &str {
+    pub fn host_name(&self) -> String {
+        let mut devices: Vec<&str> = self
+            .remote_surfaces
+            .values()
+            .filter(|remote| remote.freshness != crate::mc_data::arcmux_mesh::RemoteFreshness::Gone)
+            .map(|remote| remote.locator.device_id.as_str())
+            .collect();
+        devices.sort_unstable();
+        devices.dedup();
+        if devices.len() == 1 {
+            return devices[0].to_string();
+        }
+        if devices.len() > 1 {
+            return format!("remote×{}", devices.len());
+        }
         if let Some(ref session) = self.session {
             if let Some(ref host) = session.frontmatter.host {
-                return host;
+                return host.clone();
             }
         }
         // Derive from surface titles like "blin@blin-labs:~"
@@ -633,14 +744,38 @@ impl WorkspaceState {
                     if host.contains("mbp") || host.contains("local") {
                         None
                     } else {
-                        Some(host)
+                        Some(host.to_string())
                     }
                 } else {
                     None
                 }
             })
-            .unwrap_or("")
+            .unwrap_or_default()
     }
+}
+
+fn remote_surface_is_current(
+    remote: Option<&crate::mc_data::arcmux_mesh::RemoteSurfaceState>,
+) -> bool {
+    !remote.is_some_and(|state| {
+        state.freshness == crate::mc_data::arcmux_mesh::RemoteFreshness::Gone
+    })
+}
+
+fn retain_remote_surfaces_as_stale(
+    old: &HashMap<String, crate::mc_data::arcmux_mesh::RemoteSurfaceState>,
+    surfaces: &[SurfaceInfo],
+) -> HashMap<String, crate::mc_data::arcmux_mesh::RemoteSurfaceState> {
+    let mut stale = old.clone();
+    for remote in stale.values_mut() {
+        remote.mark_stale();
+    }
+    stale.retain(|surface_ref, _| {
+        surfaces
+            .iter()
+            .any(|surface| &surface.ref_id == surface_ref)
+    });
+    stale
 }
 
 /// Derived workspace status: is the agent baking or waiting for me?
@@ -652,6 +787,8 @@ pub enum AgentState {
     NeedsMe,
     /// No agent activity detected
     Idle,
+    /// A bound remote session is retained but its mesh projection is offline.
+    Stale,
 }
 
 impl AgentState {
@@ -660,6 +797,7 @@ impl AgentState {
             AgentState::Working => "working",
             AgentState::NeedsMe => "waiting",
             AgentState::Idle => "--",
+            AgentState::Stale => "offline",
         }
     }
 }
@@ -679,6 +817,8 @@ pub struct App {
     /// Machine-wide configuration or credential warning. Rendered in the
     /// global info layer rather than attached to any monitored workspace.
     pub global_warning: Option<String>,
+    /// Sanitized health warning from the local arcmux loopback consumer.
+    pub mesh_warning: Option<String>,
     session_to_workspace: HashMap<String, String>,
     workspace_index: HashMap<String, usize>,
     bullet_hashes: HashMap<PathBuf, u64>,
@@ -708,6 +848,8 @@ pub struct RefreshSnapshot {
     pub linear_by_ws_id: HashMap<String, crate::mc_data::linear::WorkspaceLinearView>,
     pub surface_intents_by_ws_id:
         HashMap<String, HashMap<String, crate::mc_data::session_log::ConversationIntent>>,
+    pub remote_mesh: Option<crate::mc_data::arcmux_mesh::RemoteMeshSnapshot>,
+    pub mesh_warning: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -950,6 +1092,13 @@ async fn gather_refresh_snapshot_inner(
     histories_dir: &std::path::Path,
     strict: bool,
 ) -> Result<RefreshSnapshot> {
+    // Read only arcmux's local projection. The client performs three
+    // concurrent GETs and never triggers a remote sync.
+    let mesh_task = tokio::spawn(async {
+        crate::mc_data::arcmux_mesh::ArcmuxMeshClient::default()
+            .fetch()
+            .await
+    });
     let workspaces = client.list_workspaces().await?;
     let expected_window_ref = workspaces.iter().find_map(|ws| ws.window_ref.as_deref());
     let mut surfaces_reliable = true;
@@ -1214,6 +1363,12 @@ async fn gather_refresh_snapshot_inner(
             (ws_id, intents)
         })
         .collect();
+    let mesh_fetch = mesh_task
+        .await
+        .unwrap_or_else(|_| crate::mc_data::arcmux_mesh::MeshFetch {
+            snapshot: None,
+            warning: Some("arcmux mesh reader unavailable".to_string()),
+        });
 
     Ok(RefreshSnapshot {
         workspaces,
@@ -1222,6 +1377,8 @@ async fn gather_refresh_snapshot_inner(
         beads_by_ws_id,
         linear_by_ws_id,
         surface_intents_by_ws_id,
+        remote_mesh: mesh_fetch.snapshot,
+        mesh_warning: mesh_fetch.warning,
     })
 }
 
@@ -1234,6 +1391,7 @@ impl App {
             focus: Focus::Sidebar,
             detail_scroll: 0,
             global_warning: None,
+            mesh_warning: None,
             session_to_workspace: HashMap::new(),
             workspace_index: HashMap::new(),
             bullet_hashes: HashMap::new(),
@@ -1350,7 +1508,10 @@ impl App {
             mut beads_by_ws_id,
             mut linear_by_ws_id,
             surface_intents_by_ws_id,
+            remote_mesh,
+            mesh_warning,
         } = snap;
+        self.mesh_warning = mesh_warning;
         self.beads_generation = self.beads_generation.wrapping_add(1);
 
         let old_counts: HashMap<String, u32> = self
@@ -1418,6 +1579,14 @@ impl App {
             .iter()
             .map(|ws| (ws.workspace.uuid.clone(), ws.mux_status.clone()))
             .collect();
+        let old_remote_surfaces: HashMap<
+            String,
+            HashMap<String, crate::mc_data::arcmux_mesh::RemoteSurfaceState>,
+        > = self
+            .workspaces
+            .iter()
+            .map(|ws| (ws.workspace.uuid.clone(), ws.remote_surfaces.clone()))
+            .collect();
         // Preserve the in-memory trajectory across refreshes so we can REUSE
         // it (instead of reloading from disk) when the user is actively
         // editing or peeking. Reloading mid-edit would clobber the
@@ -1444,6 +1613,15 @@ impl App {
                     beads_by_ws_id.remove(&ws.uuid)
                 };
                 let surfaces = surfaces_map.get(&ws.ref_id).cloned().unwrap_or_default();
+                let remote_surfaces = if let Some(mesh) = remote_mesh.as_ref() {
+                    mesh.resolve_workspace(&ws.uuid, &surfaces)
+                } else {
+                    let old = old_remote_surfaces
+                        .get(&ws.uuid)
+                        .cloned()
+                        .unwrap_or_default();
+                    retain_remote_surfaces_as_stale(&old, &surfaces)
+                };
                 let tool_call_count = old_counts.get(&ws.uuid).copied().unwrap_or(0);
                 let screen_preview = old_previews.get(&ws.uuid).cloned().flatten();
                 // Reuse existing insights (parsed from full 100-line capture)
@@ -1514,6 +1692,7 @@ impl App {
                     workspace: ws,
                     session,
                     surfaces,
+                    remote_surfaces,
                     screen_preview,
                     screen_insights,
                     tool_call_count,
@@ -1683,22 +1862,30 @@ impl App {
                 }
             }
 
-            // Build the new item list from the surfaces vec.
-            // Each surface item uses the workspace ref_id as surface_id because
-            // `cmux read-screen` takes a workspace ref — peek mode passes
-            // surface_id directly to read_screen, so this is the correct identifier.
+            // Build the new item list from the surfaces vec. The stable cmux
+            // surface ref is retained as surface_id so bound remote peeks read
+            // that exact local surface rather than a workspace-local transcript.
             let surface_items: Vec<crate::mc_data::trajectory::Item> = ws_state
                 .surfaces
                 .iter()
-                .map(|s| {
+                .filter_map(|s| {
                     // `effective_kind` keeps the agent glyph for ~5 min after
                     // the agent exits (Shell/Unknown current + recent
                     // last-agent file ⇒ surface the agent kind instead).
-                    let eff = crate::mc_data::surface_kind::effective_kind(
-                        &ws_state.workspace.uuid,
-                        &s.ref_id,
-                        s.kind,
-                    );
+                    let remote = ws_state.remote_surfaces.get(&s.ref_id);
+                    if !remote_surface_is_current(remote) {
+                        return None;
+                    }
+                    let eff = remote.map(|state| state.surface_kind()).unwrap_or_else(|| {
+                        crate::mc_data::surface_kind::effective_kind(
+                            &ws_state.workspace.uuid,
+                            &s.ref_id,
+                            s.kind,
+                        )
+                    });
+                    let title = remote
+                        .map(|state| state.stable_title(&s.title))
+                        .unwrap_or_else(|| s.title.clone());
                     // Remote (mosh/ssh) surfaces have no local session log; their
                     // overall/latest comes from provider inference over the
                     // screen-grab transcript (see remote_intent). Local agent
@@ -1706,7 +1893,9 @@ impl App {
                     // Bound surfaces already carry the provider "overall" summary
                     // (applied in the gather phase from overall_cache); the
                     // workspace-fallback path is for unbound surfaces only.
-                    let intent = if eff == crate::mc_data::surface_kind::SurfaceKind::Remote {
+                    let intent = if remote.is_some() {
+                        None
+                    } else if eff == crate::mc_data::surface_kind::SurfaceKind::Remote {
                         remote_intents.get(&s.ref_id).cloned()
                     } else {
                         surface_intent_summary(
@@ -1720,12 +1909,12 @@ impl App {
                     };
                     let text = crate::mc_data::surface_render::format_surface_text(
                         eff,
-                        &s.title,
+                        &title,
                         &goals,
                         &s.ref_id,
                         intent.as_ref(),
                     );
-                    crate::mc_data::trajectory::Item {
+                    Some(crate::mc_data::trajectory::Item {
                         text,
                         is_checkbox: false,
                         checked: None,
@@ -1733,7 +1922,7 @@ impl App {
                         // peek mode can distinguish surfaces within the same workspace
                         // and distribute session logs deterministically by index.
                         surface_id: Some(s.ref_id.clone()),
-                    }
+                    })
                 })
                 .collect();
 
@@ -2070,6 +2259,9 @@ impl App {
         if let Some(warning) = self.global_warning.as_deref() {
             parts.push(format!("⚠ {warning}"));
         }
+        if let Some(warning) = self.mesh_warning.as_deref() {
+            parts.push(format!("⚠ {warning}"));
+        }
         if parts.is_empty() {
             None
         } else {
@@ -2093,7 +2285,11 @@ impl App {
             ws.loading = true;
             // TypeSafe only earns its keep on remote workspaces; local
             // activity is read from mux state, then screen-regex fallbacks.
-            let classifier = if ws.is_remote() { classifier } else { None };
+            let classifier = if ws.needs_remote_screen_inference() {
+                classifier
+            } else {
+                None
+            };
             spawn_screen_task(
                 ws.workspace.uuid.clone(),
                 ws.workspace.ref_id.clone(),
@@ -2115,7 +2311,7 @@ impl App {
         for ws in &mut self.workspaces {
             ws.loading = true;
             // Remote-only: skip the TypeSafe call for local mux/screen-covered workspaces.
-            let ws_classifier = if ws.is_remote() {
+            let ws_classifier = if ws.needs_remote_screen_inference() {
                 classifier.clone()
             } else {
                 None
@@ -2152,6 +2348,11 @@ impl App {
         for ws in &self.workspaces {
             for s in &ws.surfaces {
                 live_refs.push(s.ref_id.clone());
+                // An exact mesh binding is authoritative. Do not feed its
+                // local terminal capture into the legacy inference provider.
+                if ws.remote_surfaces.contains_key(&s.ref_id) {
+                    continue;
+                }
                 if let Some(tty) = &s.tty {
                     if self.remote_watch.due(&s.ref_id, tick) {
                         candidates.push((ws.workspace.uuid.clone(), s.ref_id.clone(), tty.clone()));
@@ -2815,7 +3016,11 @@ impl App {
                     //     which the peek_tick path reads via
                     //     surface.read_text (per-surface), NOT
                     //     read-screen (workspace-level).
-                    let source = if surface_kind.is_agent() {
+                    let source = if ws.remote_surfaces.contains_key(surface_id_for_lookup) {
+                        // F10/F11/F12: a bound remote row remains the exact local
+                        // cmux surface. Never resolve it to a local session.md.
+                        crate::tui::peek_view::PeekSource::Shell
+                    } else if surface_kind.is_agent() {
                         let agent_label = surface_kind.label();
                         let same_agent_index = ws
                             .surfaces
@@ -4097,6 +4302,7 @@ workspace: test-ws
             },
             session: None,
             surfaces: Vec::new(),
+            remote_surfaces: HashMap::new(),
             screen_preview: None,
             screen_insights: ScreenInsights::default(),
             tool_call_count: 0,
@@ -4128,6 +4334,31 @@ workspace: test-ws
         app.workspace_index.insert("test-uuid-1".to_string(), 0);
         app.selected = 0;
         app
+    }
+
+    fn remote_state(
+        surface_ref: &str,
+        state: &str,
+        freshness: crate::mc_data::arcmux_mesh::RemoteFreshness,
+    ) -> crate::mc_data::arcmux_mesh::RemoteSurfaceState {
+        crate::mc_data::arcmux_mesh::RemoteSurfaceState {
+            surface_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            workspace_uuid: "test-uuid-1".to_string(),
+            locator: crate::mc_data::arcmux_mesh::RemoteSessionLocator {
+                schema_version: 1,
+                device_id: "devbox".to_string(),
+                profile_scope: "root".to_string(),
+                session_id: format!("s-{surface_ref}"),
+                transport_binding_id: None,
+            },
+            name: Some(format!("remote-{surface_ref}")),
+            agent: Some("codex".to_string()),
+            state: Some(state.to_string()),
+            health: Some("healthy".to_string()),
+            launch_cwd: Some("~/Tools/mission-control".to_string()),
+            current_work: Some("Implement exact remote surfaces".to_string()),
+            freshness,
+        }
     }
 
     fn test_linear_issue(identifier: &str) -> crate::mc_data::linear::LinearIssue {
@@ -4470,6 +4701,184 @@ platforms:
     }
 
     #[test]
+    fn remote_status_aggregates_actionable_before_working_before_stale() {
+        use crate::mc_data::arcmux_mesh::RemoteFreshness;
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let ws = &mut app.workspaces[0];
+        ws.remote_surfaces.insert(
+            "surface:working".to_string(),
+            remote_state("working", "working", RemoteFreshness::Fresh),
+        );
+        assert_eq!(ws.agent_state(), AgentState::Working);
+
+        ws.remote_surfaces.insert(
+            "surface:waiting".to_string(),
+            remote_state("waiting", "waiting", RemoteFreshness::Fresh),
+        );
+        assert_eq!(ws.agent_state(), AgentState::NeedsMe);
+
+        ws.remote_surfaces.clear();
+        ws.remote_surfaces.insert(
+            "surface:idle".to_string(),
+            remote_state("idle", "idle", RemoteFreshness::Fresh),
+        );
+        assert_eq!(ws.agent_state(), AgentState::Idle);
+
+        ws.remote_surfaces.clear();
+        ws.remote_surfaces.insert(
+            "surface:stale".to_string(),
+            remote_state("stale", "working", RemoteFreshness::Stale),
+        );
+        assert_eq!(ws.agent_state(), AgentState::Stale);
+    }
+
+    #[test]
+    fn mixed_workspace_keeps_local_compact_header_identity() {
+        use crate::mc_data::arcmux_mesh::RemoteFreshness;
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let ws = &mut app.workspaces[0];
+        ws.surfaces.push(SurfaceInfo {
+            title: "claude local".to_string(),
+            ref_id: "surface:local".to_string(),
+            uuid: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string()),
+            pane_ref: None,
+            tty: None,
+            kind: crate::mc_data::surface_kind::SurfaceKind::Claude,
+            selected: false,
+            focused: false,
+            active: false,
+            index: None,
+            index_in_pane: None,
+            surface_type: Some("terminal".to_string()),
+        });
+        ws.screen_insights.agent = Some("claude".to_string());
+        ws.screen_insights.working_dir = Some("~/Projects/local".to_string());
+        ws.remote_surfaces.insert(
+            "surface:remote".to_string(),
+            remote_state("remote", "idle", RemoteFreshness::Fresh),
+        );
+
+        assert_eq!(ws.agent_name(), "claude");
+        assert_eq!(ws.working_dir(), "~/Projects/local");
+        assert_eq!(ws.host_name(), "devbox");
+    }
+
+    #[test]
+    fn remote_header_selection_is_stable_and_excludes_gone_history() {
+        use crate::mc_data::arcmux_mesh::RemoteFreshness;
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let ws = &mut app.workspaces[0];
+
+        let mut first = remote_state("first", "working", RemoteFreshness::Fresh);
+        first.agent = Some("claude".to_string());
+        first.launch_cwd = Some("~/Projects/first".to_string());
+        ws.remote_surfaces.insert("surface:a".to_string(), first);
+
+        let mut second = remote_state("second", "working", RemoteFreshness::Fresh);
+        second.agent = Some("codex".to_string());
+        second.launch_cwd = Some("~/Projects/second".to_string());
+        ws.remote_surfaces.insert("surface:z".to_string(), second);
+
+        let mut gone = remote_state("gone", "waiting", RemoteFreshness::Gone);
+        gone.agent = Some("opencode".to_string());
+        gone.locator.device_id = "labs".to_string();
+        ws.remote_surfaces.insert("surface:0".to_string(), gone);
+
+        assert_eq!(ws.agent_name(), "claude");
+        assert_eq!(ws.working_dir(), "~/Projects/first");
+        assert_eq!(ws.host_name(), "devbox");
+        assert_eq!(ws.agent_state(), AgentState::Working);
+
+        ws.remote_surfaces.get_mut("surface:z").unwrap().state = Some("waiting".to_string());
+        assert_eq!(ws.agent_name(), "codex");
+        assert_eq!(ws.working_dir(), "~/Projects/second");
+        assert_eq!(ws.agent_state(), AgentState::NeedsMe);
+    }
+
+    #[test]
+    fn gone_remote_is_folded_out_of_current_surfaces() {
+        let gone = remote_state(
+            "gone",
+            "exited",
+            crate::mc_data::arcmux_mesh::RemoteFreshness::Gone,
+        );
+        assert!(!remote_surface_is_current(Some(&gone)));
+        assert!(remote_surface_is_current(None));
+    }
+
+    #[test]
+    fn mesh_fetch_failure_retains_exact_surface_as_stale() {
+        let mut old = HashMap::new();
+        old.insert(
+            "surface:14".to_string(),
+            remote_state(
+                "surface:14",
+                "working",
+                crate::mc_data::arcmux_mesh::RemoteFreshness::Fresh,
+            ),
+        );
+        let surfaces = vec![SurfaceInfo {
+            title: "anything".to_string(),
+            ref_id: "surface:14".to_string(),
+            uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            pane_ref: None,
+            tty: None,
+            kind: crate::mc_data::surface_kind::SurfaceKind::Remote,
+            selected: false,
+            focused: false,
+            active: false,
+            index: None,
+            index_in_pane: None,
+            surface_type: Some("terminal".to_string()),
+        }];
+
+        let retained = retain_remote_surfaces_as_stale(&old, &surfaces);
+        let state = retained.get("surface:14").expect("retained binding");
+        assert_eq!(
+            state.freshness,
+            crate::mc_data::arcmux_mesh::RemoteFreshness::Stale
+        );
+        assert_eq!(state.locator.device_id, "devbox");
+    }
+
+    #[test]
+    fn bound_remote_peek_uses_exact_cmux_surface_not_local_transcript() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let ws = &mut app.workspaces[0];
+        ws.surfaces.push(SurfaceInfo {
+            title: "codex-looking remote".to_string(),
+            ref_id: "sid-42".to_string(),
+            uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            pane_ref: None,
+            tty: Some("ttys001".to_string()),
+            kind: crate::mc_data::surface_kind::SurfaceKind::Codex,
+            selected: true,
+            focused: true,
+            active: true,
+            index: Some(0),
+            index_in_pane: Some(0),
+            surface_type: Some("terminal".to_string()),
+        });
+        ws.remote_surfaces.insert(
+            "sid-42".to_string(),
+            remote_state(
+                "sid-42",
+                "working",
+                crate::mc_data::arcmux_mesh::RemoteFreshness::Fresh,
+            ),
+        );
+        let edit = ws.edit_state.get_or_insert_with(Default::default);
+        edit.cursor_section = 1;
+        edit.cursor_item = 0;
+
+        app.handle_trajectory_key(key(KeyCode::Enter));
+
+        let peek = app.workspaces[0].peek_state.as_ref().expect("peek");
+        assert_eq!(peek.surface_ref, "sid-42");
+        assert!(matches!(peek.source, crate::tui::peek_view::PeekSource::Shell));
+    }
+
+    #[test]
     fn mux_state_drives_agent_state_instead_of_event_name() {
         let mut app = make_app(SAMPLE_WITH_SURFACE);
         app.handle_agent_event(&AgentEvent {
@@ -4615,6 +5024,8 @@ platforms:
             beads_by_ws_id,
             linear_by_ws_id: HashMap::new(),
             surface_intents_by_ws_id: HashMap::new(),
+            remote_mesh: None,
+            mesh_warning: None,
         };
         let mut app = App::new();
         app.apply_refresh_snapshot(snap, None).await;
@@ -4682,6 +5093,8 @@ platforms:
                 beads_by_ws_id: HashMap::new(),
                 linear_by_ws_id: HashMap::new(),
                 surface_intents_by_ws_id: HashMap::new(),
+                remote_mesh: None,
+                mesh_warning: None,
             }
         };
 

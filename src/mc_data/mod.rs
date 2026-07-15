@@ -1,3 +1,4 @@
+pub mod arcmux_mesh;
 pub mod beads;
 pub mod cmux_sessions;
 pub mod dismissal;

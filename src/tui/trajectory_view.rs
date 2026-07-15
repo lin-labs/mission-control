@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::mc_data::surface_kind::SurfaceKind;
 use crate::mc_data::trajectory::{
@@ -141,27 +141,60 @@ fn surface_item_lines<'a>(
     cursor: bool,
     focused: bool,
     inner_width: usize,
+    remote: Option<&crate::mc_data::arcmux_mesh::RemoteSurfaceState>,
 ) -> Vec<Line<'a>> {
     let (main, overall, ask) = split_surface_intent(text);
+    let offline = remote.is_some_and(|state| state.freshness.is_offline());
+    let row_base = if offline {
+        base.fg(Color::DarkGray).add_modifier(Modifier::DIM)
+    } else {
+        base
+    };
+    let remote_badge = remote.map(|state| {
+        format!(
+            "   [{} · {}]",
+            state.state_label(),
+            state.freshness.label()
+        )
+    });
     // The main (title) line carries the nav cursor highlight when selected; the
     // overall/latest sub-lines render identically whether or not the row is the
     // cursor, so selecting a surface doesn't change its structure.
     let first_line = if cursor {
+        let style = if offline {
+            nav_cursor_style(focused).add_modifier(Modifier::DIM)
+        } else {
+            nav_cursor_style(focused)
+        };
         Line::from(Span::styled(
-            format!("{prefix}{main}"),
-            nav_cursor_style(focused),
+            format!("{prefix}{main}{}", remote_badge.as_deref().unwrap_or("")),
+            style,
         ))
     } else {
-        let mut first = vec![Span::styled(prefix.to_string(), base)];
-        first.extend(surface_row_spans(main, dim, base));
+        let mut first = vec![Span::styled(prefix.to_string(), row_base)];
+        first.extend(surface_row_spans(main, dim || offline, row_base));
+        if let Some(badge) = remote_badge {
+            first.push(Span::styled(badge, row_base.fg(Color::DarkGray)));
+        }
         Line::from(first)
     };
     let mut lines = vec![first_line];
+    if let Some(state) = remote {
+        let detail = format!(
+            "{} · {}",
+            state.locator.session_id,
+            state.health.as_deref().unwrap_or("health unknown")
+        );
+        push_field_lines(&mut lines, "    remote:  ", &detail, row_base, inner_width);
+        if let Some(work) = state.current_work.as_deref() {
+            push_field_lines(&mut lines, "    work:    ", work, row_base, inner_width);
+        }
+    }
     if let Some(goal) = overall.filter(|s| !s.is_empty()) {
-        push_field_lines(&mut lines, "    overall: ", goal, base, inner_width);
+        push_field_lines(&mut lines, "    overall: ", goal, row_base, inner_width);
     }
     if let Some(ask) = ask.filter(|s| !s.is_empty()) {
-        push_field_lines(&mut lines, "    latest:  ", ask, base, inner_width);
+        push_field_lines(&mut lines, "    latest:  ", ask, row_base, inner_width);
     }
     lines
 }
@@ -309,6 +342,9 @@ pub struct RenderHints {
     /// Display-only override for the canonical third trajectory section.
     /// Persisted trajectory files keep `## Beads` for backward compatibility.
     pub task_section_title: Option<String>,
+    /// Volatile arcmux runtime keyed by local `surface:N`. Kept out of
+    /// trajectory.md so activity/freshness changes do not churn the file.
+    pub remote_surfaces: HashMap<String, crate::mc_data::arcmux_mesh::RemoteSurfaceState>,
 }
 
 /// Render the trajectory detail pane.
@@ -520,6 +556,9 @@ pub fn render_with_hints(
                         is_cursor && !in_insert,
                         focused,
                         body_inner.width as usize,
+                        item.surface_id
+                            .as_deref()
+                            .and_then(|surface_ref| hints.remote_surfaces.get(surface_ref)),
                     ));
                     continue;
                 }
@@ -1737,6 +1776,110 @@ workspace: t3
             "live Claude glyph should not be DIM, got {:?}",
             live
         );
+    }
+
+    #[test]
+    fn remote_runtime_renders_from_hints_without_changing_document() {
+        let doc = TrajectoryDoc::parse(T3_SAMPLE).unwrap();
+        let original = doc.to_markdown();
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hints = RenderHints::default();
+        hints.remote_surfaces.insert(
+            "surface:22".to_string(),
+            crate::mc_data::arcmux_mesh::RemoteSurfaceState {
+                surface_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+                workspace_uuid: "22222222-2222-4222-8222-222222222222".to_string(),
+                locator: crate::mc_data::arcmux_mesh::RemoteSessionLocator {
+                    schema_version: 1,
+                    device_id: "devbox".to_string(),
+                    profile_scope: "root".to_string(),
+                    session_id: "s-working".to_string(),
+                    transport_binding_id: None,
+                },
+                name: Some("remote-codex".to_string()),
+                agent: Some("codex".to_string()),
+                state: Some("working".to_string()),
+                health: Some("healthy".to_string()),
+                launch_cwd: None,
+                current_work: Some("Implement native remote surface rows".to_string()),
+                freshness: crate::mc_data::arcmux_mesh::RemoteFreshness::Fresh,
+            },
+        );
+
+        terminal
+            .draw(|f| {
+                render_with_hints(
+                    f,
+                    Rect::new(0, 0, 120, 24),
+                    Some(&doc),
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    &hints,
+                )
+            })
+            .unwrap();
+
+        let dump = buf_dump(&terminal);
+        assert!(dump.contains("working · fresh"), "runtime badge missing: {dump}");
+        assert!(dump.contains("s-working · healthy"), "locator line missing: {dump}");
+        assert!(
+            dump.contains("Implement native remote surface rows"),
+            "safe current work missing: {dump}"
+        );
+        assert_eq!(doc.to_markdown(), original, "volatile hints mutated trajectory");
+    }
+
+    #[test]
+    fn stale_remote_runtime_dims_the_surface_row() {
+        let doc = TrajectoryDoc::parse(T3_SAMPLE).unwrap();
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hints = RenderHints::default();
+        let mut state = crate::mc_data::arcmux_mesh::RemoteSurfaceState {
+            surface_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            workspace_uuid: "22222222-2222-4222-8222-222222222222".to_string(),
+            locator: crate::mc_data::arcmux_mesh::RemoteSessionLocator {
+                schema_version: 1,
+                device_id: "devbox".to_string(),
+                profile_scope: "root".to_string(),
+                session_id: "s-working".to_string(),
+                transport_binding_id: None,
+            },
+            name: None,
+            agent: Some("codex".to_string()),
+            state: Some("working".to_string()),
+            health: None,
+            launch_cwd: None,
+            current_work: None,
+            freshness: crate::mc_data::arcmux_mesh::RemoteFreshness::Fresh,
+        };
+        state.mark_stale();
+        hints.remote_surfaces.insert("surface:22".to_string(), state);
+
+        terminal
+            .draw(|f| {
+                render_with_hints(
+                    f,
+                    Rect::new(0, 0, 120, 24),
+                    Some(&doc),
+                    0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    &hints,
+                )
+            })
+            .unwrap();
+
+        let dump = buf_dump(&terminal);
+        assert!(dump.contains("working · stale"));
+        let style = cell_style(&terminal, "codex · shell", '▲').unwrap();
+        assert!(style.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]

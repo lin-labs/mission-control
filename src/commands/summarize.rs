@@ -273,18 +273,13 @@ async fn commit_stats_for(cwd: &Path) -> Option<CommitStats> {
 }
 
 fn derive_status_label(ws: &crate::tui::app::WorkspaceState) -> String {
-    // Reuse the same labels the sidebar shows.
-    use crate::tui::app::AgentState;
-    let state = if ws.summarizing {
-        AgentState::Working
-    } else if ws.screen_insights.activity.is_some() {
-        AgentState::Working
-    } else if ws.session.is_some() {
-        AgentState::NeedsMe
+    // Reuse the exact aggregate used by the sidebar, including bound remote
+    // surfaces and their freshness.
+    if ws.summarizing {
+        crate::tui::app::AgentState::Working.label().to_string()
     } else {
-        AgentState::Idle
-    };
-    state.label().to_string()
+        ws.agent_state().label().to_string()
+    }
 }
 
 /// Resolve the directory where mc writes summary reports: the

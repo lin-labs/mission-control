@@ -2066,6 +2066,7 @@ mod tests {
             },
             session: None,
             surfaces: Vec::new(),
+            remote_surfaces: std::collections::HashMap::new(),
             screen_preview: None,
             screen_insights: ScreenInsights::default(),
             tool_call_count: 0,

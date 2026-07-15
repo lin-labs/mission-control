@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "peers": [
+    {"peer_id": "devbox", "state": "connected"},
+    {"peer_id": "labs", "state": "connected"}
+  ]
+}

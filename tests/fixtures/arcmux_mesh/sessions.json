@@ -1,0 +1,50 @@
+{
+  "sessions": [
+    {
+      "schema_version": 1,
+      "locator": {
+        "schema_version": 1,
+        "device_id": "devbox",
+        "profile_scope": "root",
+        "session_id": "s-working"
+      },
+      "metadata": {
+        "name": "mc-native-remote",
+        "agent": "codex",
+        "launch_cwd": "~/Tools/mission-control",
+        "state": "working",
+        "health": "healthy",
+        "current_work": {
+          "summary": "Wire native remote surfaces into Mission Control",
+          "provenance": "hook.overall_goal_summarizer.v1",
+          "updated_at": "2026-07-15T12:00:00Z"
+        }
+      },
+      "received_at": "2026-07-15T12:00:00Z",
+      "freshness_changed_at": "2026-07-15T12:00:00Z",
+      "source_epoch": "boot-devbox",
+      "source_revision": 9,
+      "freshness": "fresh"
+    },
+    {
+      "schema_version": 1,
+      "locator": {
+        "schema_version": 1,
+        "device_id": "labs",
+        "profile_scope": "profile:boyan",
+        "session_id": "s-working"
+      },
+      "metadata": {
+        "name": "same-name-different-host",
+        "agent": "claude",
+        "state": "idle",
+        "health": "healthy"
+      },
+      "received_at": "2026-07-15T12:00:00Z",
+      "freshness_changed_at": "2026-07-15T12:00:00Z",
+      "source_epoch": "boot-labs",
+      "source_revision": 3,
+      "freshness": "fresh"
+    }
+  ]
+}
