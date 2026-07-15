@@ -11,6 +11,8 @@ use tokio::process::Command;
 const GCP_PROJECT: &str = "reflectionai";
 const GCP_SECRET: &str = "OPENAI_API_KEY_AGENTIC";
 const GCP_SECRET_TIMEOUT: Duration = Duration::from_secs(8);
+const ZSHENV_KEY_TIMEOUT: Duration = Duration::from_secs(2);
+const ZSHENV_KEY_SCRIPT: &str = r#"print -rn -- "${OPENAI_API_KEY-}""#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiKeyResolution {
@@ -19,37 +21,75 @@ pub struct ApiKeyResolution {
 }
 
 /// Resolve an OpenAI key without persisting or logging it. Explicit CLI/env
-/// configuration wins; otherwise use the machine's gcloud authentication.
+/// configuration wins, followed by ~/.zshenv and then gcloud authentication.
 pub async fn resolve_api_key(explicit: Option<String>) -> ApiKeyResolution {
-    let args = [
-        "secrets",
-        "versions",
-        "access",
-        "latest",
-        "--secret",
-        GCP_SECRET,
-        "--project",
-        GCP_PROJECT,
-    ];
-    resolve_api_key_with_command(explicit, "gcloud", &args, GCP_SECRET_TIMEOUT).await
+    resolve_api_key_with_sources(
+        explicit,
+        "/bin/zsh",
+        &["-c", ZSHENV_KEY_SCRIPT],
+        ZSHENV_KEY_TIMEOUT,
+        "gcloud",
+        &[
+            "secrets",
+            "versions",
+            "access",
+            "latest",
+            "--secret",
+            GCP_SECRET,
+            "--project",
+            GCP_PROJECT,
+        ],
+        GCP_SECRET_TIMEOUT,
+    )
+    .await
 }
 
-async fn resolve_api_key_with_command(
+async fn resolve_api_key_with_sources(
     explicit: Option<String>,
-    binary: &str,
-    args: &[&str],
-    timeout: Duration,
+    local_binary: &str,
+    local_args: &[&str],
+    local_timeout: Duration,
+    gcloud_binary: &str,
+    gcloud_args: &[&str],
+    gcloud_timeout: Duration,
 ) -> ApiKeyResolution {
-    if let Some(key) = explicit
-        .map(|key| key.trim().to_string())
-        .filter(|key| !key.is_empty())
-    {
-        return ApiKeyResolution {
-            api_key: Some(key),
-            warning: None,
-        };
+    if let Some(key) = normalize_key(explicit) {
+        return resolved(key);
     }
 
+    if let Some(key) = key_from_command(local_binary, local_args, local_timeout).await {
+        return resolved(key);
+    }
+
+    resolve_gcloud_key(gcloud_binary, gcloud_args, gcloud_timeout).await
+}
+
+fn normalize_key(key: Option<String>) -> Option<String> {
+    key.map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+}
+
+fn resolved(key: String) -> ApiKeyResolution {
+    ApiKeyResolution {
+        api_key: Some(key),
+        warning: None,
+    }
+}
+
+async fn key_from_command(binary: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut command = Command::new(binary);
+    command.args(args).kill_on_drop(true);
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    normalize_key(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
+}
+
+async fn resolve_gcloud_key(binary: &str, args: &[&str], timeout: Duration) -> ApiKeyResolution {
     let mut command = Command::new(binary);
     command.args(args).kill_on_drop(true);
     match tokio::time::timeout(timeout, command.output()).await {
@@ -79,19 +119,17 @@ async fn resolve_api_key_with_command(
             )),
         },
         Ok(Ok(output)) => {
-            let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if key.is_empty() {
+            if let Some(key) =
+                normalize_key(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
+            {
+                resolved(key)
+            } else {
                 ApiKeyResolution {
                     api_key: None,
                     warning: Some(
                         "OpenAI key unavailable: gcloud secret lookup returned an empty value; reload mc after fixing access"
-                            .to_string(),
+                        .to_string(),
                     ),
-                }
-            } else {
-                ApiKeyResolution {
-                    api_key: Some(key),
-                    warning: None,
                 }
             }
         }
@@ -291,10 +329,47 @@ fn parse_summary(text: &str) -> Result<Summary> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn explicit_key_skips_external_lookup() {
-        let result = resolve_api_key_with_command(
+    async fn zshenv_script_reads_openai_key() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let zdotdir = std::env::temp_dir().join(format!(
+            "mission-control-zshenv-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&zdotdir).unwrap();
+        std::fs::write(
+            zdotdir.join(".zshenv"),
+            "export OPENAI_API_KEY='secret-from-zshenv'\n",
+        )
+        .unwrap();
+
+        let output = Command::new("/bin/zsh")
+            .args(["-c", ZSHENV_KEY_SCRIPT])
+            .env("ZDOTDIR", &zdotdir)
+            .env_remove("OPENAI_API_KEY")
+            .output()
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&zdotdir);
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "secret-from-zshenv"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_key_skips_local_and_gcloud_lookups() {
+        let result = resolve_api_key_with_sources(
             Some("  explicit-key\n".into()),
+            "/definitely/missing/zsh",
+            &[],
+            Duration::from_millis(10),
             "/definitely/missing/gcloud",
             &[],
             Duration::from_millis(10),
@@ -305,9 +380,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_lookup_trims_key() {
-        let result = resolve_api_key_with_command(
+    async fn local_key_skips_gcloud_lookup() {
+        let result = resolve_api_key_with_sources(
             None,
+            "/bin/sh",
+            &["-c", "printf '  secret-from-zshenv\\n'"],
+            Duration::from_secs(1),
+            "/definitely/missing/gcloud",
+            &[],
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(result.api_key.as_deref(), Some("secret-from-zshenv"));
+        assert_eq!(result.warning, None);
+    }
+
+    #[tokio::test]
+    async fn empty_local_key_falls_back_to_gcloud() {
+        let result = resolve_api_key_with_sources(
+            None,
+            "/bin/sh",
+            &["-c", "printf '  \\n'"],
+            Duration::from_secs(1),
             "/bin/sh",
             &["-c", "printf 'secret-from-gcloud\\n'"],
             Duration::from_secs(1),
@@ -318,9 +412,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_lookup_is_sanitized() {
-        let result = resolve_api_key_with_command(
-            None,
+    async fn failed_gcloud_lookup_is_sanitized() {
+        let result = resolve_gcloud_key(
             "/bin/sh",
             &["-c", "printf 'sensitive stderr' >&2; exit 7"],
             Duration::from_secs(1),
@@ -333,27 +426,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_lookup_is_non_fatal() {
-        let result = resolve_api_key_with_command(
-            None,
-            "/bin/sh",
-            &["-c", "printf '  \n'"],
-            Duration::from_secs(1),
-        )
-        .await;
+    async fn empty_gcloud_lookup_is_non_fatal() {
+        let result =
+            resolve_gcloud_key("/bin/sh", &["-c", "printf '  \n'"], Duration::from_secs(1)).await;
         assert_eq!(result.api_key, None);
         assert!(result.warning.unwrap().contains("empty value"));
     }
 
     #[tokio::test]
-    async fn timed_out_lookup_is_non_fatal() {
-        let result = resolve_api_key_with_command(
-            None,
-            "/bin/sh",
-            &["-c", "sleep 1"],
-            Duration::from_millis(5),
-        )
-        .await;
+    async fn timed_out_gcloud_lookup_is_non_fatal() {
+        let result =
+            resolve_gcloud_key("/bin/sh", &["-c", "sleep 1"], Duration::from_millis(5)).await;
         assert_eq!(result.api_key, None);
         assert!(result.warning.unwrap().contains("timed out"));
     }

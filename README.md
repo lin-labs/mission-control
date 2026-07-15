@@ -22,6 +22,7 @@ signals are weak.
 - `cmux`
 - Optional: `codex` on your `PATH` for local summarization
 - Optional: `OPENAI_API_KEY` for OpenAI-backed summaries
+- Optional: `OPENAI_API_KEY` exported from `~/.zshenv` for app launches that do not inherit it
 - Optional: `gcloud` authenticated to `reflectionai` for automatic OpenAI key lookup
 - Optional: `TYPESAFE_API_KEY` for screen classification
 
@@ -60,9 +61,10 @@ use one machine-local provider selected in `~/data/mission-control/config.json`:
 
 Supported values are `xai` and `openai`. A missing file preserves the historical
 `xai` default. OpenAI uses `OPENAI_API_KEY` / `--openai-api-key` when supplied;
-otherwise Mission Control reads `OPENAI_API_KEY_AGENTIC` through `gcloud` from
-the `reflectionai` project. Secret lookup failures are non-fatal and appear as a
-global warning in the TUI. The fetched key is never persisted.
+otherwise Mission Control checks `OPENAI_API_KEY` from `~/.zshenv`, then reads
+`OPENAI_API_KEY_AGENTIC` through `gcloud` from the `reflectionai` project.
+Secret lookup failures are non-fatal and appear as a global warning in the TUI.
+The resolved key is never persisted.
 
 ## Subcommands
 
