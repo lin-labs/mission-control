@@ -111,6 +111,11 @@ Meta-patterns observed so far:
   before dropping to lower-level pane inspection. The snapshot already carries
   the workspace-to-surface mapping plus each structured surface's overall goal
   and latest ask.
+- **Fault the mesh, not the supervised session, for recovery dogfood**. A
+  mesh-only hot reload to an unreachable peer kept the remote agent and exact
+  surface alive, proved stale → fresh on the same locator, and avoided turning
+  a reconnect test into daemon/session teardown. Pair it with exact peek and
+  yield before cleaning the disposable binding.
 
 ## Where retro findings from this project should land
 

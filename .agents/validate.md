@@ -682,7 +682,11 @@ disconnects.
    expose only bounded, sanitized warnings.
 6. Run focused exact-binding, mixed local/remote, stale/reconnect,
    malformed/missing projection, workspace-isolation, and no-title-inference
-   tests. Tier 4 must include a real ref/devbox disconnect and reconnect.
+   tests. Tier 4 must include a real ref/devbox disconnect and reconnect. Fault
+   only the mesh transport (for example, hot-reload a temporary unreachable
+   peer URL and then restore it); do **not** stop the remote daemon, because a
+   daemon stop may terminate its managed tmux session and exercises `gone`
+   cleanup instead of same-locator stale → fresh recovery.
 
 ---
 
