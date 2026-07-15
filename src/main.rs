@@ -41,7 +41,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, interval};
+use tokio::time::{Duration, Instant as TokioInstant, MissedTickBehavior, interval, interval_at};
 
 /// A trajectory.md file was written externally — carry just the workspace uuid.
 #[derive(Debug, Clone)]
@@ -828,6 +828,14 @@ async fn run_app(
     let mut surface_summary_tick = interval(Duration::from_secs(60));
     let mut dismiss_tick = interval(Duration::from_secs(30));
     let mut mux_state_interval = interval(Duration::from_secs(2));
+    // Mission checkboxes update synchronously on keypress. Cross-section
+    // relocation is deliberately batched onto its own five-second sweep so
+    // the 200 ms peek renderer can never make a mission row disappear.
+    let mut mission_relocation_interval = interval_at(
+        TokioInstant::now() + crate::tui::trajectory_edit::MISSION_RELOCATION_DELAY,
+        crate::tui::trajectory_edit::MISSION_RELOCATION_DELAY,
+    );
+    mission_relocation_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     // Track per-workspace surface count from the previous cmux refresh.
     // Used to detect surface detachments between cmux event stream events.
@@ -1566,7 +1574,7 @@ async fn run_app(
             }
 
 
-            _ = peek_tick.tick() => {
+            _ = mission_relocation_interval.tick() => {
                 for (workspace_ref, description) in app.settle_pending_mission_moves() {
                     let client = cmux_client.clone();
                     tokio::spawn(async move {
@@ -1580,6 +1588,9 @@ async fn run_app(
                         }
                     });
                 }
+            }
+
+            _ = peek_tick.tick() => {
                 if let Some((uuid, surface_ref)) = app.peek_needs_poll() {
                     let uuid = uuid.to_string();
                     let surface_ref = surface_ref.to_string();
