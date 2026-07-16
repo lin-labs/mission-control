@@ -14,9 +14,11 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
+const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const HANDOFF_WAIT: &str = "90s";
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(100);
 const SIMPLE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -150,6 +152,7 @@ pub struct HandoffUpdate {
 pub struct HandoffCommandRunner {
     bin: PathBuf,
     mux_state_dir: PathBuf,
+    reader_drain_timeout: Duration,
 }
 
 impl Default for HandoffCommandRunner {
@@ -160,6 +163,7 @@ impl Default for HandoffCommandRunner {
         Self {
             bin,
             mux_state_dir: crate::mc_data::mux_state::session_state_dir(),
+            reader_drain_timeout: READER_DRAIN_TIMEOUT,
         }
     }
 }
@@ -172,7 +176,15 @@ impl HandoffCommandRunner {
         Self {
             bin: bin.clone(),
             mux_state_dir: mux_state_dir.to_path_buf(),
+            reader_drain_timeout: READER_DRAIN_TIMEOUT,
         }
+    }
+
+    #[cfg(test)]
+    fn new_with_reader_drain_timeout(bin: impl Into<PathBuf>, drain_timeout: Duration) -> Self {
+        let mut runner = Self::new(bin);
+        runner.reader_drain_timeout = drain_timeout;
+        runner
     }
 
     async fn run(&self, spec: CommandSpec) -> Result<Vec<u8>, String> {
@@ -199,8 +211,8 @@ impl HandoffCommandRunner {
             .stderr
             .take()
             .ok_or_else(|| "arcmux stderr unavailable".to_string())?;
-        let stdout_task = tokio::spawn(read_bounded(stdout));
-        let stderr_task = tokio::spawn(read_bounded(stderr));
+        let mut stdout_task = tokio::spawn(read_bounded(stdout));
+        let mut stderr_task = tokio::spawn(read_bounded(stderr));
 
         if let Some(input) = spec.stdin {
             let mut stdin = child
@@ -222,17 +234,21 @@ impl HandoffCommandRunner {
             Err(_) => {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                let _ = collect_bounded_readers(
+                    &mut stdout_task,
+                    &mut stderr_task,
+                    self.reader_drain_timeout,
+                )
+                .await;
                 return Err("arcmux handoff command timed out".to_string());
             }
         };
-        let (stdout, stdout_overflow) = stdout_task
-            .await
-            .map_err(|_| "arcmux stdout reader failed".to_string())??;
-        let (stderr, stderr_overflow) = stderr_task
-            .await
-            .map_err(|_| "arcmux stderr reader failed".to_string())??;
+        let ((stdout, stdout_overflow), (stderr, stderr_overflow)) = collect_bounded_readers(
+            &mut stdout_task,
+            &mut stderr_task,
+            self.reader_drain_timeout,
+        )
+        .await?;
         if stdout_overflow || stderr_overflow {
             return Err("arcmux handoff output exceeded the safety limit".to_string());
         }
@@ -1168,6 +1184,38 @@ async fn read_bounded(mut reader: impl AsyncRead + Unpin) -> Result<(Vec<u8>, bo
     Ok((retained, overflow))
 }
 
+type BoundedReadTask = JoinHandle<Result<(Vec<u8>, bool), String>>;
+
+async fn collect_bounded_readers(
+    stdout_task: &mut BoundedReadTask,
+    stderr_task: &mut BoundedReadTask,
+    drain_timeout: Duration,
+) -> Result<((Vec<u8>, bool), (Vec<u8>, bool)), String> {
+    let joined = timeout(drain_timeout, async {
+        let stdout = (&mut *stdout_task)
+            .await
+            .map_err(|_| "arcmux stdout reader failed".to_string())??;
+        let stderr = (&mut *stderr_task)
+            .await
+            .map_err(|_| "arcmux stderr reader failed".to_string())??;
+        Ok::<_, String>((stdout, stderr))
+    })
+    .await;
+    match joined {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            Err(error)
+        }
+        Err(_) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            Err("arcmux handoff output pipe drain timed out".to_string())
+        }
+    }
+}
+
 fn bounded_message(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
         .split_whitespace()
@@ -1887,5 +1935,28 @@ esac
                 .unwrap_err()
                 .contains("safety limit")
         );
+    }
+
+    #[tokio::test]
+    async fn descendant_retained_pipe_cannot_hang_handoff_runner() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("arcmux-fake");
+        std::fs::write(
+            &path,
+            "#!/usr/bin/env python3\nimport os, time\nif os.fork() == 0:\n    time.sleep(5)\n    os._exit(0)\nprint('{\"state\":\"remote_prepared\"}', flush=True)\nos._exit(0)\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let runner =
+            HandoffCommandRunner::new_with_reader_drain_timeout(path, Duration::from_millis(20));
+        let started = std::time::Instant::now();
+
+        assert_eq!(
+            runner.run(show_spec("handoff-1")).await.unwrap_err(),
+            "arcmux handoff output pipe drain timed out"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

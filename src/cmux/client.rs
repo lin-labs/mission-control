@@ -2,9 +2,18 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::{ExitStatus, Stdio};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 use crate::mc_data::surface_kind::{self, SurfaceKind};
+
+const TRANSACTION_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+const TRANSACTION_READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const TRANSACTION_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
 // ── Transient JSON types for `cmux tree --all --json` ─────────────────────────
 
@@ -158,17 +167,111 @@ pub struct SurfaceInfo {
 pub struct CmuxClient {
     bin: String,
     socket_path: PathBuf,
+    transaction_command_timeout: Duration,
+    transaction_reader_drain_timeout: Duration,
+    transaction_max_output_bytes: usize,
+}
+
+struct BoundedCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 impl CmuxClient {
     pub fn new(bin: String, socket_path: PathBuf) -> Self {
-        Self { bin, socket_path }
+        Self {
+            bin,
+            socket_path,
+            transaction_command_timeout: TRANSACTION_COMMAND_TIMEOUT,
+            transaction_reader_drain_timeout: TRANSACTION_READER_DRAIN_TIMEOUT,
+            transaction_max_output_bytes: TRANSACTION_MAX_OUTPUT_BYTES,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_transaction_limits(
+        bin: String,
+        socket_path: PathBuf,
+        command_timeout: Duration,
+        reader_drain_timeout: Duration,
+        max_output_bytes: usize,
+    ) -> Self {
+        Self {
+            bin,
+            socket_path,
+            transaction_command_timeout: command_timeout,
+            transaction_reader_drain_timeout: reader_drain_timeout,
+            transaction_max_output_bytes: max_output_bytes,
+        }
     }
 
     fn cmd(&self) -> Command {
         let mut cmd = Command::new(&self.bin);
         cmd.env("CMUX_SOCKET_PATH", &self.socket_path);
         cmd
+    }
+
+    /// Run one identity-sensitive cmux transaction command with bounded time,
+    /// retained output, and pipe-drain lifetime. A grandchild retaining the
+    /// inherited stdout/stderr descriptors must not hold Mission Control open
+    /// after the direct cmux child has exited.
+    async fn bounded_transaction_output(&self, args: &[&str]) -> Result<BoundedCommandOutput> {
+        let mut command = self.cmd();
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command
+            .spawn()
+            .context("failed to start bounded cmux command")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("bounded cmux stdout unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("bounded cmux stderr unavailable"))?;
+        let mut stdout_task = tokio::spawn(read_bounded_output(
+            stdout,
+            self.transaction_max_output_bytes,
+        ));
+        let mut stderr_task = tokio::spawn(read_bounded_output(
+            stderr,
+            self.transaction_max_output_bytes,
+        ));
+
+        let status = match timeout(self.transaction_command_timeout, child.wait()).await {
+            Ok(result) => result.context("bounded cmux command wait failed")?,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = collect_bounded_output(
+                    &mut stdout_task,
+                    &mut stderr_task,
+                    self.transaction_reader_drain_timeout,
+                )
+                .await;
+                anyhow::bail!("cmux command timed out");
+            }
+        };
+        let ((stdout, stdout_overflow), (stderr, stderr_overflow)) = collect_bounded_output(
+            &mut stdout_task,
+            &mut stderr_task,
+            self.transaction_reader_drain_timeout,
+        )
+        .await?;
+        if stdout_overflow || stderr_overflow {
+            anyhow::bail!("cmux command output exceeded the safety limit");
+        }
+        Ok(BoundedCommandOutput {
+            status,
+            stdout,
+            stderr,
+        })
     }
 
     /// Parse `cmux list-workspaces --json --id-format both` output.
@@ -503,9 +606,7 @@ impl CmuxClient {
         surface_ref: &str,
     ) -> Result<String> {
         let output = self
-            .cmd()
-            .args(["tree", "--all", "--json", "--id-format", "both"])
-            .output()
+            .bounded_transaction_output(&["tree", "--all", "--json", "--id-format", "both"])
             .await
             .context("failed to run cmux tree for exact surface UUID")?;
         if !output.status.success() {
@@ -555,8 +656,7 @@ impl CmuxClient {
         text: &str,
     ) -> Result<()> {
         let output = self
-            .cmd()
-            .args([
+            .bounded_transaction_output(&[
                 "send",
                 "--workspace",
                 workspace_ref,
@@ -564,7 +664,6 @@ impl CmuxClient {
                 surface_ref,
                 text,
             ])
-            .output()
             .await
             .context("failed to run cmux send")?;
         if !output.status.success() {
@@ -585,15 +684,13 @@ impl CmuxClient {
     /// On failure cmux prints `Error: <kind>: <message>` on stderr.
     pub async fn new_surface(&self, workspace_ref: &str, surface_type: &str) -> Result<String> {
         let output = self
-            .cmd()
-            .args([
+            .bounded_transaction_output(&[
                 "new-surface",
                 "--type",
                 surface_type,
                 "--workspace",
                 workspace_ref,
             ])
-            .output()
             .await
             .context("failed to run cmux new-surface")?;
         if !output.status.success() {
@@ -613,6 +710,58 @@ impl CmuxClient {
             "cmux new-surface succeeded but did not emit a surface:<N> ref; stdout was: {}",
             stdout.trim()
         );
+    }
+}
+
+type BoundedReadTask = JoinHandle<std::io::Result<(Vec<u8>, bool)>>;
+
+async fn read_bounded_output(
+    mut reader: impl AsyncRead + Unpin,
+    max_bytes: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut retained = Vec::new();
+    let mut overflow = false;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(retained.len());
+        let keep = remaining.min(count);
+        retained.extend_from_slice(&chunk[..keep]);
+        overflow |= keep < count;
+    }
+    Ok((retained, overflow))
+}
+
+async fn collect_bounded_output(
+    stdout_task: &mut BoundedReadTask,
+    stderr_task: &mut BoundedReadTask,
+    drain_timeout: Duration,
+) -> Result<((Vec<u8>, bool), (Vec<u8>, bool))> {
+    let joined = timeout(drain_timeout, async {
+        let stdout = (&mut *stdout_task)
+            .await
+            .context("bounded cmux stdout reader task failed")??;
+        let stderr = (&mut *stderr_task)
+            .await
+            .context("bounded cmux stderr reader task failed")??;
+        Ok::<_, anyhow::Error>((stdout, stderr))
+    })
+    .await;
+    match joined {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            Err(error)
+        }
+        Err(_) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            anyhow::bail!("cmux output pipe drain timed out");
+        }
     }
 }
 
@@ -636,4 +785,98 @@ fn current_window_ref(
         .find(|window| window.current || window.active || window.key)
         .or_else(|| parsed.windows.first())
         .map(|window| window.ref_id.clone()))
+}
+
+#[cfg(test)]
+mod bounded_transaction_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+
+    fn executable(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn test_client(path: &std::path::Path) -> CmuxClient {
+        CmuxClient::new_with_transaction_limits(
+            path.to_string_lossy().into_owned(),
+            path.with_extension("sock"),
+            Duration::from_millis(500),
+            Duration::from_millis(20),
+            1024,
+        )
+    }
+
+    #[tokio::test]
+    async fn every_dispatch_cmux_command_has_a_wall_clock_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("cmux");
+        executable(&bin, "#!/bin/sh\nsleep 5\n");
+        let client = CmuxClient::new_with_transaction_limits(
+            bin.to_string_lossy().into_owned(),
+            bin.with_extension("sock"),
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            1024,
+        );
+        let started = Instant::now();
+
+        assert!(client.new_surface("workspace:1", "terminal").await.is_err());
+        assert!(
+            client
+                .exact_surface_uuid("window:1", "workspace:1", "surface:1")
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .send_text("workspace:1", "surface:1", "attach\r")
+                .await
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn descendant_retained_pipe_is_aborted_after_direct_cmux_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("cmux");
+        executable(
+            &bin,
+            "#!/usr/bin/env python3\nimport os, time\nif os.fork() == 0:\n    time.sleep(5)\n    os._exit(0)\nprint('OK surface:42 pane:1 workspace:1', flush=True)\nos._exit(0)\n",
+        );
+        let client = test_client(&bin);
+        let started = Instant::now();
+
+        let error = format!(
+            "{:#}",
+            client
+                .new_surface("workspace:1", "terminal")
+                .await
+                .unwrap_err()
+        );
+        assert!(error.contains("output pipe drain timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn transaction_output_is_capped_before_parsing() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("cmux");
+        executable(&bin, "#!/bin/sh\nprintf '%2048s' '' | tr ' ' x\n");
+        let error = format!(
+            "{:#}",
+            test_client(&bin)
+                .new_surface("workspace:1", "terminal")
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            error.contains("output exceeded the safety limit"),
+            "{error}"
+        );
+    }
 }

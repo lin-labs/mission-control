@@ -1,0 +1,15 @@
+{
+  "device_id": "ref",
+  "socket_path": "/Users/blin/.config/arcmux/arcmux.sock",
+  "http_addr": "127.0.0.1:7777",
+  "data_root": "/Users/blin/data",
+  "bolt_path": "/Users/blin/data/arcmux/_daemon/state.bolt",
+  "log_dir": "/Users/blin/.config/arcmux/logs",
+  "tmux_socket": "arcmux",
+  "hook_output_dir": "/Users/blin/data/mux/hook-output",
+  "daemon_pid": 67170,
+  "running": true,
+  "uptime_sec": 39396,
+  "session_count": 20,
+  "version": "0.1.0"
+}

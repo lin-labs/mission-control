@@ -781,6 +781,12 @@ a guessed session based on title/cwd/recency.
    malformed/mismatched binding, timeout/output bounds, rollback order,
    cross-workspace async completion, no-title inference, and restart
    rehydration from the daemon's persisted binding.
+7. Bound every cmux `new-surface`, exact `tree`, and `send` process used by the
+   transaction by wall-clock time and retained stdout/stderr. After any cmux or
+   arcmux direct child exits, separately bound pipe-reader drain time; a
+   descendant that inherited stdout/stderr must be aborted rather than hanging
+   the TUI. Exercise stalled children, oversized output, and descendant-retained
+   file descriptors with adversarial executables.
 
 ---
 

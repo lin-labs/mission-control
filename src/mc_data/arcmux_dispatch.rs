@@ -18,12 +18,15 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const SURFACE_RESOLVE_ATTEMPTS: usize = 20;
 const SURFACE_RESOLVE_DELAY: Duration = Duration::from_millis(100);
+const SURFACE_RESOLVE_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_READY_ATTEMPTS: usize = 60;
 const SESSION_READY_DELAY: Duration = Duration::from_millis(500);
 const MAX_GOAL_BYTES: usize = 32 * 1024;
@@ -64,6 +67,7 @@ struct DispatchCommandRunner {
     arcmux_bin: PathBuf,
     arcmux_cli_bin: PathBuf,
     timeout: Duration,
+    reader_drain_timeout: Duration,
 }
 
 impl Default for DispatchCommandRunner {
@@ -76,6 +80,7 @@ impl Default for DispatchCommandRunner {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("arcmux-cli")),
             timeout: COMMAND_TIMEOUT,
+            reader_drain_timeout: READER_DRAIN_TIMEOUT,
         }
     }
 }
@@ -87,6 +92,22 @@ impl DispatchCommandRunner {
             arcmux_bin,
             arcmux_cli_bin,
             timeout,
+            reader_drain_timeout: timeout.min(READER_DRAIN_TIMEOUT),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_reader_drain_timeout(
+        arcmux_bin: PathBuf,
+        arcmux_cli_bin: PathBuf,
+        command_timeout: Duration,
+        reader_drain_timeout: Duration,
+    ) -> Self {
+        Self {
+            arcmux_bin,
+            arcmux_cli_bin,
+            timeout: command_timeout,
+            reader_drain_timeout,
         }
     }
 
@@ -126,8 +147,8 @@ impl DispatchCommandRunner {
             .stderr
             .take()
             .ok_or_else(|| "arcmux dispatch stderr unavailable".to_string())?;
-        let stdout_task = tokio::spawn(read_bounded(stdout));
-        let stderr_task = tokio::spawn(read_bounded(stderr));
+        let mut stdout_task = tokio::spawn(read_bounded(stdout));
+        let mut stderr_task = tokio::spawn(read_bounded(stderr));
         if let Some(input) = stdin {
             let mut child_stdin = child
                 .stdin
@@ -146,8 +167,12 @@ impl DispatchCommandRunner {
             if let Some(message) = input_error {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                let _ = collect_bounded_readers(
+                    &mut stdout_task,
+                    &mut stderr_task,
+                    self.reader_drain_timeout,
+                )
+                .await;
                 return Err(message.to_string());
             }
         }
@@ -156,17 +181,21 @@ impl DispatchCommandRunner {
             Err(_) => {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                let _ = collect_bounded_readers(
+                    &mut stdout_task,
+                    &mut stderr_task,
+                    self.reader_drain_timeout,
+                )
+                .await;
                 return Err("arcmux dispatch command timed out".to_string());
             }
         };
-        let (stdout, stdout_overflow) = stdout_task
-            .await
-            .map_err(|_| "arcmux dispatch stdout reader failed".to_string())??;
-        let (stderr, stderr_overflow) = stderr_task
-            .await
-            .map_err(|_| "arcmux dispatch stderr reader failed".to_string())??;
+        let ((stdout, stdout_overflow), (stderr, stderr_overflow)) = collect_bounded_readers(
+            &mut stdout_task,
+            &mut stderr_task,
+            self.reader_drain_timeout,
+        )
+        .await?;
         if stdout_overflow || stderr_overflow {
             return Err("arcmux dispatch output exceeded the safety limit".to_string());
         }
@@ -273,7 +302,7 @@ async fn execute_dispatch(
         .await
         .map_err(|_| NewSurfaceDispatchFailure {
             surface_ref: None,
-            message: "cmux could not create the raw terminal".to_string(),
+            message: "not arcmux-supervised: cmux could not create the raw terminal".to_string(),
         })?;
     if !valid_ref(&surface_ref, "surface:") {
         return Err(NewSurfaceDispatchFailure {
@@ -301,7 +330,12 @@ async fn execute_dispatch(
     let session_name = format!("mc-{agent}-{short_uuid}-{}", surface_ref.replace(':', "-"));
 
     let execution: Result<NewSurfaceDispatchSuccess, String> = async {
-        let uuid = resolve_new_surface_uuid(cmux, request, &surface_ref).await?;
+        let uuid = timeout(
+            SURFACE_RESOLVE_TOTAL_TIMEOUT,
+            resolve_new_surface_uuid(cmux, request, &surface_ref),
+        )
+        .await
+        .map_err(|_| "exact cmux surface UUID resolution timed out".to_string())??;
         surface_uuid = Some(uuid.clone());
 
         let created = runner
@@ -617,6 +651,38 @@ async fn read_bounded(mut reader: impl AsyncRead + Unpin) -> Result<(Vec<u8>, bo
     Ok((retained, overflow))
 }
 
+type BoundedReadTask = JoinHandle<Result<(Vec<u8>, bool), String>>;
+
+async fn collect_bounded_readers(
+    stdout_task: &mut BoundedReadTask,
+    stderr_task: &mut BoundedReadTask,
+    drain_timeout: Duration,
+) -> Result<((Vec<u8>, bool), (Vec<u8>, bool)), String> {
+    let joined = timeout(drain_timeout, async {
+        let stdout = (&mut *stdout_task)
+            .await
+            .map_err(|_| "arcmux dispatch stdout reader failed".to_string())??;
+        let stderr = (&mut *stderr_task)
+            .await
+            .map_err(|_| "arcmux dispatch stderr reader failed".to_string())??;
+        Ok::<_, String>((stdout, stderr))
+    })
+    .await;
+    match joined {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            Err(error)
+        }
+        Err(_) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            Err("arcmux dispatch output pipe drain timed out".to_string())
+        }
+    }
+}
+
 fn bounded_message(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
         .split_whitespace()
@@ -648,6 +714,16 @@ mod tests {
             goal_text: "Implement the exact supervised dispatch".into(),
             kind: SurfaceKind::Codex,
         }
+    }
+
+    fn bounded_cmux(path: &Path, socket_path: PathBuf) -> CmuxClient {
+        CmuxClient::new_with_transaction_limits(
+            path.to_string_lossy().into_owned(),
+            socket_path,
+            Duration::from_millis(500),
+            Duration::from_millis(20),
+            4096,
+        )
     }
 
     fn cmux_script(log: &Path, surface_ref: &str) -> String {
@@ -819,6 +895,109 @@ fi
     }
 
     #[tokio::test]
+    async fn stalled_cmux_new_surface_returns_visible_unsupervised_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let cmux_bin = temp.path().join("cmux");
+        let arcmux_bin = temp.path().join("arcmux");
+        let cli_bin = temp.path().join("arcmux-cli");
+        executable(&cmux_bin, "#!/bin/sh\nsleep 1\n");
+        executable(&arcmux_bin, "#!/bin/sh\nexit 99\n");
+        executable(&cli_bin, "#!/bin/sh\nexit 99\n");
+        let (tx, mut rx) = mpsc::channel(1);
+
+        run_new_surface_dispatch_with_runner(
+            request(temp.path().to_path_buf()),
+            bounded_cmux(&cmux_bin, temp.path().join("cmux.sock")),
+            DispatchCommandRunner::new(arcmux_bin, cli_bin, Duration::from_secs(1)),
+            tx,
+        )
+        .await;
+
+        let failure = rx.recv().await.unwrap().result.unwrap_err();
+        assert!(failure.surface_ref.is_none());
+        assert!(failure.message.starts_with("not arcmux-supervised:"));
+    }
+
+    #[tokio::test]
+    async fn stalled_cmux_tree_leaves_created_surface_visibly_unsupervised() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("calls");
+        let cmux_bin = temp.path().join("cmux");
+        let arcmux_bin = temp.path().join("arcmux");
+        let cli_bin = temp.path().join("arcmux-cli");
+        executable(
+            &cmux_bin,
+            &format!(
+                "#!/bin/sh\nprintf 'cmux:%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n  new-surface) printf 'OK surface:42 pane:7 workspace:9\\n' ;;\n  tree) sleep 1 ;;\n  *) exit 2 ;;\nesac\n",
+                log.display()
+            ),
+        );
+        executable(&arcmux_bin, "#!/bin/sh\nexit 99\n");
+        executable(
+            &cli_bin,
+            &format!(
+                "#!/bin/sh\nprintf 'cli:%s\\n' \"$*\" >> '{}'\nexit 99\n",
+                log.display()
+            ),
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+
+        run_new_surface_dispatch_with_runner(
+            request(temp.path().to_path_buf()),
+            bounded_cmux(&cmux_bin, temp.path().join("cmux.sock")),
+            DispatchCommandRunner::new(arcmux_bin, cli_bin, Duration::from_secs(1)),
+            tx,
+        )
+        .await;
+
+        let failure = rx.recv().await.unwrap().result.unwrap_err();
+        assert_eq!(failure.surface_ref.as_deref(), Some("surface:42"));
+        assert!(failure.message.starts_with("not arcmux-supervised:"));
+        assert!(!std::fs::read_to_string(log).unwrap().contains("cli:create"));
+    }
+
+    #[tokio::test]
+    async fn stalled_cmux_attach_rolls_back_exact_binding_and_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("calls");
+        let cmux_bin = temp.path().join("cmux");
+        let cli_bin = temp.path().join("arcmux-cli");
+        let arcmux_bin = temp.path().join("arcmux");
+        let stalled_send =
+            cmux_script(&log, "surface:42").replace("send) exit 0 ;;", "send) sleep 1 ;;");
+        executable(&cmux_bin, &stalled_send);
+        executable(
+            &cli_bin,
+            &success_cli_script(&log, &temp.path().join("goal"), temp.path()),
+        );
+        executable(&arcmux_bin, &arcmux_script(&log, false));
+        let (tx, mut rx) = mpsc::channel(1);
+
+        run_new_surface_dispatch_with_runner(
+            request(temp.path().to_path_buf()),
+            bounded_cmux(&cmux_bin, temp.path().join("cmux.sock")),
+            DispatchCommandRunner::new(arcmux_bin, cli_bin, Duration::from_secs(1)),
+            tx,
+        )
+        .await;
+
+        let failure = rx.recv().await.unwrap().result.unwrap_err();
+        assert_eq!(failure.surface_ref.as_deref(), Some("surface:42"));
+        assert!(failure.message.starts_with("not arcmux-supervised:"));
+        let calls = std::fs::read_to_string(log).unwrap();
+        let lines: Vec<_> = calls.lines().collect();
+        let unbind = lines
+            .iter()
+            .position(|line| line.contains("surface unbind"))
+            .unwrap();
+        let kill = lines
+            .iter()
+            .position(|line| line == &"cli:kill s-created")
+            .unwrap();
+        assert!(unbind < kill);
+    }
+
+    #[tokio::test]
     async fn misleading_title_never_substitutes_for_exact_surface_ref() {
         let temp = tempfile::tempdir().unwrap();
         let log = temp.path().join("calls");
@@ -910,6 +1089,31 @@ fi
     }
 
     #[tokio::test]
+    async fn descendant_retained_pipe_cannot_hang_dispatch_runner() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("retained-pipe");
+        executable(
+            &bin,
+            "#!/usr/bin/env python3\nimport os, time\nif os.fork() == 0:\n    time.sleep(5)\n    os._exit(0)\nprint('{\"device_id\":\"ref\",\"tmux_socket\":\"arcmux\"}', flush=True)\nos._exit(0)\n",
+        );
+        let runner = DispatchCommandRunner::new_with_reader_drain_timeout(
+            bin.clone(),
+            bin,
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            runner
+                .arcmux(vec!["info".into(), "--json".into()])
+                .await
+                .unwrap_err(),
+            "arcmux dispatch output pipe drain timed out"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
     async fn blocked_stdin_is_bounded_by_command_timeout() {
         let temp = tempfile::tempdir().unwrap();
         let bin = temp.path().join("blocked");
@@ -945,5 +1149,15 @@ fi
     fn missing_device_id_is_not_inferred_from_other_runtime_fields() {
         let malformed = serde_json::from_slice::<InfoResponse>(br#"{"tmux_socket":"arcmux"}"#);
         assert!(malformed.is_err());
+    }
+
+    #[test]
+    fn arcmux_info_fixture_matches_authoritative_de8249a_shape() {
+        let info: InfoResponse = serde_json::from_str(include_str!(
+            "../../tests/fixtures/arcmux_info/de8249a.json"
+        ))
+        .unwrap();
+        assert_eq!(info.device_id, "ref");
+        assert_eq!(info.tmux_socket, "arcmux");
     }
 }
