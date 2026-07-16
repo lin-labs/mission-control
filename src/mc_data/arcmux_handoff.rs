@@ -70,6 +70,7 @@ pub enum HandoffStage {
     CheckingIdentity,
     Launching,
     VerifyingContext,
+    BindingTarget,
     RetiringSource,
 }
 
@@ -80,6 +81,7 @@ impl HandoffStage {
             Self::CheckingIdentity => "verifying exact source and target",
             Self::Launching => "launching target agent",
             Self::VerifyingContext => "waiting for target context",
+            Self::BindingTarget => "binding this surface to the exact target",
             Self::RetiringSource => "retiring exact source session",
         }
     }
@@ -303,6 +305,25 @@ fn surface_show_spec(surface_uuid: &str) -> CommandSpec {
     }
 }
 
+fn target_bind_spec(source: &HandoffSourceContext, target: &HandoffLocator) -> CommandSpec {
+    CommandSpec {
+        args: vec![
+            "mesh".into(),
+            "bind".into(),
+            target.device_id.clone().into(),
+            target.profile_scope.clone().into(),
+            target.session_id.clone().into(),
+            "--surface".into(),
+            source.surface_uuid.clone().into(),
+            "--workspace".into(),
+            source.workspace_uuid.clone().into(),
+            "--replace".into(),
+        ],
+        stdin: None,
+        timeout: SIMPLE_TIMEOUT,
+    }
+}
+
 fn launch_spec(handoff_id: &str) -> CommandSpec {
     wait_spec("launch", handoff_id, HANDOFF_WAIT, LAUNCH_TIMEOUT)
 }
@@ -383,6 +404,15 @@ struct SurfaceBindingProof {
     locator: RemoteSessionLocator,
 }
 
+#[derive(Debug, Deserialize)]
+struct TargetBindResponse {
+    schema_version: u32,
+    surface_id: String,
+    workspace_id: String,
+    locator: RemoteSessionLocator,
+    binding: SurfaceBindingProof,
+}
+
 fn parse_status(bytes: &[u8], expected_state: &str) -> Result<HandoffStatus, String> {
     let status: HandoffStatus = serde_json::from_slice(bytes)
         .map_err(|_| "arcmux returned malformed handoff JSON".to_string())?;
@@ -434,6 +464,45 @@ fn verify_authoritative_source_binding(
         || !binding.locator.valid()
     {
         return Err("authoritative arcmux source binding changed".to_string());
+    }
+    Ok(())
+}
+
+fn verify_authoritative_target_binding(
+    bytes: &[u8],
+    source: &HandoffSourceContext,
+    target: &HandoffLocator,
+) -> Result<(), String> {
+    let response: TargetBindResponse = serde_json::from_slice(bytes)
+        .map_err(|_| "arcmux returned malformed target binding JSON".to_string())?;
+    let locator_matches = |locator: &RemoteSessionLocator| {
+        locator.valid()
+            && locator.device_id == target.device_id
+            && locator.profile_scope == target.profile_scope
+            && locator.session_id == target.session_id
+    };
+    if response.schema_version != 1
+        || !response
+            .surface_id
+            .eq_ignore_ascii_case(&source.surface_uuid)
+        || !response
+            .workspace_id
+            .eq_ignore_ascii_case(&source.workspace_uuid)
+        || !locator_matches(&response.locator)
+        || !response
+            .binding
+            .surface_id
+            .eq_ignore_ascii_case(&source.surface_uuid)
+        || !response
+            .binding
+            .workspace_id
+            .eq_ignore_ascii_case(&source.workspace_uuid)
+        || response.binding.local_device_id != source.locator.device_id
+        || !locator_matches(&response.binding.locator)
+    {
+        return Err(
+            "arcmux target binding did not match the verified handoff identity".to_string(),
+        );
     }
     Ok(())
 }
@@ -876,6 +945,58 @@ async fn run_handoff_with_runner(
         return;
     }
 
+    // Context is loaded and the exact source has just been re-proven. Replace
+    // the durable cmux binding while the source is still alive, then retire the
+    // source only after arcmux returns the exact target locator. A timeout or
+    // malformed/mismatched response deliberately leaves the source running;
+    // Mission Control never guesses whether a target-side mutation occurred.
+    if !send_progress(
+        &updates,
+        &workspace_uuid,
+        generation,
+        HandoffStage::BindingTarget,
+    )
+    .await
+    {
+        return;
+    }
+    let target_binding = match runner
+        .run(target_bind_spec(&operation.plan.source, &target_locator))
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            let _ = updates
+                .send(finish(Err(failure(
+                    message,
+                    Some(&handoff_id),
+                    &source_locator,
+                    Some(target_locator),
+                    true,
+                    true,
+                ))))
+                .await;
+            return;
+        }
+    };
+    if let Err(message) = verify_authoritative_target_binding(
+        &target_binding,
+        &operation.plan.source,
+        &target_locator,
+    ) {
+        let _ = updates
+            .send(finish(Err(failure(
+                message,
+                Some(&handoff_id),
+                &source_locator,
+                Some(target_locator),
+                true,
+                true,
+            ))))
+            .await;
+        return;
+    }
+
     if !send_progress(
         &updates,
         &workspace_uuid,
@@ -1207,6 +1328,42 @@ mod tests {
     }
 
     #[test]
+    fn target_replace_binding_uses_exact_argv_and_response_identity() {
+        let plan = plan();
+        let target = HandoffLocator {
+            device_id: "devbox".into(),
+            profile_scope: "root".into(),
+            session_id: "s-target".into(),
+        };
+        assert_eq!(
+            args(&target_bind_spec(&plan.source, &target)),
+            vec![
+                "mesh",
+                "bind",
+                "devbox",
+                "root",
+                "s-target",
+                "--surface",
+                "11111111-1111-4111-8111-111111111111",
+                "--workspace",
+                "22222222-2222-4222-8222-222222222222",
+                "--replace",
+            ]
+        );
+        let valid = br#"{"schema_version":1,"surface_id":"11111111-1111-4111-8111-111111111111","workspace_id":"22222222-2222-4222-8222-222222222222","locator":{"schema_version":1,"device_id":"devbox","profile_scope":"root","session_id":"s-target"},"binding":{"surface_id":"11111111-1111-4111-8111-111111111111","workspace_id":"22222222-2222-4222-8222-222222222222","local_device_id":"ref","locator":{"schema_version":1,"device_id":"devbox","profile_scope":"root","session_id":"s-target"}}}"#;
+        assert!(verify_authoritative_target_binding(valid, &plan.source, &target).is_ok());
+
+        let mismatched = String::from_utf8(valid.to_vec())
+            .unwrap()
+            .replace("s-target", "s-other");
+        assert_eq!(
+            verify_authoritative_target_binding(mismatched.as_bytes(), &plan.source, &target)
+                .unwrap_err(),
+            "arcmux target binding did not match the verified handoff identity"
+        );
+    }
+
+    #[test]
     fn plan_rejects_transport_snapshot_as_conversation_history() {
         let mut plan = plan();
         plan.source.history = "arcmux-handoff-sha256-deadbeef.md".into();
@@ -1337,6 +1494,7 @@ case "$verb" in
   show) printf '%s\n' '{"handoff_id":"handoff-1","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"remote_prepared","target_device":"devbox","target_profile":"codex","project":"mission-control","source_locator":{"device_id":"ref","profile_scope":"root","session_id":"s-source"},"verification_state":"not_ready","context_loaded":false,"retirement_state":"not_requested"}' ;;
   launch) printf '%s\n' '{"handoff_id":"handoff-1","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"accepted","target_device":"devbox","target_profile":"codex","project":"mission-control","source_locator":{"device_id":"ref","profile_scope":"root","session_id":"s-source"},"target_locator":{"device_id":"devbox","profile_scope":"root","session_id":"s-target"},"verification_state":"pending","context_loaded":false,"retirement_state":"not_requested"}' ;;
   verify) printf '%s\n' '{"handoff_id":"handoff-1","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"accepted","target_device":"devbox","target_profile":"codex","project":"mission-control","source_locator":{"device_id":"ref","profile_scope":"root","session_id":"s-source"},"target_locator":{"device_id":"devbox","profile_scope":"root","session_id":"s-target"},"verification_state":"context_loaded","context_loaded":true,"retirement_state":"not_requested"}' ;;
+  bind) printf '%s\n' '{"schema_version":1,"surface_id":"11111111-1111-4111-8111-111111111111","workspace_id":"22222222-2222-4222-8222-222222222222","locator":{"schema_version":1,"device_id":"devbox","profile_scope":"root","session_id":"s-target"},"binding":{"surface_id":"11111111-1111-4111-8111-111111111111","workspace_id":"22222222-2222-4222-8222-222222222222","local_device_id":"ref","locator":{"schema_version":1,"device_id":"devbox","profile_scope":"root","session_id":"s-target"}}}' ;;
   retire) printf '%s\n' '{"handoff_id":"handoff-1","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"accepted","target_device":"devbox","target_profile":"codex","project":"mission-control","source_locator":{"device_id":"ref","profile_scope":"root","session_id":"s-source"},"target_locator":{"device_id":"devbox","profile_scope":"root","session_id":"s-target"},"verification_state":"context_loaded","context_loaded":true,"retirement_state":"retired"}' ;;
   *) exit 2 ;;
 esac
@@ -1366,6 +1524,7 @@ esac
                 HandoffStage::CheckingIdentity,
                 HandoffStage::Launching,
                 HandoffStage::VerifyingContext,
+                HandoffStage::BindingTarget,
                 HandoffStage::RetiringSource,
             ]
         );
@@ -1374,6 +1533,66 @@ esac
             Some(HandoffUpdateKind::Finished(Ok(success)))
                 if success.target_locator.session_id == "s-target"
         ));
+    }
+
+    #[tokio::test]
+    async fn mismatched_target_binding_never_retires_source() {
+        let temp = tempfile::tempdir().unwrap();
+        write_idle_source_state(temp.path(), 3);
+        let log = temp.path().join("calls");
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1" = "surface" ]; then
+  printf '%s\n' 'surface-show' >> '{}'
+  printf '%s\n' '{{"binding":{{"surface_id":"11111111-1111-4111-8111-111111111111","workspace_id":"22222222-2222-4222-8222-222222222222","local_device_id":"ref","locator":{{"schema_version":1,"device_id":"ref","profile_scope":"root","session_id":"s-source"}}}}}}'
+  exit 0
+fi
+verb="$2"
+printf '%s\n' "$verb" >> '{}'
+case "$verb" in
+  prepare) cat >/dev/null; printf '%s\n' '{{"handoff_id":"handoff-1","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"remote_prepared","target_device":"devbox","target_profile":"codex","project":"mission-control","source_locator":{{"device_id":"ref","profile_scope":"root","session_id":"s-source"}},"verification_state":"not_ready","context_loaded":false,"retirement_state":"not_requested"}}' ;;
+  show) printf '%s\n' '{{"handoff_id":"handoff-1","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"remote_prepared","target_device":"devbox","target_profile":"codex","project":"mission-control","source_locator":{{"device_id":"ref","profile_scope":"root","session_id":"s-source"}},"verification_state":"not_ready","context_loaded":false,"retirement_state":"not_requested"}}' ;;
+  launch) printf '%s\n' '{{"handoff_id":"handoff-1","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"accepted","target_device":"devbox","target_profile":"codex","project":"mission-control","source_locator":{{"device_id":"ref","profile_scope":"root","session_id":"s-source"}},"target_locator":{{"device_id":"devbox","profile_scope":"root","session_id":"s-target"}},"verification_state":"pending","context_loaded":false,"retirement_state":"not_requested"}}' ;;
+  verify) printf '%s\n' '{{"handoff_id":"handoff-1","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"accepted","target_device":"devbox","target_profile":"codex","project":"mission-control","source_locator":{{"device_id":"ref","profile_scope":"root","session_id":"s-source"}},"target_locator":{{"device_id":"devbox","profile_scope":"root","session_id":"s-target"}},"verification_state":"context_loaded","context_loaded":true,"retirement_state":"not_requested"}}' ;;
+  bind) printf '%s\n' '{{"schema_version":1,"surface_id":"11111111-1111-4111-8111-111111111111","workspace_id":"22222222-2222-4222-8222-222222222222","locator":{{"schema_version":1,"device_id":"devbox","profile_scope":"root","session_id":"s-other"}},"binding":{{"surface_id":"11111111-1111-4111-8111-111111111111","workspace_id":"22222222-2222-4222-8222-222222222222","local_device_id":"ref","locator":{{"schema_version":1,"device_id":"devbox","profile_scope":"root","session_id":"s-other"}}}}}}' ;;
+  retire) exit 99 ;;
+  *) exit 2 ;;
+esac
+"#,
+            log.display(),
+            log.display()
+        );
+        let path = temp.path().join("arcmux-fake");
+        std::fs::write(&path, script).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        run_handoff_with_runner(
+            HandoffOperation {
+                generation: 8,
+                plan: plan(),
+            },
+            HandoffCommandRunner::new(path),
+            tx,
+        )
+        .await;
+
+        let updates: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let failure = match &updates.last().unwrap().kind {
+            HandoffUpdateKind::Finished(Err(failure)) => failure,
+            other => panic!("unexpected final update: {other:?}"),
+        };
+        assert_eq!(
+            failure.message,
+            "arcmux target binding did not match the verified handoff identity"
+        );
+        assert!(failure.target_uncertain);
+        assert!(failure.duplicate_live);
+        assert!(!failure.retryable);
+        let calls = std::fs::read_to_string(log).unwrap();
+        assert!(calls.lines().any(|call| call == "bind"));
+        assert!(!calls.lines().any(|call| call == "retire"));
     }
 
     #[tokio::test]
@@ -1526,6 +1745,7 @@ case "$verb" in
   show) printf '%s\n' '{{"handoff_id":"handoff-1","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"remote_prepared","target_device":"devbox","target_profile":"codex","project":"mission-control","source_locator":{{"device_id":"ref","profile_scope":"root","session_id":"s-source"}},"verification_state":"not_ready","context_loaded":false,"retirement_state":"not_requested"}}' ;;
   launch) printf '%s\n' '{{"handoff_id":"handoff-1","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"accepted","target_device":"devbox","target_profile":"codex","project":"mission-control","source_locator":{{"device_id":"ref","profile_scope":"root","session_id":"s-source"}},"target_locator":{{"device_id":"devbox","profile_scope":"root","session_id":"s-target"}},"verification_state":"pending","context_loaded":false,"retirement_state":"not_requested"}}' ;;
   verify) printf '%s\n' '{{"handoff_id":"handoff-1","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"accepted","target_device":"devbox","target_profile":"codex","project":"mission-control","source_locator":{{"device_id":"ref","profile_scope":"root","session_id":"s-source"}},"target_locator":{{"device_id":"devbox","profile_scope":"root","session_id":"s-target"}},"verification_state":"context_loaded","context_loaded":true,"retirement_state":"not_requested"}}' ;;
+  bind) printf '%s\n' '{{"schema_version":1,"surface_id":"11111111-1111-4111-8111-111111111111","workspace_id":"22222222-2222-4222-8222-222222222222","locator":{{"schema_version":1,"device_id":"devbox","profile_scope":"root","session_id":"s-target"}},"binding":{{"surface_id":"11111111-1111-4111-8111-111111111111","workspace_id":"22222222-2222-4222-8222-222222222222","local_device_id":"ref","locator":{{"schema_version":1,"device_id":"devbox","profile_scope":"root","session_id":"s-target"}}}}}}' ;;
   retire) printf '%s\n' '{{"handoff_id":"handoff-1","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"accepted","target_device":"devbox","target_profile":"codex","project":"mission-control","source_locator":{{"device_id":"ref","profile_scope":"root","session_id":"s-source"}},"target_locator":{{"device_id":"devbox","profile_scope":"root","session_id":"s-target"}},"verification_state":"context_loaded","context_loaded":true,"retirement_state":"pending"}}' ;;
   *) exit 2 ;;
 esac

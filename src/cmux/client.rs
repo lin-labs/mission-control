@@ -491,6 +491,53 @@ impl CmuxClient {
         self.get_surfaces_json_for_window(expected_window_ref).await
     }
 
+    /// Resolve one newly-created cmux `surface:N` ref to its stable UUID.
+    ///
+    /// The join is deliberately exact across the window ref, workspace ref,
+    /// and surface ref. Dispatch must never recover a UUID by matching a title,
+    /// cwd, focus state, or newest surface (F1/F10/F16).
+    pub async fn exact_surface_uuid(
+        &self,
+        expected_window_ref: &str,
+        workspace_ref: &str,
+        surface_ref: &str,
+    ) -> Result<String> {
+        let output = self
+            .cmd()
+            .args(["tree", "--all", "--json", "--id-format", "both"])
+            .output()
+            .await
+            .context("failed to run cmux tree for exact surface UUID")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "cmux tree failed while resolving exact surface UUID: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let tree: TreeJson = serde_json::from_slice(&output.stdout)
+            .context("failed to parse cmux tree for exact surface UUID")?;
+        let mut matches = tree
+            .windows
+            .into_iter()
+            .filter(|window| window.ref_id == expected_window_ref)
+            .flat_map(|window| window.workspaces)
+            .filter(|workspace| workspace.ref_id == workspace_ref)
+            .flat_map(|workspace| workspace.panes)
+            .flat_map(|pane| pane.surfaces)
+            .filter(|surface| surface.ref_id == surface_ref);
+        let surface = matches
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("exact cmux surface is not present in tree"))?;
+        if matches.next().is_some() {
+            anyhow::bail!("exact cmux surface identity is ambiguous");
+        }
+        let uuid = surface
+            .uuid
+            .filter(|uuid| !uuid.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("exact cmux surface has no stable UUID"))?;
+        Ok(uuid)
+    }
+
     /// Send raw text to a cmux surface (terminal only).
     ///
     /// Wraps `cmux send --workspace <ws> --surface <s> <text>`. The `--workspace`

@@ -853,6 +853,56 @@ mod tests {
     }
 
     #[test]
+    fn persisted_same_device_binding_rehydrates_after_restart_without_title_inference() {
+        let bindings = serde_json::json!({"surface_bindings": [{
+            "schema_version": 1,
+            "binding_id": "binding-persisted",
+            "local_device_id": "ref",
+            "mux": "cmux",
+            "surface_id": "11111111-1111-4111-8111-111111111111",
+            "workspace_id": "22222222-2222-4222-8222-222222222222",
+            "locator": {
+                "schema_version": 1,
+                "device_id": "ref",
+                "profile_scope": "root",
+                "session_id": "s-persisted"
+            },
+            "source": "arcmux",
+            "created_at": "2026-07-16T12:00:00Z",
+            "updated_at": "2026-07-16T12:00:00Z"
+        }]});
+        let resolve_after_start = |surface_ref: &str, misleading_title: &str| {
+            // Decoding the durable daemon projection afresh represents a new
+            // Mission Control process with no retained in-memory association.
+            decode_snapshot(
+                &fixture("status"),
+                &serde_json::json!({"sessions": []}),
+                &bindings,
+            )
+            .snapshot
+            .resolve_local_handoff_sources(
+                "22222222-2222-4222-8222-222222222222",
+                &[surface(
+                    "11111111-1111-4111-8111-111111111111",
+                    surface_ref,
+                    misleading_title,
+                )],
+            )
+        };
+
+        let before = resolve_after_start("surface:14", "claude labs guessed-session");
+        let after = resolve_after_start("surface:77", "totally unrelated shell title");
+        assert_eq!(
+            before.get("surface:14").unwrap().locator,
+            after.get("surface:77").unwrap().locator
+        );
+        assert_eq!(
+            after.get("surface:77").unwrap().locator.session_id,
+            "s-persisted"
+        );
+    }
+
+    #[test]
     fn local_handoff_source_never_infers_from_title_or_remote_binding() {
         let decoded = decode_snapshot(
             &fixture("status"),

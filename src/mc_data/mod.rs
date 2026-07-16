@@ -1,3 +1,4 @@
+pub mod arcmux_dispatch;
 pub mod arcmux_handoff;
 pub mod arcmux_mesh;
 pub mod beads;

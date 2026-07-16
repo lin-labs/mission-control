@@ -395,6 +395,16 @@ fn extract_duration(text: &str) -> Option<String> {
     None
 }
 
+fn bounded_dispatch_warning(message: &str) -> String {
+    const MAX_CHARS: usize = 300;
+    if message.chars().count() <= MAX_CHARS {
+        return message.to_string();
+    }
+    let mut bounded: String = message.chars().take(MAX_CHARS - 1).collect();
+    bounded.push('…');
+    bounded
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkspaceState {
     pub workspace: Workspace,
@@ -460,10 +470,9 @@ pub struct WorkspaceState {
     pub handoff_modal: Option<crate::tui::handoff_modal::HandoffModal>,
     /// Pending pure-modal outcome consumed by the async main loop.
     pub handoff_pending_outcome: Option<crate::tui::handoff_modal::HandoffOutcome>,
-    /// Most recent dispatch error (e.g. cmux send failure) — shown briefly in
-    /// the status line, cleared on the next key press or after ~5s. Populated
-    /// by `set_dispatch_error` from the main loop's dispatch outcome handler.
-    #[allow(dead_code)]
+    /// Most recent dispatch error (e.g. exact arcmux binding failure). It stays
+    /// visible in the status line until a later successful dispatch replaces
+    /// it, including across the periodic workspace rebuild.
     pub dispatch_error: Option<String>,
 }
 
@@ -1815,6 +1824,11 @@ impl App {
                 .iter()
                 .map(|ws| (ws.workspace.uuid.clone(), ws.handoff_modal.clone()))
                 .collect();
+        let old_dispatch_errors: HashMap<String, Option<String>> = self
+            .workspaces
+            .iter()
+            .map(|ws| (ws.workspace.uuid.clone(), ws.dispatch_error.clone()))
+            .collect();
         // Preserve the in-memory trajectory across refreshes so we can REUSE
         // it (instead of reloading from disk) when the user is actively
         // editing or peeking. Reloading mid-edit would clobber the
@@ -1854,6 +1868,7 @@ impl App {
                     .cloned()
                     .unwrap_or_default();
                 let handoff_modal = old_handoff_modals.get(&ws.uuid).cloned().flatten();
+                let dispatch_error = old_dispatch_errors.get(&ws.uuid).cloned().flatten();
                 let tool_call_count = old_counts.get(&ws.uuid).copied().unwrap_or(0);
                 let screen_preview = old_previews.get(&ws.uuid).cloned().flatten();
                 // Reuse existing insights (parsed from full 100-line capture)
@@ -1948,7 +1963,7 @@ impl App {
                     dispatch_pending_outcome: None,
                     handoff_modal,
                     handoff_pending_outcome: None,
-                    dispatch_error: None,
+                    dispatch_error,
                 }
             })
             .collect();
@@ -2511,6 +2526,12 @@ impl App {
             parts.push(format!("⚠ {warning}"));
         }
         if let Some(warning) = self.mesh_warning.as_deref() {
+            parts.push(format!("⚠ {warning}"));
+        }
+        if let Some(warning) = self
+            .selected_workspace()
+            .and_then(|ws| ws.dispatch_error.as_deref())
+        {
             parts.push(format!("⚠ {warning}"));
         }
         if parts.is_empty() {
@@ -3550,6 +3571,52 @@ impl App {
         modal.apply_update(update.generation, update.kind);
     }
 
+    /// Apply a completed supervised-dispatch transaction to the exact source
+    /// workspace. Selection may have changed while arcmux was provisioning the
+    /// session, so the async result must never be applied by cursor position.
+    pub fn apply_new_surface_dispatch_update(
+        &mut self,
+        update: crate::mc_data::arcmux_dispatch::NewSurfaceDispatchUpdate,
+    ) {
+        let Some(&idx) = self.workspace_index.get(&update.workspace_uuid) else {
+            return;
+        };
+        match update.result {
+            Ok(success) => {
+                let workspace_uuid = update.workspace_uuid;
+                self.workspaces[idx].dispatch_error = None;
+                self.workspaces[idx].local_handoff_sources.insert(
+                    success.surface_ref.clone(),
+                    crate::mc_data::arcmux_mesh::LocalHandoffSource {
+                        surface_uuid: success.surface_uuid,
+                        workspace_uuid: workspace_uuid.clone(),
+                        locator: success.locator,
+                    },
+                );
+
+                let mut goals = crate::mc_data::goals_json::GoalsFile::load(&workspace_uuid);
+                goals.set_assignment(
+                    &update.goal_text,
+                    &success.surface_ref,
+                    update.kind,
+                    chrono::Utc::now(),
+                );
+                if let Err(error) = goals.save(&workspace_uuid) {
+                    self.workspaces[idx].dispatch_error = Some(bounded_dispatch_warning(&format!(
+                        "supervised session started, but goals.json save failed: {error}"
+                    )));
+                }
+            }
+            Err(failure) => {
+                let message = match failure.surface_ref {
+                    Some(surface_ref) => format!("{surface_ref} {}", failure.message),
+                    None => failure.message,
+                };
+                self.workspaces[idx].dispatch_error = Some(bounded_dispatch_warning(&message));
+            }
+        }
+    }
+
     pub fn close_handoff_modal(&mut self) {
         if let Some(ws) = self.workspaces.get_mut(self.selected) {
             ws.handoff_modal = None;
@@ -3566,13 +3633,21 @@ impl App {
         }
     }
 
-    /// Set the dispatch error message (shown in the status bar). Cleared on
-    /// the next key press.
-    #[allow(dead_code)]
+    /// Set a dispatch error on the exact workspace that initiated the work.
+    /// Async dispatch completion must not follow the current selection.
+    pub fn set_dispatch_error_for_workspace(&mut self, workspace_uuid: &str, msg: String) {
+        if let Some(&idx) = self.workspace_index.get(workspace_uuid) {
+            self.workspaces[idx].dispatch_error = Some(bounded_dispatch_warning(&msg));
+        }
+    }
+
+    /// Set a dispatch error on the selected workspace.
     pub fn set_dispatch_error(&mut self, msg: String) {
-        let idx = self.selected;
-        if let Some(ws) = self.workspaces.get_mut(idx) {
-            ws.dispatch_error = Some(msg);
+        if let Some(workspace_uuid) = self
+            .selected_workspace()
+            .map(|ws| ws.workspace.uuid.clone())
+        {
+            self.set_dispatch_error_for_workspace(&workspace_uuid, msg);
         }
     }
 
@@ -5309,6 +5384,101 @@ platforms:
         assert_eq!(
             app.bottom_info().as_deref(),
             Some("workspace test-uuid-1 · window window-test · ⚠ OpenAI key unavailable")
+        );
+    }
+
+    #[test]
+    fn failed_supervised_dispatch_stays_with_exact_workspace() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let mut other = make_ws(SAMPLE_WITH_SURFACE);
+        other.workspace.uuid = "other-uuid".to_string();
+        other.workspace.name = "other".to_string();
+        app.workspaces.push(other);
+        app.workspace_index.insert("other-uuid".to_string(), 1);
+        app.selected = 1;
+
+        app.apply_new_surface_dispatch_update(
+            crate::mc_data::arcmux_dispatch::NewSurfaceDispatchUpdate {
+                workspace_uuid: "test-uuid-1".to_string(),
+                goal_text: "Ship exact mesh binding".to_string(),
+                kind: crate::mc_data::surface_kind::SurfaceKind::Codex,
+                result: Err(crate::mc_data::arcmux_dispatch::NewSurfaceDispatchFailure {
+                    surface_ref: Some("surface:42".to_string()),
+                    message: "not arcmux-supervised: bind identity mismatch".to_string(),
+                }),
+            },
+        );
+
+        assert!(app.workspaces[1].dispatch_error.is_none());
+        assert!(
+            !app.bottom_info()
+                .unwrap()
+                .contains("bind identity mismatch")
+        );
+        app.selected = 0;
+        assert!(
+            app.bottom_info()
+                .unwrap()
+                .contains("⚠ surface:42 not arcmux-supervised: bind identity mismatch")
+        );
+    }
+
+    #[test]
+    fn successful_supervised_dispatch_records_exact_binding_and_goal() {
+        struct HomeGuard(Option<std::ffi::OsString>);
+        impl Drop for HomeGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => unsafe { std::env::set_var("HOME", value) },
+                    None => unsafe { std::env::remove_var("HOME") },
+                }
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard(std::env::var_os("HOME"));
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let mut other = make_ws(SAMPLE_WITH_SURFACE);
+        other.workspace.uuid = "other-uuid".to_string();
+        app.workspaces.push(other);
+        app.workspace_index.insert("other-uuid".to_string(), 1);
+        app.selected = 1;
+        let locator = crate::mc_data::arcmux_mesh::RemoteSessionLocator {
+            schema_version: 1,
+            device_id: "ref-device".to_string(),
+            profile_scope: "root".to_string(),
+            session_id: "session-42".to_string(),
+            transport_binding_id: None,
+        };
+
+        app.apply_new_surface_dispatch_update(
+            crate::mc_data::arcmux_dispatch::NewSurfaceDispatchUpdate {
+                workspace_uuid: "test-uuid-1".to_string(),
+                goal_text: "Ship exact mesh binding".to_string(),
+                kind: crate::mc_data::surface_kind::SurfaceKind::Codex,
+                result: Ok(crate::mc_data::arcmux_dispatch::NewSurfaceDispatchSuccess {
+                    surface_ref: "surface:42".to_string(),
+                    surface_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+                    locator: locator.clone(),
+                }),
+            },
+        );
+
+        let source = app.workspaces[0]
+            .local_handoff_sources
+            .get("surface:42")
+            .expect("exact binding should be immediately handoff-eligible");
+        assert_eq!(source.locator, locator);
+        assert!(app.workspaces[1].local_handoff_sources.is_empty());
+        let goals = crate::mc_data::goals_json::GoalsFile::load("test-uuid-1");
+        assert_eq!(goals.goals.len(), 1);
+        assert_eq!(goals.goals[0].assigned_surface_ref, "surface:42");
+        assert_eq!(
+            goals.goals[0].assigned_agent_kind,
+            crate::mc_data::surface_kind::SurfaceKind::Codex
         );
     }
 

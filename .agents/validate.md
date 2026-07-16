@@ -754,6 +754,34 @@ a per-surface session pointer.
 3. Run directory-scan, watcher/filter, explicit bind, fallback bind, and
    per-surface pointer regressions with a transport-shaped basename.
 
+### F19 — A newly dispatched agent surface is raw or ambiguously bound
+
+**Symptom**: choosing Claude or Codex in the dispatch modal starts an agent
+directly in cmux, the surface is absent from arcmux, or a later handoff targets
+a guessed session based on title/cwd/recency.
+
+**Prevention checklist**:
+
+1. Resolve the new cmux `surface:N` to exactly one stable surface UUID within
+   the exact `window:N` and `workspace:N`; reject missing or ambiguous UUIDs.
+2. Create the arcmux session with a deterministic owner, re-read it from the
+   exact owner catalog, and require matching session ID, agent, owner, cwd, and
+   `%pane` target before binding.
+3. Require `arcmux info --json` to provide a valid local `device_id` and tmux
+   socket. Never infer either field from a title, cwd, another session, focus,
+   or newest-session ordering.
+4. Bind the stable surface/workspace UUIDs to that exact locator before cmux
+   attaches it. Send the goal through `arcmux-cli send` stdin, never through a
+   terminal command or argv.
+5. On any failure after bind invocation, unbind the exact surface before
+   killing the exact created session. Leave the raw terminal visible with a
+   bounded `not arcmux-supervised` warning and a deterministic owner for
+   reconciliation.
+6. Test exact create → catalog proof → bind → attach → ready → send order,
+   malformed/mismatched binding, timeout/output bounds, rollback order,
+   cross-workspace async completion, no-title inference, and restart
+   rehydration from the daemon's persisted binding.
+
 ---
 
 ## Per-area validation cheat sheets

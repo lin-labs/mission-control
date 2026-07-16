@@ -5,13 +5,14 @@
 //!
 //!   - numeric shortcuts (1..=9) for the existing terminal surfaces in the
 //!     current workspace,
-//!   - `n` to open a sub-picker that creates a new surface and seeds it with
-//!     `claude` or `codex`,
+//!   - `n` to open a sub-picker that creates a new surface supervised by an
+//!     exact arcmux Claude or Codex session,
 //!   - Esc to cancel with no side effects.
 //!
 //! The modal owns *no* I/O — it is a pure state machine. The TUI event loop
-//! reads the user's selection out of the modal, runs the appropriate cmux
-//! commands, and on success updates `goals.json` via `GoalsFile::set_assignment`.
+//! reads the user's selection out of the modal, runs the transactional
+//! cmux/arcmux dispatch, and on success updates `goals.json` via
+//! `GoalsFile::set_assignment`.
 
 use crate::cmux::client::SurfaceInfo;
 use crate::mc_data::surface_kind::SurfaceKind;
@@ -37,7 +38,7 @@ pub enum DispatchOption {
         kind: SurfaceKind,
         label: String,
     },
-    /// Spawn a brand-new surface and seed it with an agent binary.
+    /// Spawn a brand-new surface supervised by arcmux.
     NewSurface,
 }
 
@@ -64,17 +65,16 @@ pub enum DispatchOutcome {
         surface_ref: String,
         kind: SurfaceKind,
     },
-    /// User picked "new surface" with a specific agent kind. Parent should:
-    ///   1. `cmux new-surface --type terminal --workspace <ws-ref>` → new_ref
-    ///   2. wait ~800ms, `cmux send --surface <new_ref> "<agent>\r"`
-    ///   3. wait ~1500ms, `cmux send --surface <new_ref> "<goal text>\r"`
-    ///   4. `GoalsFile::set_assignment(text, new_ref, kind, now)`
+    /// User picked "new surface" with a specific agent kind. Parent should
+    /// create and prove an exact arcmux session, bind the stable surface UUID,
+    /// attach the session, deliver the goal through arcmux, and only then
+    /// update `goals.json`.
     NewSurface { kind: SurfaceKind },
 }
 
 /// The dispatch modal state. Owned by the WorkspaceState while the modal is
 /// open; cleared on Cancel / SelectExisting / NewSurface (after the cmux
-/// commands resolve).
+/// transaction resolves).
 #[derive(Debug, Clone)]
 pub struct DispatchModal {
     pub goal_text: String,

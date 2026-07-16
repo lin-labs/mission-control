@@ -839,6 +839,11 @@ async fn run_app(
     // backpressure the worker without contending with refresh or tracker IO.
     let (handoff_tx, mut handoff_rx) =
         mpsc::channel::<crate::mc_data::arcmux_handoff::HandoffUpdate>(16);
+    // New agent surfaces are provisioned transactionally through arcmux. Keep
+    // their exact-workspace results separate from handoff progress so either
+    // operation can finish after the user's selection has moved elsewhere.
+    let (dispatch_tx, mut dispatch_rx) =
+        mpsc::channel::<crate::mc_data::arcmux_dispatch::NewSurfaceDispatchUpdate>(8);
 
     let mut refresh_interval = interval(Duration::from_secs(30));
     let mut mesh_refresh_interval = interval_at(
@@ -1114,6 +1119,7 @@ async fn run_app(
                                             &mut app,
                                             outcome,
                                             cmux_client.clone(),
+                                            dispatch_tx.clone(),
                                         );
                                     }
                                     if let Some(outcome) = app.take_handoff_outcome() {
@@ -1587,6 +1593,10 @@ async fn run_app(
                 app.apply_handoff_update(update);
             }
 
+            Some(update) = dispatch_rx.recv() => {
+                app.apply_new_surface_dispatch_update(update);
+            }
+
             Some(result) = linear_open_rx.recv() => {
                 if let Err(warning) = result {
                     app.global_warning = Some(warning);
@@ -1908,12 +1918,10 @@ async fn open_linear_desktop_issue(url: &str) -> Result<(), String> {
 
 /// Act on the user's choice from the dispatch modal.
 ///
-/// - `Cancel`              → close the modal, no side effects.
-/// - `SelectExisting`      → spawn `cmux send` to the chosen surface, then
-///                            record the assignment in `goals.json`.
-/// - `NewSurface { kind }` → spawn `cmux new-surface` → wait 800ms → seed the
-///                            agent binary → wait 1500ms → send the goal text
-///                            → record the assignment. All async.
+/// `Cancel` closes the modal with no side effects. `SelectExisting` sends to
+/// the chosen cmux surface and records the assignment in `goals.json`.
+/// `NewSurface` creates an exact arcmux-supervised session, binds the new
+/// surface UUID, attaches it, and delivers the goal over arcmux asynchronously.
 ///
 /// goals.json is updated synchronously on the UI thread once the cmux work
 /// resolves. On any cmux failure we set `dispatch_error` on the app and leave
@@ -1922,6 +1930,9 @@ fn handle_dispatch_outcome(
     app: &mut App,
     outcome: crate::tui::dispatch_modal::DispatchOutcome,
     cmux: CmuxClient,
+    dispatch_tx: tokio::sync::mpsc::Sender<
+        crate::mc_data::arcmux_dispatch::NewSurfaceDispatchUpdate,
+    >,
 ) {
     use crate::tui::dispatch_modal::DispatchOutcome;
 
@@ -1997,54 +2008,53 @@ fn handle_dispatch_outcome(
             });
         }
         DispatchOutcome::NewSurface { kind } => {
-            let agent_bin = match kind {
-                crate::mc_data::surface_kind::SurfaceKind::Claude => "claude",
-                crate::mc_data::surface_kind::SurfaceKind::Codex => "codex",
-                _ => return, // PickAgent only emits Claude/Codex today.
+            if !matches!(
+                kind,
+                crate::mc_data::surface_kind::SurfaceKind::Claude
+                    | crate::mc_data::surface_kind::SurfaceKind::Codex
+            ) {
+                return; // PickAgent only emits Claude/Codex today.
+            }
+            let Some((workspace_uuid, window_ref, cwd)) = app.selected_workspace().map(|ws| {
+                (
+                    ws.workspace.uuid.clone(),
+                    ws.workspace.window_ref.clone(),
+                    ws.workspace.current_directory.clone(),
+                )
+            }) else {
+                return;
             };
-            let goal_text_owned = goal_text.clone();
-            let workspace_ref_clone = workspace_ref.clone();
-            let cmux_new = cmux.clone();
             app.close_dispatch_modal();
-            let uuid = app
-                .selected_workspace()
-                .map(|ws| ws.workspace.uuid.clone())
-                .unwrap_or_default();
+
+            let Some(window_ref) = window_ref else {
+                app.set_dispatch_error_for_workspace(
+                    &workspace_uuid,
+                    "not arcmux-supervised: exact cmux window ref is unavailable".to_string(),
+                );
+                return;
+            };
+            let Some(cwd) = cwd.map(std::path::PathBuf::from) else {
+                app.set_dispatch_error_for_workspace(
+                    &workspace_uuid,
+                    "not arcmux-supervised: workspace cwd is unavailable".to_string(),
+                );
+                return;
+            };
+            let request = crate::mc_data::arcmux_dispatch::NewSurfaceDispatchRequest {
+                workspace_uuid,
+                workspace_ref,
+                window_ref,
+                cwd,
+                goal_text,
+                kind,
+            };
             tokio::spawn(async move {
-                use tokio::time::{Duration, sleep};
-                let new_ref = match cmux_new.new_surface(&workspace_ref_clone, "terminal").await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("dispatch: cmux new-surface failed: {e:?}");
-                        return;
-                    }
-                };
-                sleep(Duration::from_millis(800)).await;
-                let agent_with_cr = format!("{}\r", agent_bin);
-                if let Err(e) = cmux_new
-                    .send_text(&workspace_ref_clone, &new_ref, &agent_with_cr)
-                    .await
-                {
-                    eprintln!("dispatch: send agent binary failed: {e:?}");
-                    return;
-                }
-                sleep(Duration::from_millis(1500)).await;
-                let goal_with_cr = format!("{}\r", goal_text_owned);
-                if let Err(e) = cmux_new
-                    .send_text(&workspace_ref_clone, &new_ref, &goal_with_cr)
-                    .await
-                {
-                    eprintln!("dispatch: send goal text failed: {e:?}");
-                    return;
-                }
-                if uuid.is_empty() {
-                    return;
-                }
-                let mut goals = crate::mc_data::goals_json::GoalsFile::load(&uuid);
-                goals.set_assignment(&goal_text_owned, &new_ref, kind, chrono::Utc::now());
-                if let Err(e) = goals.save(&uuid) {
-                    eprintln!("dispatch: goals.json save: {e:?}");
-                }
+                crate::mc_data::arcmux_dispatch::run_new_surface_dispatch(
+                    request,
+                    cmux,
+                    dispatch_tx,
+                )
+                .await;
             });
         }
     }
