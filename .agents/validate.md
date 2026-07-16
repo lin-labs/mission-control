@@ -785,8 +785,10 @@ a guessed session based on title/cwd/recency.
    transaction by wall-clock time and retained stdout/stderr. After any cmux or
    arcmux direct child exits, separately bound pipe-reader drain time; a
    descendant that inherited stdout/stderr must be aborted rather than hanging
-   the TUI. Exercise stalled children, oversized output, and descendant-retained
-   file descriptors with adversarial executables.
+   the TUI. Reader tasks must also abort when an outer caller cancels the command
+   future before its internal deadline. Exercise stalled children, oversized
+   output, and descendant-retained file descriptors with adversarial executables,
+   including the combined outer-timeout case.
 
 ---
 

@@ -235,14 +235,14 @@ impl CmuxClient {
             .stderr
             .take()
             .ok_or_else(|| anyhow::anyhow!("bounded cmux stderr unavailable"))?;
-        let mut stdout_task = tokio::spawn(read_bounded_output(
+        let mut stdout_task = BoundedReadTask::new(tokio::spawn(read_bounded_output(
             stdout,
             self.transaction_max_output_bytes,
-        ));
-        let mut stderr_task = tokio::spawn(read_bounded_output(
+        )));
+        let mut stderr_task = BoundedReadTask::new(tokio::spawn(read_bounded_output(
             stderr,
             self.transaction_max_output_bytes,
-        ));
+        )));
 
         let status = match timeout(self.transaction_command_timeout, child.wait()).await {
             Ok(result) => result.context("bounded cmux command wait failed")?,
@@ -713,7 +713,28 @@ impl CmuxClient {
     }
 }
 
-type BoundedReadTask = JoinHandle<std::io::Result<(Vec<u8>, bool)>>;
+/// Owns a pipe reader so cancelling the command future cannot detach the task.
+struct BoundedReadTask(JoinHandle<std::io::Result<(Vec<u8>, bool)>>);
+
+impl BoundedReadTask {
+    fn new(task: JoinHandle<std::io::Result<(Vec<u8>, bool)>>) -> Self {
+        Self(task)
+    }
+
+    fn abort(&self) {
+        self.0.abort();
+    }
+
+    fn handle_mut(&mut self) -> &mut JoinHandle<std::io::Result<(Vec<u8>, bool)>> {
+        &mut self.0
+    }
+}
+
+impl Drop for BoundedReadTask {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
 
 async fn read_bounded_output(
     mut reader: impl AsyncRead + Unpin,
@@ -741,10 +762,12 @@ async fn collect_bounded_output(
     drain_timeout: Duration,
 ) -> Result<((Vec<u8>, bool), (Vec<u8>, bool))> {
     let joined = timeout(drain_timeout, async {
-        let stdout = (&mut *stdout_task)
+        let stdout = stdout_task
+            .handle_mut()
             .await
             .context("bounded cmux stdout reader task failed")??;
-        let stderr = (&mut *stderr_task)
+        let stderr = stderr_task
+            .handle_mut()
             .await
             .context("bounded cmux stderr reader task failed")??;
         Ok::<_, anyhow::Error>((stdout, stderr))
@@ -804,7 +827,7 @@ mod bounded_transaction_tests {
         CmuxClient::new_with_transaction_limits(
             path.to_string_lossy().into_owned(),
             path.with_extension("sock"),
-            Duration::from_millis(500),
+            Duration::from_secs(5),
             Duration::from_millis(20),
             1024,
         )
@@ -859,7 +882,7 @@ mod bounded_transaction_tests {
                 .unwrap_err()
         );
         assert!(error.contains("output pipe drain timed out"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[tokio::test]

@@ -211,8 +211,8 @@ impl HandoffCommandRunner {
             .stderr
             .take()
             .ok_or_else(|| "arcmux stderr unavailable".to_string())?;
-        let mut stdout_task = tokio::spawn(read_bounded(stdout));
-        let mut stderr_task = tokio::spawn(read_bounded(stderr));
+        let mut stdout_task = BoundedReadTask::new(tokio::spawn(read_bounded(stdout)));
+        let mut stderr_task = BoundedReadTask::new(tokio::spawn(read_bounded(stderr)));
 
         if let Some(input) = spec.stdin {
             let mut stdin = child
@@ -1184,7 +1184,28 @@ async fn read_bounded(mut reader: impl AsyncRead + Unpin) -> Result<(Vec<u8>, bo
     Ok((retained, overflow))
 }
 
-type BoundedReadTask = JoinHandle<Result<(Vec<u8>, bool), String>>;
+/// Owns a pipe reader so cancelling the command future cannot detach the task.
+struct BoundedReadTask(JoinHandle<Result<(Vec<u8>, bool), String>>);
+
+impl BoundedReadTask {
+    fn new(task: JoinHandle<Result<(Vec<u8>, bool), String>>) -> Self {
+        Self(task)
+    }
+
+    fn abort(&self) {
+        self.0.abort();
+    }
+
+    fn handle_mut(&mut self) -> &mut JoinHandle<Result<(Vec<u8>, bool), String>> {
+        &mut self.0
+    }
+}
+
+impl Drop for BoundedReadTask {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
 
 async fn collect_bounded_readers(
     stdout_task: &mut BoundedReadTask,
@@ -1192,10 +1213,12 @@ async fn collect_bounded_readers(
     drain_timeout: Duration,
 ) -> Result<((Vec<u8>, bool), (Vec<u8>, bool)), String> {
     let joined = timeout(drain_timeout, async {
-        let stdout = (&mut *stdout_task)
+        let stdout = stdout_task
+            .handle_mut()
             .await
             .map_err(|_| "arcmux stdout reader failed".to_string())??;
-        let stderr = (&mut *stderr_task)
+        let stderr = stderr_task
+            .handle_mut()
             .await
             .map_err(|_| "arcmux stderr reader failed".to_string())??;
         Ok::<_, String>((stdout, stderr))

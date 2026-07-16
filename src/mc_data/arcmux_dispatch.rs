@@ -147,8 +147,8 @@ impl DispatchCommandRunner {
             .stderr
             .take()
             .ok_or_else(|| "arcmux dispatch stderr unavailable".to_string())?;
-        let mut stdout_task = tokio::spawn(read_bounded(stdout));
-        let mut stderr_task = tokio::spawn(read_bounded(stderr));
+        let mut stdout_task = BoundedReadTask::new(tokio::spawn(read_bounded(stdout)));
+        let mut stderr_task = BoundedReadTask::new(tokio::spawn(read_bounded(stderr)));
         if let Some(input) = stdin {
             let mut child_stdin = child
                 .stdin
@@ -651,7 +651,28 @@ async fn read_bounded(mut reader: impl AsyncRead + Unpin) -> Result<(Vec<u8>, bo
     Ok((retained, overflow))
 }
 
-type BoundedReadTask = JoinHandle<Result<(Vec<u8>, bool), String>>;
+/// Owns a pipe reader so cancelling the command future cannot detach the task.
+struct BoundedReadTask(JoinHandle<Result<(Vec<u8>, bool), String>>);
+
+impl BoundedReadTask {
+    fn new(task: JoinHandle<Result<(Vec<u8>, bool), String>>) -> Self {
+        Self(task)
+    }
+
+    fn abort(&self) {
+        self.0.abort();
+    }
+
+    fn handle_mut(&mut self) -> &mut JoinHandle<Result<(Vec<u8>, bool), String>> {
+        &mut self.0
+    }
+}
+
+impl Drop for BoundedReadTask {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
 
 async fn collect_bounded_readers(
     stdout_task: &mut BoundedReadTask,
@@ -659,10 +680,12 @@ async fn collect_bounded_readers(
     drain_timeout: Duration,
 ) -> Result<((Vec<u8>, bool), (Vec<u8>, bool)), String> {
     let joined = timeout(drain_timeout, async {
-        let stdout = (&mut *stdout_task)
+        let stdout = stdout_task
+            .handle_mut()
             .await
             .map_err(|_| "arcmux dispatch stdout reader failed".to_string())??;
-        let stderr = (&mut *stderr_task)
+        let stderr = stderr_task
+            .handle_mut()
             .await
             .map_err(|_| "arcmux dispatch stderr reader failed".to_string())??;
         Ok::<_, String>((stdout, stderr))
@@ -954,6 +977,62 @@ fi
         assert_eq!(failure.surface_ref.as_deref(), Some("surface:42"));
         assert!(failure.message.starts_with("not arcmux-supervised:"));
         assert!(!std::fs::read_to_string(log).unwrap().contains("cli:create"));
+    }
+
+    #[tokio::test]
+    async fn outer_surface_timeout_aborts_readers_held_by_stalled_cmux_descendant() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("pipe-state");
+        let cmux_bin = temp.path().join("cmux");
+        executable(
+            &cmux_bin,
+            &format!(
+                r#"#!/usr/bin/env python3
+import os, time
+if os.fork() == 0:
+    time.sleep(1)
+    try:
+        os.write(1, b'late output')
+        state = 'reader-open'
+    except BrokenPipeError:
+        state = 'reader-closed'
+    with open('{}', 'w') as output:
+        output.write(state)
+    os._exit(0)
+time.sleep(5)
+"#,
+                state.display()
+            ),
+        );
+        let cmux = CmuxClient::new_with_transaction_limits(
+            cmux_bin.to_string_lossy().into_owned(),
+            temp.path().join("cmux.sock"),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            4096,
+        );
+        let request = request(temp.path().to_path_buf());
+        let started = std::time::Instant::now();
+
+        let resolution = timeout(
+            Duration::from_millis(500),
+            resolve_new_surface_uuid(&cmux, &request, "surface:42"),
+        )
+        .await;
+
+        assert!(resolution.is_err(), "the outer resolver timeout must win");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        for _ in 0..30 {
+            if state.exists() {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(state).unwrap(),
+            "reader-closed",
+            "outer cancellation must abort the detached stdout reader"
+        );
     }
 
     #[tokio::test]
