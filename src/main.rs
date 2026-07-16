@@ -209,7 +209,7 @@ fn detail_scroll_context(app: &App) -> bool {
     let Some(ws) = app.selected_workspace() else {
         return false;
     };
-    if ws.peek_state.is_some() || ws.dispatch_modal.is_some() {
+    if ws.peek_state.is_some() || ws.dispatch_modal.is_some() || ws.handoff_modal.is_some() {
         return false;
     }
     let in_insert = ws
@@ -266,28 +266,29 @@ fn ensure_selected_trajectory_cursor(app: &mut App) {
 }
 
 fn is_trajectory_detail_key(key: KeyEvent) -> bool {
-    matches!(
-        key.code,
-        KeyCode::Char('j')
-            | KeyCode::Down
-            | KeyCode::Char('k')
-            | KeyCode::Up
-            | KeyCode::Char('g')
-            | KeyCode::Char('G')
-            | KeyCode::Char('i')
-            | KeyCode::Char('l')
-            | KeyCode::Right
-            | KeyCode::Enter
-            | KeyCode::Char(' ')
-            | KeyCode::Char('-')
-            | KeyCode::Char('x')
-            | KeyCode::Char('X')
-            | KeyCode::Char('d')
-            | KeyCode::Char('o')
-            | KeyCode::Char('O')
-            | KeyCode::Char('J')
-            | KeyCode::Char('K')
-    )
+    crate::tui::app::is_handoff_key(&key)
+        || matches!(
+            key.code,
+            KeyCode::Char('j')
+                | KeyCode::Down
+                | KeyCode::Char('k')
+                | KeyCode::Up
+                | KeyCode::Char('g')
+                | KeyCode::Char('G')
+                | KeyCode::Char('i')
+                | KeyCode::Char('l')
+                | KeyCode::Right
+                | KeyCode::Enter
+                | KeyCode::Char(' ')
+                | KeyCode::Char('-')
+                | KeyCode::Char('x')
+                | KeyCode::Char('X')
+                | KeyCode::Char('d')
+                | KeyCode::Char('o')
+                | KeyCode::Char('O')
+                | KeyCode::Char('J')
+                | KeyCode::Char('K')
+        )
 }
 
 #[tokio::main]
@@ -310,6 +311,7 @@ async fn main() -> Result<()> {
         }) => cli::bind::run(&surface_id, session_file.as_deref()),
         Some(config::Command::Summarize) => run_summarize_cli(&cli.tui).await,
         Some(config::Command::BackfillWindow) => run_backfill_window_cli(&cli.tui).await,
+        Some(config::Command::Missions) => run_missions_cli(),
         Some(config::Command::RemoteGrabProbe {
             surface_ref,
             iters,
@@ -320,6 +322,17 @@ async fn main() -> Result<()> {
         }
         Some(config::Command::ArchiveClosed) => run_archive_closed(&cli.tui).await,
     }
+}
+
+fn run_missions_cli() -> Result<()> {
+    let outcome = crate::mc_data::missions::sync_default()?;
+    let (status, path) = match outcome {
+        crate::mc_data::missions::SyncOutcome::Created(path) => ("created", path),
+        crate::mc_data::missions::SyncOutcome::Updated(path) => ("updated", path),
+        crate::mc_data::missions::SyncOutcome::Unchanged(path) => ("unchanged", path),
+    };
+    println!("{status}: {}", path.display());
+    Ok(())
 }
 
 /// Headless run of the workspace state lifecycle: migrate `.data/` → `active/`,
@@ -822,6 +835,10 @@ async fn run_app(
         mpsc::channel::<crate::tui::app::BeadsRefreshSnapshot>(4);
     let mut beads_refresh_inflight: bool = false;
     let (linear_open_tx, mut linear_open_rx) = mpsc::channel::<Result<(), String>>(4);
+    // Dedicated bounded path for handoff progress/results. Slow rendering can
+    // backpressure the worker without contending with refresh or tracker IO.
+    let (handoff_tx, mut handoff_rx) =
+        mpsc::channel::<crate::mc_data::arcmux_handoff::HandoffUpdate>(16);
 
     let mut refresh_interval = interval(Duration::from_secs(30));
     let mut mesh_refresh_interval = interval_at(
@@ -922,12 +939,7 @@ async fn run_app(
                     tui::footer::render_command_bar(f, vchunks[2], cl);
                 }
                 crate::tui::command::InputMode::Normal => {
-                    tui::footer::render_footer(
-                        f,
-                        vchunks[2],
-                        app.focus,
-                        detail_has_trajectory,
-                    );
+                    tui::footer::render_footer(f, vchunks[2], app.focus, detail_has_trajectory);
                 }
             }
         })?;
@@ -1063,6 +1075,9 @@ async fn run_app(
                                 let in_dispatch = app
                                     .selected_workspace()
                                     .map_or(false, |ws| ws.dispatch_modal.is_some());
+                                let in_handoff = app
+                                    .selected_workspace()
+                                    .map_or(false, |ws| ws.handoff_modal.is_some());
 
                                 // ^c / ^r are truly global — they must work
                                 // even inside peek / insert / dispatch.
@@ -1077,7 +1092,11 @@ async fn run_app(
                                 );
 
                                 if !is_global_quit_key
-                                    && (in_peek || in_insert || in_dispatch || is_traj_nav_key)
+                                    && (in_peek
+                                        || in_insert
+                                        || in_dispatch
+                                        || in_handoff
+                                        || is_traj_nav_key)
                                 {
                                     let actions = app.handle_trajectory_key(key);
                                     if !actions.is_empty() {
@@ -1096,6 +1115,26 @@ async fn run_app(
                                             outcome,
                                             cmux_client.clone(),
                                         );
+                                    }
+                                    if let Some(outcome) = app.take_handoff_outcome() {
+                                        match outcome {
+                                            crate::tui::handoff_modal::HandoffOutcome::Handled => {}
+                                            crate::tui::handoff_modal::HandoffOutcome::Cancel => {
+                                                app.close_handoff_modal();
+                                            }
+                                            crate::tui::handoff_modal::HandoffOutcome::Start(plan) => {
+                                                if let Some(operation) = app.begin_handoff(*plan) {
+                                                    let tx = handoff_tx.clone();
+                                                    tokio::spawn(async move {
+                                                        crate::mc_data::arcmux_handoff::run_handoff(
+                                                            operation,
+                                                            tx,
+                                                        )
+                                                        .await;
+                                                    });
+                                                }
+                                            }
+                                        }
                                     }
                                     if let Some(url) = app.take_linear_open_request() {
                                         let tx = linear_open_tx.clone();
@@ -1542,6 +1581,10 @@ async fn run_app(
             Some(mesh_fetch) = mesh_refresh_rx.recv() => {
                 mesh_refresh_inflight = false;
                 app.apply_mesh_fetch(mesh_fetch);
+            }
+
+            Some(update) = handoff_rx.recv() => {
+                app.apply_handoff_update(update);
             }
 
             Some(result) = linear_open_rx.recv() => {
@@ -2099,6 +2142,7 @@ mod tests {
             session: None,
             surfaces: Vec::new(),
             remote_surfaces: std::collections::HashMap::new(),
+            local_handoff_sources: std::collections::HashMap::new(),
             screen_preview: None,
             screen_insights: ScreenInsights::default(),
             tool_call_count: 0,
@@ -2119,6 +2163,8 @@ mod tests {
             dismissal: DismissalState::default(),
             dispatch_modal: None,
             dispatch_pending_outcome: None,
+            handoff_modal: None,
+            handoff_pending_outcome: None,
             dispatch_error: None,
         }
     }
@@ -2160,6 +2206,23 @@ mod tests {
     fn l_and_right_are_owned_by_trajectory_detail() {
         assert!(is_trajectory_detail_key(key(KeyCode::Char('l'))));
         assert!(is_trajectory_detail_key(key(KeyCode::Right)));
+    }
+
+    #[test]
+    fn uppercase_h_handoff_is_owned_by_trajectory_detail_router() {
+        let app = detail_app_with_trajectory();
+
+        assert_eq!(app.focus, Focus::Detail);
+        assert!(selected_workspace_has_trajectory(&app));
+        assert!(is_trajectory_detail_key(key(KeyCode::Char('H'))));
+    }
+
+    #[test]
+    fn shifted_lowercase_h_handoff_is_owned_by_trajectory_detail_router() {
+        let mut shifted_h = key(KeyCode::Char('h'));
+        shifted_h.modifiers = KeyModifiers::SHIFT;
+
+        assert!(is_trajectory_detail_key(shifted_h));
     }
 
     #[tokio::test]

@@ -109,6 +109,21 @@ Workspace renames in cmux atomically `mv` the display symlink — the UUID-keyed
 data dir never moves. If you want to bootstrap the data root explicitly,
 run `mc setup` once.
 
+## Obsidian Missions projection
+
+After each reliable workspace refresh, Mission Control projects the current
+device's active workspaces and surfaces into:
+
+```text
+~/agents/obsAgents/Missions/sessions/<PT-date>-<device>.md
+```
+
+The generated workspace/surface outline is bounded by
+`mission-control:generated` HTML comments. Mission Control replaces only that
+managed region and leaves human-authored content elsewhere in the note intact.
+If the normalized state has not changed, the note is not rewritten. Run
+`mc missions` to refresh from the persisted registries without contacting cmux.
+
 ## Session logs
 
 Cross-agent session logs live at `~obsAgents/Sessions/<date>-<hour>-<slug>.md`,

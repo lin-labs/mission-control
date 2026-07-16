@@ -299,9 +299,13 @@ fn mc_backfill_window_writes_registry_with_fake_cmux() {
     let home = tmp.path().join("home");
     let histories = tmp.path().join("histories");
     let repo = tmp.path().join("repo");
+    let obs_agents = home.join("agents/obsAgents");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&histories).unwrap();
     std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&obs_agents).unwrap();
+    std::fs::create_dir_all(home.join("data/mission-control/active/WS-1")).unwrap();
+    std::fs::write(home.join("agents/device.json"), r#"{"name":"ref"}"#).unwrap();
     assert!(
         Command::new("git")
             .args(["init", "-q"])
@@ -342,6 +346,19 @@ fn mc_backfill_window_writes_registry_with_fake_cmux() {
     assert!(window.contains("\"window_id\": \"WIN-1\""));
     assert!(window.contains("\"histories_valid\": true"));
     assert!(window.contains("\"repo_roots\""));
+
+    let date = chrono::Local::now().format("%Y-%m-%d");
+    let missions_note = obs_agents
+        .join("Missions/sessions")
+        .join(format!("{date}-ref.md"));
+    let missions = std::fs::read_to_string(&missions_note).unwrap_or_else(|error| {
+        panic!(
+            "refresh did not project {}: {error}",
+            missions_note.display()
+        )
+    });
+    assert!(missions.contains("Workspace: repo"));
+    assert!(missions.contains("Surface: shell"));
 }
 
 #[cfg(unix)]

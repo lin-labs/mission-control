@@ -403,6 +403,9 @@ pub struct WorkspaceState {
     /// Exact arcmux mesh state keyed by the local cmux `surface:N` ref. The
     /// join is authorized only by stable surface/workspace UUID bindings.
     pub remote_surfaces: HashMap<String, crate::mc_data::arcmux_mesh::RemoteSurfaceState>,
+    /// Exact local arcmux session bindings keyed by cmux `surface:N` ref.
+    /// A row absent from this map is not eligible for handoff.
+    pub local_handoff_sources: HashMap<String, crate::mc_data::arcmux_mesh::LocalHandoffSource>,
     pub screen_preview: Option<String>,
     pub screen_insights: ScreenInsights,
     pub tool_call_count: u32,
@@ -453,6 +456,10 @@ pub struct WorkspaceState {
     /// main event loop after each key dispatch so async cmux work can be
     /// spawned from outside the `&mut self` borrow.
     pub dispatch_pending_outcome: Option<crate::tui::dispatch_modal::DispatchOutcome>,
+    /// Active verified-handoff picker/progress/result modal.
+    pub handoff_modal: Option<crate::tui::handoff_modal::HandoffModal>,
+    /// Pending pure-modal outcome consumed by the async main loop.
+    pub handoff_pending_outcome: Option<crate::tui::handoff_modal::HandoffOutcome>,
     /// Most recent dispatch error (e.g. cmux send failure) — shown briefly in
     /// the status line, cleared on the next key press or after ~5s. Populated
     /// by `set_dispatch_error` from the main loop's dispatch outcome handler.
@@ -760,9 +767,8 @@ impl WorkspaceState {
 fn remote_surface_is_current(
     remote: Option<&crate::mc_data::arcmux_mesh::RemoteSurfaceState>,
 ) -> bool {
-    !remote.is_some_and(|state| {
-        state.freshness == crate::mc_data::arcmux_mesh::RemoteFreshness::Gone
-    })
+    !remote
+        .is_some_and(|state| state.freshness == crate::mc_data::arcmux_mesh::RemoteFreshness::Gone)
 }
 
 fn retain_remote_surfaces_as_stale(
@@ -975,6 +981,10 @@ pub struct App {
     /// Completion time of the last applied mesh fetch. Full refreshes and the
     /// five-second poll can overlap; older results must never win the race.
     last_mesh_observed_at: Option<std::time::Instant>,
+    /// Connected peers that explicitly advertise `handoffs.v1`.
+    handoff_peers: Vec<String>,
+    /// Monotonic operation identity used to ignore late async updates.
+    handoff_generation: u64,
     session_to_workspace: HashMap<String, String>,
     workspace_index: HashMap<String, usize>,
     bullet_hashes: HashMap<PathBuf, u64>,
@@ -1457,7 +1467,14 @@ async fn gather_refresh_snapshot_inner(
     let registry_for_write = registry_output.registry.clone();
     if surfaces_reliable {
         if let Err(e) = tokio::task::spawn_blocking(move || {
-            crate::mc_data::window_registry::write_registry(&registry_for_write)
+            crate::mc_data::window_registry::write_registry(&registry_for_write)?;
+            // The daily Obsidian note is a best-effort projection of the
+            // authoritative registry. A missing vault must never break the TUI
+            // refresh or prevent window.json from being updated.
+            if let Err(error) = crate::mc_data::missions::sync_default() {
+                eprintln!("Obsidian Missions sync skipped: {error:#}");
+            }
+            Ok(())
         })
         .await
         .unwrap_or_else(|e| Err(anyhow::anyhow!("registry writer join failed: {e}")))
@@ -1473,11 +1490,8 @@ async fn gather_refresh_snapshot_inner(
     let repo_roots_by_ws_id = registry_output.repo_roots_by_ws_id;
     let repo_by_surface_by_ws_id = registry_output.repo_by_surface_by_ws_id;
     let project_registry = crate::mc_data::project_registry::ProjectRegistry::load_default().ok();
-    let task_sources = resolve_task_sources(
-        &workspaces,
-        &repo_roots_by_ws_id,
-        project_registry.as_ref(),
-    );
+    let task_sources =
+        resolve_task_sources(&workspaces, &repo_roots_by_ws_id, project_registry.as_ref());
     let task_sources_for_beads = task_sources.clone();
     let beads_by_ws_id = tokio::task::spawn_blocking(move || {
         use crate::mc_data::project_registry::TaskSource;
@@ -1548,6 +1562,8 @@ impl App {
             global_warning: None,
             mesh_warning: None,
             last_mesh_observed_at: None,
+            handoff_peers: Vec::new(),
+            handoff_generation: 0,
             session_to_workspace: HashMap::new(),
             workspace_index: HashMap::new(),
             bullet_hashes: HashMap::new(),
@@ -1611,10 +1627,14 @@ impl App {
         }
         self.last_mesh_observed_at = Some(fetch.observed_at);
         self.mesh_warning = fetch.warning;
+        self.handoff_peers = fetch
+            .snapshot
+            .as_ref()
+            .map(|mesh| mesh.connected_handoff_peers())
+            .unwrap_or_default();
         for workspace in &mut self.workspaces {
             workspace.remote_surfaces = if let Some(mesh) = fetch.snapshot.as_ref() {
-                let next =
-                    mesh.resolve_workspace(&workspace.workspace.uuid, &workspace.surfaces);
+                let next = mesh.resolve_workspace(&workspace.workspace.uuid, &workspace.surfaces);
                 merge_remote_projection(
                     next,
                     &workspace.remote_surfaces,
@@ -1622,11 +1642,18 @@ impl App {
                     fetch.partial,
                 )
             } else {
-                retain_remote_surfaces_as_stale(
-                    &workspace.remote_surfaces,
-                    &workspace.surfaces,
-                )
+                retain_remote_surfaces_as_stale(&workspace.remote_surfaces, &workspace.surfaces)
             };
+            workspace.local_handoff_sources = fetch
+                .snapshot
+                .as_ref()
+                .map(|mesh| {
+                    mesh.resolve_local_handoff_sources(
+                        &workspace.workspace.uuid,
+                        &workspace.surfaces,
+                    )
+                })
+                .unwrap_or_default();
             fold_gone_remote_rows(workspace);
             repair_bound_remote_peek(workspace);
         }
@@ -1727,14 +1754,11 @@ impl App {
             .iter()
             .map(|ws| (ws.workspace.uuid.clone(), ws.summary.clone()))
             .collect();
-        let old_linear_views: HashMap<
-            String,
-            Option<crate::mc_data::linear::WorkspaceLinearView>,
-        > = self
-            .workspaces
-            .iter()
-            .map(|ws| (ws.workspace.uuid.clone(), ws.linear.clone()))
-            .collect();
+        let old_linear_views: HashMap<String, Option<crate::mc_data::linear::WorkspaceLinearView>> =
+            self.workspaces
+                .iter()
+                .map(|ws| (ws.workspace.uuid.clone(), ws.linear.clone()))
+                .collect();
         // Preserve editing state across refreshes so cursor position is remembered.
         let old_edit_states: HashMap<
             String,
@@ -1778,6 +1802,19 @@ impl App {
             .iter()
             .map(|ws| (ws.workspace.uuid.clone(), ws.remote_surfaces.clone()))
             .collect();
+        let old_local_handoff_sources: HashMap<
+            String,
+            HashMap<String, crate::mc_data::arcmux_mesh::LocalHandoffSource>,
+        > = self
+            .workspaces
+            .iter()
+            .map(|ws| (ws.workspace.uuid.clone(), ws.local_handoff_sources.clone()))
+            .collect();
+        let old_handoff_modals: HashMap<String, Option<crate::tui::handoff_modal::HandoffModal>> =
+            self.workspaces
+                .iter()
+                .map(|ws| (ws.workspace.uuid.clone(), ws.handoff_modal.clone()))
+                .collect();
         // Preserve the in-memory trajectory across refreshes so we can REUSE
         // it (instead of reloading from disk) when the user is actively
         // editing or peeking. Reloading mid-edit would clobber the
@@ -1812,6 +1849,11 @@ impl App {
                     .cloned()
                     .unwrap_or_default();
                 let remote_surfaces = rekey_remote_surfaces(&old, &surfaces, false);
+                let local_handoff_sources = old_local_handoff_sources
+                    .get(&ws.uuid)
+                    .cloned()
+                    .unwrap_or_default();
+                let handoff_modal = old_handoff_modals.get(&ws.uuid).cloned().flatten();
                 let tool_call_count = old_counts.get(&ws.uuid).copied().unwrap_or(0);
                 let screen_preview = old_previews.get(&ws.uuid).cloned().flatten();
                 // Reuse existing insights (parsed from full 100-line capture)
@@ -1883,6 +1925,7 @@ impl App {
                     session,
                     surfaces,
                     remote_surfaces,
+                    local_handoff_sources,
                     screen_preview,
                     screen_insights,
                     tool_call_count,
@@ -1903,6 +1946,8 @@ impl App {
                     dismissal,
                     dispatch_modal: None,
                     dispatch_pending_outcome: None,
+                    handoff_modal,
+                    handoff_pending_outcome: None,
                     dispatch_error: None,
                 }
             })
@@ -2152,10 +2197,10 @@ impl App {
                 .map(|s| s.items.clone())
                 .unwrap_or_default();
             let mut goals_mutated = false;
-            let (goals_unchanged, goals_items_opt) = if let Some(linear) = ws_state.linear.as_ref() {
+            let (goals_unchanged, goals_items_opt) = if let Some(linear) = ws_state.linear.as_ref()
+            {
                 let linear_items = linear_items_for_view(linear);
-                let unchanged =
-                    items_equal_for_projection(&goals_section_existing, &linear_items);
+                let unchanged = items_equal_for_projection(&goals_section_existing, &linear_items);
                 (unchanged, Some(linear_items))
             } else if let Some(beads) = ws_state.beads.as_ref() {
                 let highlighted_repo = highlighted_surface_repo(ws_state);
@@ -2336,10 +2381,11 @@ impl App {
         }
 
         let mut states = Vec::new();
-        let mut active_by_id: HashMap<String, MuxSessionState> = crate::mc_data::mux_state::load_all_in_dir(dir)
-            .into_iter()
-            .map(|state| (state.session_id.clone(), state))
-            .collect();
+        let mut active_by_id: HashMap<String, MuxSessionState> =
+            crate::mc_data::mux_state::load_all_in_dir(dir)
+                .into_iter()
+                .map(|state| (state.session_id.clone(), state))
+                .collect();
         for session_id in self.session_to_workspace.keys() {
             if let Some(state) = active_by_id.remove(session_id) {
                 states.push(state);
@@ -2965,17 +3011,17 @@ impl App {
         // generated task list cannot briefly replace read-only Linear/Beads.
         let projected_task_items = (self.workspaces[idx].linear.is_some()
             || self.workspaces[idx].beads.is_some())
-            .then(|| {
-                self.workspaces[idx]
-                    .trajectory
-                    .as_ref()
-                    .and_then(|current| {
-                        current
-                            .section(crate::mc_data::trajectory::SECTION_GOALS)
-                            .map(|section| section.items.clone())
-                    })
-                    .unwrap_or_default()
-            });
+        .then(|| {
+            self.workspaces[idx]
+                .trajectory
+                .as_ref()
+                .and_then(|current| {
+                    current
+                        .section(crate::mc_data::trajectory::SECTION_GOALS)
+                        .map(|section| section.items.clone())
+                })
+                .unwrap_or_default()
+        });
 
         // Ensure canonical sections exist.
         doc.ensure_sections();
@@ -3088,6 +3134,18 @@ impl App {
         use crossterm::event::KeyCode;
         let idx = self.selected;
 
+        // ── Verified handoff modal: intercept every key ────────────────────
+        {
+            let ws = match self.workspaces.get_mut(idx) {
+                Some(w) => w,
+                None => return vec![],
+            };
+            if let Some(modal) = ws.handoff_modal.as_mut() {
+                ws.handoff_pending_outcome = Some(modal.handle_key(key));
+                return vec![];
+            }
+        }
+
         // ── Dispatch modal: intercept before peek/edit ──────────────────────
         {
             let ws = match self.workspaces.get_mut(idx) {
@@ -3105,6 +3163,11 @@ impl App {
                 }
                 return vec![];
             }
+        }
+
+        // ── Nav mode + H on Current surfaces → verified handoff ───────────
+        if is_handoff_key(&key) && self.open_handoff_for_highlighted_surface(idx) {
+            return vec![];
         }
 
         // ── Peek mode: intercept before the editor sees anything ────────────
@@ -3194,8 +3257,7 @@ impl App {
                     // among same-kind surfaces over the workspace's flat surface
                     // list (cmux's `index_in_pane` is per-pane so two panes can
                     // both have idx=0; we don't use it here).
-                    let surface_id_for_lookup =
-                        item.surface_id.as_deref().unwrap_or("");
+                    let surface_id_for_lookup = item.surface_id.as_deref().unwrap_or("");
                     let this_surface = ws
                         .surfaces
                         .iter()
@@ -3370,6 +3432,63 @@ impl App {
         crate::tui::trajectory_edit::handle_key(state, doc, key)
     }
 
+    /// Open a handoff modal only for the exact highlighted Current Surfaces
+    /// row. Returning true means the key belonged to that row even when the
+    /// source is ineligible and an explanatory modal was opened.
+    fn open_handoff_for_highlighted_surface(&mut self, idx: usize) -> bool {
+        use crate::mc_data::trajectory::SECTION_CURRENT_SURFACES;
+        use crate::tui::trajectory_edit::EditMode;
+
+        let Some(ws) = self.workspaces.get(idx) else {
+            return false;
+        };
+        let Some(state) = ws.edit_state.as_ref() else {
+            return false;
+        };
+        if !matches!(state.mode, EditMode::Nav) {
+            return false;
+        }
+        let Some(item) = ws
+            .trajectory
+            .as_ref()
+            .and_then(|doc| doc.sections.get(state.cursor_section))
+            .filter(|section| section.name == SECTION_CURRENT_SURFACES)
+            .and_then(|section| section.items.get(state.cursor_item))
+        else {
+            return false;
+        };
+        let workspace_uuid = ws.workspace.uuid.clone();
+        let surface_label = item.text.clone();
+        let Some(surface_ref) = item.surface_id.clone() else {
+            self.workspaces[idx].handoff_modal =
+                Some(crate::tui::handoff_modal::HandoffModal::unavailable(
+                    workspace_uuid,
+                    surface_label,
+                    "not arcmux-supervised",
+                ));
+            return true;
+        };
+        let source = ws.local_handoff_sources.get(&surface_ref).cloned();
+        let context = source
+            .as_ref()
+            .ok_or_else(|| "not arcmux-supervised".to_string())
+            .and_then(|source| build_handoff_source_context(ws, &surface_ref, source));
+        let modal = match context {
+            Ok(context) => crate::tui::handoff_modal::HandoffModal::new(
+                context,
+                surface_label,
+                self.handoff_peers.clone(),
+            ),
+            Err(message) => crate::tui::handoff_modal::HandoffModal::unavailable(
+                workspace_uuid,
+                surface_label,
+                message,
+            ),
+        };
+        self.workspaces[idx].handoff_modal = Some(modal);
+        true
+    }
+
     /// Read and clear the exact Linear deep link requested by the selected row.
     pub fn take_linear_open_request(&mut self) -> Option<String> {
         self.workspaces
@@ -3385,6 +3504,57 @@ impl App {
         let idx = self.selected;
         let ws = self.workspaces.get_mut(idx)?;
         ws.dispatch_pending_outcome.take()
+    }
+
+    pub fn take_handoff_outcome(&mut self) -> Option<crate::tui::handoff_modal::HandoffOutcome> {
+        self.workspaces
+            .get_mut(self.selected)?
+            .handoff_pending_outcome
+            .take()
+    }
+
+    /// Transition the selected modal to an uninterruptible running state and
+    /// return the generation-tagged operation for the background worker.
+    pub fn begin_handoff(
+        &mut self,
+        plan: crate::mc_data::arcmux_handoff::HandoffPlan,
+    ) -> Option<crate::mc_data::arcmux_handoff::HandoffOperation> {
+        let confirmation = self
+            .workspaces
+            .get(self.selected)
+            .ok_or_else(|| "handoff confirmation: workspace disappeared".to_string())
+            .and_then(|ws| confirm_handoff_source_context(ws, &plan.source));
+        let ws = self.workspaces.get_mut(self.selected)?;
+        let modal = ws.handoff_modal.as_mut()?;
+        if modal.workspace_uuid != plan.source.workspace_uuid {
+            modal.invalidate_confirmation("handoff confirmation: workspace identity changed");
+            return None;
+        }
+        if let Err(message) = confirmation {
+            modal.invalidate_confirmation(message);
+            return None;
+        }
+        self.handoff_generation = self.handoff_generation.wrapping_add(1).max(1);
+        let generation = self.handoff_generation;
+        modal.mark_running(generation, plan.clone());
+        Some(crate::mc_data::arcmux_handoff::HandoffOperation { generation, plan })
+    }
+
+    pub fn apply_handoff_update(&mut self, update: crate::mc_data::arcmux_handoff::HandoffUpdate) {
+        let Some(&idx) = self.workspace_index.get(&update.workspace_uuid) else {
+            return;
+        };
+        let Some(modal) = self.workspaces[idx].handoff_modal.as_mut() else {
+            return;
+        };
+        modal.apply_update(update.generation, update.kind);
+    }
+
+    pub fn close_handoff_modal(&mut self) {
+        if let Some(ws) = self.workspaces.get_mut(self.selected) {
+            ws.handoff_modal = None;
+            ws.handoff_pending_outcome = None;
+        }
     }
 
     /// Close the dispatch modal for the selected workspace.
@@ -3859,12 +4029,7 @@ impl App {
             }
 
             next_doc.sort_tasks_if_long();
-            if let Err(error) = save(
-                &ws.workspace.uuid,
-                &mut next_doc,
-                &next_state,
-                &actions,
-            ) {
+            if let Err(error) = save(&ws.workspace.uuid, &mut next_doc, &next_state, &actions) {
                 eprintln!(
                     "settle_pending_mission_moves({}): {error:?}",
                     ws.workspace.uuid
@@ -3929,6 +4094,17 @@ impl App {
             }
         });
     }
+}
+
+/// Accept both terminal encodings of Shift-H. Legacy terminals send the
+/// shifted character (`H`); modern keyboard protocols may preserve the base
+/// character (`h`) and carry Shift in the modifier flags.
+pub(crate) fn is_handoff_key(key: &crossterm::event::KeyEvent) -> bool {
+    matches!(key.code, crossterm::event::KeyCode::Char('H'))
+        || (matches!(key.code, crossterm::event::KeyCode::Char('h'))
+            && key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::SHIFT))
 }
 
 /// Spawn a background task that captures a workspace's screen (and optionally
@@ -4028,6 +4204,233 @@ fn highlighted_surface_id(ws_state: &WorkspaceState) -> Option<String> {
         return None;
     }
     section.items.get(state.cursor_item)?.surface_id.clone()
+}
+
+fn confirm_handoff_source_context(
+    ws: &WorkspaceState,
+    cached: &crate::mc_data::arcmux_handoff::HandoffSourceContext,
+) -> std::result::Result<(), String> {
+    let (surface_ref, source) = ws
+        .local_handoff_sources
+        .iter()
+        .find(|(_, source)| {
+            source
+                .surface_uuid
+                .eq_ignore_ascii_case(&cached.surface_uuid)
+        })
+        .ok_or_else(|| "handoff confirmation: exact arcmux binding disappeared".to_string())?;
+    let refreshed = build_handoff_source_context(ws, surface_ref, source)?;
+    if &refreshed != cached {
+        return Err(
+            "handoff confirmation: source binding, session, or completed turn changed".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Assemble handoff context exclusively from exact arcmux/cmux identities.
+/// Workspace title, selected cwd, recency, and trajectory text are never used
+/// as substitutes for missing protocol artifacts.
+fn build_handoff_source_context(
+    ws: &WorkspaceState,
+    surface_ref: &str,
+    source: &crate::mc_data::arcmux_mesh::LocalHandoffSource,
+) -> std::result::Result<crate::mc_data::arcmux_handoff::HandoffSourceContext, String> {
+    if source.workspace_uuid != ws.workspace.uuid {
+        return Err("handoff preflight: source workspace identity changed".to_string());
+    }
+    let surface = ws
+        .surfaces
+        .iter()
+        .find(|surface| surface.ref_id == surface_ref)
+        .ok_or_else(|| "handoff preflight: exact cmux surface is unavailable".to_string())?;
+    if !surface
+        .uuid
+        .as_deref()
+        .is_some_and(|uuid| uuid.eq_ignore_ascii_case(&source.surface_uuid))
+    {
+        return Err("handoff preflight: exact cmux surface identity changed".to_string());
+    }
+
+    let hook_sessions = crate::mc_data::cmux_sessions::load_by_surface();
+    let hook = hook_sessions
+        .get(&source.surface_uuid)
+        .or_else(|| {
+            hook_sessions
+                .iter()
+                .find(|(uuid, _)| uuid.eq_ignore_ascii_case(&source.surface_uuid))
+                .map(|(_, session)| session)
+        })
+        .ok_or_else(|| "handoff preflight: exact cmux agent binding is missing".to_string())?;
+    let cwd = hook
+        .cwd
+        .as_deref()
+        .ok_or_else(|| "handoff preflight: source repository path is missing".to_string())?;
+
+    let mux = crate::mc_data::mux_state::load_session_in_dir(
+        &crate::mc_data::mux_state::session_state_dir(),
+        &source.locator.session_id,
+    )
+    .map_err(|_| "handoff preflight: source session state is unreadable".to_string())?
+    .ok_or_else(|| "handoff preflight: source session state is missing".to_string())?;
+    if mux.session_id != source.locator.session_id
+        || !mux.agent.eq_ignore_ascii_case(hook.agent.label())
+    {
+        return Err("handoff preflight: source agent identity does not match".to_string());
+    }
+    if !source_is_idle_after_completed_turn(&mux) {
+        return Err("handoff preflight: source must be idle after a completed turn".to_string());
+    }
+    let last_turn_end_at = mux
+        .last_turn_end_at
+        .as_ref()
+        .map(chrono::DateTime::to_rfc3339)
+        .ok_or_else(|| {
+            "handoff preflight: completed source turn has no stable timestamp".to_string()
+        })?;
+    let contract = mux
+        .turn_contract
+        .as_ref()
+        .ok_or_else(|| "handoff preflight: source goal contract is missing".to_string())?;
+    let mission_items = ws
+        .trajectory
+        .as_ref()
+        .and_then(|doc| doc.section(crate::mc_data::trajectory::SECTION_MISSION))
+        .map(|section| section.items.as_slice())
+        .unwrap_or_default();
+    let goal = compose_handoff_action_context(
+        contract.overall_goal().or_else(|| contract.goal()),
+        mission_items,
+    )?;
+    let history = contract
+        .vault_log_name()
+        .ok_or_else(|| "handoff preflight: canonical conversation history is missing".to_string())?
+        .to_string();
+    let history_path = crate::mc_data::paths::agent_histories_dir().join(&history);
+    if !crate::session::file::is_canonical_history_path(&history_path) || !history_path.is_file() {
+        return Err("handoff preflight: canonical conversation history is missing".to_string());
+    }
+    let project = crate::mc_data::project_registry::ProjectRegistry::load_default()
+        .map_err(|_| "handoff preflight: project registry is unavailable".to_string())?
+        .project_slug_for_path(cwd)
+        .ok_or_else(|| "handoff preflight: source project is unregistered".to_string())?;
+
+    Ok(crate::mc_data::arcmux_handoff::HandoffSourceContext {
+        workspace_uuid: ws.workspace.uuid.clone(),
+        surface_uuid: source.surface_uuid.clone(),
+        locator: source.locator.clone(),
+        agent: mux.agent.to_ascii_lowercase(),
+        project,
+        goal,
+        history,
+        conversation_id: None,
+        parent_handoff_id: None,
+        validation: "not_run".to_string(),
+        observation: crate::mc_data::arcmux_handoff::HandoffSourceObservation {
+            turn_count: mux.turn_count,
+            updated_at: mux.updated_at.to_rfc3339(),
+            last_turn_end_at: Some(last_turn_end_at),
+        },
+    })
+}
+
+fn source_is_idle_after_completed_turn(mux: &crate::mc_data::mux_state::MuxSessionState) -> bool {
+    let Some(last_turn_end) = mux.last_turn_end_at.as_ref() else {
+        return false;
+    };
+    !mux.working
+        && mux.has_ended_turn()
+        && mux.turn_count > 0
+        && mux
+            .last_prompt_submit_at
+            .as_ref()
+            .is_none_or(|last_prompt| last_prompt <= last_turn_end)
+}
+
+fn compose_handoff_action_context(
+    overall_goal: Option<&str>,
+    mission_items: &[crate::mc_data::trajectory::Item],
+) -> std::result::Result<String, String> {
+    let active = mission_items
+        .iter()
+        .filter(|item| item.checked != Some(true) && !item.text.trim().is_empty());
+    let (human, generated): (Vec<_>, Vec<_>) = active.partition(|item| {
+        item.text
+            .trim_start()
+            .get(..3)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("[h]"))
+    });
+    // Human Mission rows are authoritative. Preserve every one verbatim and
+    // in its original relative order; similarity is not grounds for erasing a
+    // separately-entered human instruction (for example, equivalent work on
+    // two different devices).
+    let mut unique: Vec<String> = Vec::with_capacity(human.len() + generated.len() + 1);
+    for item in human {
+        if item.text.chars().any(char::is_control) {
+            return Err("handoff preflight: action context contains invalid characters".into());
+        }
+        unique.push(item.text.clone());
+    }
+
+    // Goal and generated material may be redundant. Add those candidates only
+    // when they do not overlap an authoritative human row or an earlier
+    // accepted candidate.
+    let mut candidates: Vec<String> = Vec::with_capacity(generated.len() + 1);
+    if let Some(goal) = overall_goal {
+        let normalized = goal.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !normalized.is_empty() {
+            candidates.push(normalized);
+        }
+    }
+    candidates.extend(
+        generated
+            .into_iter()
+            .map(|item| item.text.trim().to_string()),
+    );
+
+    for candidate in candidates {
+        if candidate.chars().any(char::is_control) {
+            return Err("handoff preflight: action context contains invalid characters".into());
+        }
+        if unique
+            .iter()
+            .any(|existing| handoff_actions_are_similar(existing, &candidate))
+        {
+            continue;
+        }
+        unique.push(candidate);
+    }
+    if unique.is_empty() {
+        return Err("handoff preflight: action context is missing".to_string());
+    }
+    let summary = unique.join("; ");
+    if summary.chars().count() > 2048 {
+        return Err("handoff preflight: action context exceeds 2048 characters".to_string());
+    }
+    Ok(summary)
+}
+
+fn handoff_actions_are_similar(left: &str, right: &str) -> bool {
+    fn tokens(value: &str) -> std::collections::HashSet<String> {
+        value
+            .trim_start()
+            .strip_prefix("[h]")
+            .unwrap_or(value)
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    }
+    let left = tokens(left);
+    let right = tokens(right);
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    if left == right {
+        return true;
+    }
+    let shorter = left.len().min(right.len());
+    shorter >= 3 && left.intersection(&right).count() * 4 >= shorter * 3
 }
 
 fn retain_last_good_linear(
@@ -4520,6 +4923,7 @@ workspace: test-ws
             session: None,
             surfaces: Vec::new(),
             remote_surfaces: HashMap::new(),
+            local_handoff_sources: HashMap::new(),
             screen_preview: None,
             screen_insights: ScreenInsights::default(),
             tool_call_count: 0,
@@ -4540,6 +4944,8 @@ workspace: test-ws
             dismissal: DismissalState::default(),
             dispatch_modal: None,
             dispatch_pending_outcome: None,
+            handoff_modal: None,
+            handoff_pending_outcome: None,
             dispatch_error: None,
         }
     }
@@ -4690,8 +5096,7 @@ platforms:
 "#,
         )
         .unwrap();
-        let registry =
-            ProjectRegistry::load_with_home(&registry_path, temp.path()).unwrap();
+        let registry = ProjectRegistry::load_with_home(&registry_path, temp.path()).unwrap();
         let workspace = |uuid: &str, cwd: std::path::PathBuf| Workspace {
             window_id: Some("window-test".to_string()),
             window_ref: Some("window:1".to_string()),
@@ -4794,9 +5199,7 @@ platforms:
         assert!(actions.is_empty());
         assert_eq!(
             app.take_linear_open_request().as_deref(),
-            Some(
-                "linear://linear.app/reflection-ai/issue/MID-508/open-the-exact-issue"
-            )
+            Some("linear://linear.app/reflection-ai/issue/MID-508/open-the-exact-issue")
         );
         assert!(app.workspaces[0].dispatch_modal.is_none());
     }
@@ -4812,11 +5215,7 @@ platforms:
             warning: Some("Linear unavailable: API request failed".to_string()),
         };
         install_linear_view(&mut app, unavailable);
-        let before = app.workspaces[0]
-            .trajectory
-            .as_ref()
-            .unwrap()
-            .to_markdown();
+        let before = app.workspaces[0].trajectory.as_ref().unwrap().to_markdown();
 
         app.handle_trajectory_key(key(KeyCode::Enter));
         assert_eq!(app.take_linear_open_request(), None);
@@ -4834,11 +5233,7 @@ platforms:
             assert!(app.handle_trajectory_key(key(code)).is_empty());
         }
         assert_eq!(
-            app.workspaces[0]
-                .trajectory
-                .as_ref()
-                .unwrap()
-                .to_markdown(),
+            app.workspaces[0].trajectory.as_ref().unwrap().to_markdown(),
             before
         );
         assert!(matches!(
@@ -4915,6 +5310,180 @@ platforms:
             app.bottom_info().as_deref(),
             Some("workspace test-uuid-1 · window window-test · ⚠ OpenAI key unavailable")
         );
+    }
+
+    #[test]
+    fn handoff_on_raw_surface_explains_missing_supervision() {
+        let mut app = make_app(SAMPLE_NO_SURFACE_ID);
+        let state = crate::tui::trajectory_edit::TrajectoryEditState {
+            cursor_section: 1,
+            ..Default::default()
+        };
+        app.workspaces[0].edit_state = Some(state);
+
+        app.handle_trajectory_key(key(KeyCode::Char('H')));
+
+        assert!(matches!(
+            app.workspaces[0]
+                .handoff_modal
+                .as_ref()
+                .map(|modal| &modal.view),
+            Some(crate::tui::handoff_modal::HandoffView::Unavailable(message))
+                if message == "not arcmux-supervised"
+        ));
+    }
+
+    #[test]
+    fn shifted_lowercase_h_opens_handoff_for_modern_terminal_encoding() {
+        let mut app = make_app(SAMPLE_NO_SURFACE_ID);
+        let state = crate::tui::trajectory_edit::TrajectoryEditState {
+            cursor_section: 1,
+            ..Default::default()
+        };
+        app.workspaces[0].edit_state = Some(state);
+
+        app.handle_trajectory_key(shift_key('h'));
+
+        assert!(matches!(
+            app.workspaces[0]
+                .handoff_modal
+                .as_ref()
+                .map(|modal| &modal.view),
+            Some(crate::tui::handoff_modal::HandoffView::Unavailable(message))
+                if message == "not arcmux-supervised"
+        ));
+    }
+
+    #[test]
+    fn handoff_never_infers_context_from_a_matching_surface_title() {
+        let mut app = make_app(SAMPLE_WITH_SURFACE);
+        let state = crate::tui::trajectory_edit::TrajectoryEditState {
+            cursor_section: 1,
+            ..Default::default()
+        };
+        app.workspaces[0].edit_state = Some(state);
+        app.workspaces[0].surfaces.push(SurfaceInfo {
+            title: "claude · matching title".into(),
+            ref_id: "sid-42".into(),
+            uuid: Some("11111111-1111-4111-8111-111111111111".into()),
+            pane_ref: None,
+            tty: None,
+            kind: crate::mc_data::surface_kind::SurfaceKind::Claude,
+            selected: false,
+            focused: false,
+            active: false,
+            index: None,
+            index_in_pane: None,
+            surface_type: Some("terminal".into()),
+        });
+        app.workspaces[0].local_handoff_sources.insert(
+            "sid-42".into(),
+            crate::mc_data::arcmux_mesh::LocalHandoffSource {
+                surface_uuid: "11111111-1111-4111-8111-111111111111".into(),
+                workspace_uuid: "test-uuid-1".into(),
+                locator: crate::mc_data::arcmux_mesh::RemoteSessionLocator {
+                    schema_version: 1,
+                    device_id: "ref".into(),
+                    profile_scope: "root".into(),
+                    session_id: "definitely-not-a-real-session".into(),
+                    transport_binding_id: None,
+                },
+            },
+        );
+
+        app.handle_trajectory_key(key(KeyCode::Char('H')));
+
+        assert!(matches!(
+            app.workspaces[0]
+                .handoff_modal
+                .as_ref()
+                .map(|modal| &modal.view),
+            Some(crate::tui::handoff_modal::HandoffView::Unavailable(message))
+                if message.starts_with("handoff preflight:")
+        ));
+    }
+
+    #[test]
+    fn handoff_action_context_prioritizes_human_mission_and_dedupes_goal() {
+        use crate::mc_data::trajectory::Item;
+        let items = vec![
+            Item {
+                text: "Retire exact source after context loads".into(),
+                is_checkbox: true,
+                checked: Some(false),
+                surface_id: None,
+            },
+            Item {
+                text: "[h] Ship verified handoff".into(),
+                is_checkbox: true,
+                checked: Some(false),
+                surface_id: None,
+            },
+            Item {
+                text: "Finished action".into(),
+                is_checkbox: true,
+                checked: Some(true),
+                surface_id: None,
+            },
+        ];
+        assert_eq!(
+            compose_handoff_action_context(Some("Ship verified handoff\nacross devices"), &items)
+                .unwrap(),
+            "[h] Ship verified handoff; Retire exact source after context loads"
+        );
+        assert!(compose_handoff_action_context(Some(&"x".repeat(2049)), &[]).is_err());
+        assert_eq!(
+            compose_handoff_action_context(None, &[]).unwrap_err(),
+            "handoff preflight: action context is missing"
+        );
+    }
+
+    #[test]
+    fn handoff_action_context_preserves_distinct_similar_human_rows_in_order() {
+        use crate::mc_data::trajectory::Item;
+        let items = vec![
+            Item {
+                text: "[h] Implement arcmux mesh on ref".into(),
+                is_checkbox: true,
+                checked: Some(false),
+                surface_id: None,
+            },
+            Item {
+                text: "[h] Implement arcmux mesh on labs".into(),
+                is_checkbox: true,
+                checked: Some(false),
+                surface_id: None,
+            },
+        ];
+
+        assert_eq!(
+            compose_handoff_action_context(None, &items).unwrap(),
+            "[h] Implement arcmux mesh on ref; [h] Implement arcmux mesh on labs"
+        );
+    }
+
+    #[test]
+    fn handoff_ui_requires_idle_source_with_completed_turn() {
+        let idle: crate::mc_data::mux_state::MuxSessionState = serde_json::from_str(
+            r#"{"session_id":"s-source","agent":"codex","created_at":"2026-07-15T20:00:00-07:00","updated_at":"2026-07-15T20:01:00-07:00","last_event":"turn_end","working":false,"turn_count":1,"last_turn_end_at":"2026-07-15T20:01:00-07:00"}"#,
+        )
+        .unwrap();
+        assert!(source_is_idle_after_completed_turn(&idle));
+
+        let mut working = idle.clone();
+        working.working = true;
+        assert!(!source_is_idle_after_completed_turn(&working));
+
+        let mut never_completed = idle;
+        never_completed.turn_count = 0;
+        never_completed.last_turn_end_at = None;
+        assert!(!source_is_idle_after_completed_turn(&never_completed));
+
+        let mut new_prompt = working;
+        new_prompt.working = false;
+        new_prompt.last_prompt_submit_at =
+            Some(chrono::DateTime::parse_from_rfc3339("2026-07-15T20:02:00-07:00").unwrap());
+        assert!(!source_is_idle_after_completed_turn(&new_prompt));
     }
 
     #[test]
@@ -5234,7 +5803,10 @@ workspace: test-ws
             peek.surface_uuid.as_deref(),
             Some("11111111-1111-4111-8111-111111111111")
         );
-        assert!(matches!(peek.source, crate::tui::peek_view::PeekSource::Shell));
+        assert!(matches!(
+            peek.source,
+            crate::tui::peek_view::PeekSource::Shell
+        ));
     }
 
     #[test]
@@ -5723,10 +6295,9 @@ workspace: test-ws
             .section(crate::mc_data::trajectory::SECTION_MISSION)
             .unwrap();
         assert_eq!(live_mission.items[0].checked, Some(true));
-        let restarted = crate::mc_data::trajectory::TrajectoryDoc::parse(
-            &saved_preview.unwrap().to_markdown(),
-        )
-        .unwrap();
+        let restarted =
+            crate::mc_data::trajectory::TrajectoryDoc::parse(&saved_preview.unwrap().to_markdown())
+                .unwrap();
         assert_eq!(
             restarted
                 .section(crate::mc_data::trajectory::SECTION_MISSION)
@@ -5740,11 +6311,13 @@ workspace: test-ws
         // Cancelling within the grace period leaves the same stable restart
         // state, and a subsequent real Beads write can persist normally.
         app.handle_trajectory_key(key(KeyCode::Char('x')));
-        assert!(!app.workspaces[0]
-            .edit_state
-            .as_ref()
-            .unwrap()
-            .has_pending_mission_moves());
+        assert!(
+            !app.workspaces[0]
+                .edit_state
+                .as_ref()
+                .unwrap()
+                .has_pending_mission_moves()
+        );
         let mut saved_after_cancel = None;
         app.apply_beads_refresh_snapshot_with_saver(
             snapshot(app.beads_generation, "new-2"),
@@ -6273,10 +6846,9 @@ workspace: test-ws
         app.handle_trajectory_key(key(KeyCode::Char('x')));
         let due_at = Instant::now() + std::time::Duration::from_secs(6);
 
-        let settled = app.settle_pending_mission_moves_with_saver(
-            due_at,
-            |_, _, _, _| anyhow::bail!("deterministic save failure"),
-        );
+        let settled = app.settle_pending_mission_moves_with_saver(due_at, |_, _, _, _| {
+            anyhow::bail!("deterministic save failure")
+        });
         assert!(settled.is_empty());
         let live_doc = app.workspaces[0].trajectory.as_ref().unwrap();
         assert_eq!(
@@ -6288,20 +6860,19 @@ workspace: test-ws
             Some(true)
         );
         assert!(live_doc.mission_history.is_empty());
-        assert!(app.workspaces[0]
-            .edit_state
-            .as_ref()
-            .unwrap()
-            .has_pending_mission_moves());
+        assert!(
+            app.workspaces[0]
+                .edit_state
+                .as_ref()
+                .unwrap()
+                .has_pending_mission_moves()
+        );
 
         let mut saved_actions = 0;
-        let settled = app.settle_pending_mission_moves_with_saver(
-            due_at,
-            |_, _, _, actions| {
-                saved_actions = actions.len();
-                Ok(())
-            },
-        );
+        let settled = app.settle_pending_mission_moves_with_saver(due_at, |_, _, _, actions| {
+            saved_actions = actions.len();
+            Ok(())
+        });
         assert_eq!(saved_actions, 1);
         assert_eq!(settled.len(), 1);
         let live_doc = app.workspaces[0].trajectory.as_ref().unwrap();
@@ -6313,11 +6884,13 @@ workspace: test-ws
                 .is_empty()
         );
         assert_eq!(live_doc.mission_history.len(), 1);
-        assert!(!app.workspaces[0]
-            .edit_state
-            .as_ref()
-            .unwrap()
-            .has_pending_mission_moves());
+        assert!(
+            !app.workspaces[0]
+                .edit_state
+                .as_ref()
+                .unwrap()
+                .has_pending_mission_moves()
+        );
     }
 
     #[test]
@@ -6653,14 +7226,22 @@ workspace: test-ws
     #[test]
     fn projected_task_row_distinguishes_injected_rows_from_goals() {
         // mc-injected bead rows + headers.
-        assert!(is_projected_task_row("[P0] GTR-1 open · elonco send delivers brief"));
+        assert!(is_projected_task_row(
+            "[P0] GTR-1 open · elonco send delivers brief"
+        ));
         assert!(is_projected_task_row("[P?] foo-1 in-progress · bar"));
         assert!(is_projected_task_row("repo: elonco"));
         assert!(is_projected_task_row("No active beads in gmail-triage"));
-        assert!(is_projected_task_row("Beads unavailable in foo (bd list failed)"));
+        assert!(is_projected_task_row(
+            "Beads unavailable in foo (bd list failed)"
+        ));
         assert!(is_projected_task_row("No active Linear issues"));
-        assert!(is_projected_task_row("(Linear unavailable: API request failed)"));
-        assert!(is_projected_task_row("(stale — Linear refresh unavailable)"));
+        assert!(is_projected_task_row(
+            "(Linear unavailable: API request failed)"
+        ));
+        assert!(is_projected_task_row(
+            "(stale — Linear refresh unavailable)"
+        ));
         // Local/legacy goal rows must NOT be treated as beads.
         assert!(!is_projected_task_row("[MSC-1] build the thing"));
         assert!(!is_projected_task_row("ship the feature"));

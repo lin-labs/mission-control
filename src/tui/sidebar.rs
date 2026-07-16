@@ -182,6 +182,7 @@ mod tests {
             session: None,
             surfaces: Vec::new(),
             remote_surfaces: std::collections::HashMap::new(),
+            local_handoff_sources: std::collections::HashMap::new(),
             screen_preview: None,
             screen_insights: ScreenInsights::default(),
             tool_call_count: 0,
@@ -202,6 +203,8 @@ mod tests {
             dismissal: DismissalState::default(),
             dispatch_modal: None,
             dispatch_pending_outcome: None,
+            handoff_modal: None,
+            handoff_pending_outcome: None,
             dispatch_error: None,
         }
     }

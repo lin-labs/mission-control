@@ -103,6 +103,28 @@ impl ProjectRegistry {
         self.resolve_project(project)
     }
 
+    /// Resolve the stable project identity for an exact filesystem path.
+    ///
+    /// A feature belongs to its containing platform, so a path inside an
+    /// Olympus feature returns `olympus` rather than the feature's display
+    /// label. This mirrors the project value used by arcmux handoff manifests
+    /// while still using the feature root to disambiguate the owning unit.
+    pub fn project_slug_for_path(&self, workspace_path: impl AsRef<Path>) -> Option<String> {
+        let workspace = normalize_path(workspace_path.as_ref());
+        let project = self.best_project(&workspace);
+        let feature = self.best_feature(&workspace);
+
+        if let Some(feature) = feature.filter(|feature| {
+            project
+                .as_ref()
+                .is_none_or(|project| feature.specificity >= project.specificity)
+        }) {
+            return non_empty(feature.platform.name.as_deref()).map(str::to_owned);
+        }
+
+        project.and_then(|matched| non_empty(matched.project.project.as_deref()).map(str::to_owned))
+    }
+
     /// Resolve the registered unit a workspace says it is about. Feature names
     /// are more specific than project/platform names; title evidence precedes
     /// description evidence. Ambiguous text intentionally returns
@@ -357,6 +379,7 @@ struct RegistryFile {
 struct ProjectEntry {
     project: Option<String>,
     path: Option<String>,
+    worktrees: Option<String>,
     roots: Vec<String>,
     repos: Vec<RepoBinding>,
     tracker: Option<String>,
@@ -365,9 +388,8 @@ struct ProjectEntry {
 
 impl ProjectEntry {
     fn bindings(&self) -> Vec<NormalizedBinding<'_>> {
-        if !self.repos.is_empty() {
-            return self
-                .repos
+        let mut bindings: Vec<NormalizedBinding<'_>> = if !self.repos.is_empty() {
+            self.repos
                 .iter()
                 .map(|binding| match binding {
                     RepoBinding::Path(path) => NormalizedBinding { path, roots: &[] },
@@ -376,17 +398,22 @@ impl ProjectEntry {
                         roots: &binding.roots,
                     },
                 })
-                .collect();
-        }
+                .collect()
+        } else {
+            self.path
+                .as_deref()
+                .map(|path| NormalizedBinding {
+                    path,
+                    roots: &self.roots,
+                })
+                .into_iter()
+                .collect()
+        };
 
-        self.path
-            .as_deref()
-            .map(|path| NormalizedBinding {
-                path,
-                roots: &self.roots,
-            })
-            .into_iter()
-            .collect()
+        if let Some(path) = self.worktrees.as_deref() {
+            bindings.push(NormalizedBinding { path, roots: &[] });
+        }
+        bindings
     }
 }
 
@@ -678,6 +705,74 @@ projects:
         let workspace = temp.path().join("Tools/mission-control/src");
 
         assert_eq!(registry.resolve(workspace), TaskSource::Beads);
+    }
+
+    #[test]
+    fn project_slug_uses_registered_project_for_repo_path() {
+        let (temp, registry) = registry(
+            r#"
+projects:
+  - project: mission-control
+    path: ~/Tools/mission-control
+"#,
+        );
+
+        assert_eq!(
+            registry.project_slug_for_path(temp.path().join("Tools/mission-control/src")),
+            Some("mission-control".into())
+        );
+    }
+
+    #[test]
+    fn project_slug_uses_registered_managed_worktree_root() {
+        let (temp, registry) = registry(
+            r#"
+projects:
+  - project: arcmux
+    path: ~/Tools/arcmux
+    worktrees: ~/data/Projects/arcmux/worktrees
+"#,
+        );
+
+        assert_eq!(
+            registry.project_slug_for_path(
+                temp.path()
+                    .join("data/Projects/arcmux/worktrees/verified-handoff/internal")
+            ),
+            Some("arcmux".into())
+        );
+        assert_eq!(
+            registry.resolve(
+                temp.path()
+                    .join("data/Projects/arcmux/worktrees/verified-handoff/internal")
+            ),
+            TaskSource::Beads
+        );
+    }
+
+    #[test]
+    fn project_slug_uses_owning_platform_for_feature_path() {
+        let (temp, registry) = registry(
+            r#"
+projects:
+  - project: olympus
+    path: ~/Projects/olympus
+platforms:
+  - name: olympus
+    features:
+      - name: group-grader
+        repo: ~/Projects/olympus
+        roots: [olympus/projects/minos/graders]
+"#,
+        );
+
+        assert_eq!(
+            registry.project_slug_for_path(
+                temp.path()
+                    .join("Projects/olympus/olympus/projects/minos/graders/tests")
+            ),
+            Some("olympus".into())
+        );
     }
 
     #[test]

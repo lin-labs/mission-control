@@ -32,6 +32,7 @@ pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus, detail_has_traject
         Focus::Detail if detail_has_trajectory => &[
             ("j/k", "cursor"),
             ("⏎/i", "edit/act"),
+            ("H", "handoff"),
             ("pg/wheel", "scroll"),
             ("h/esc", "back"),
             (":", "cmd"),

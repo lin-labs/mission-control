@@ -59,11 +59,8 @@ pub fn render_detail(
         // uses this to apply Modifier::DIM to the glyph + label.
         let mut hints = crate::tui::trajectory_view::RenderHints::default();
         for s in &ws.surfaces {
-            let eff = crate::mc_data::surface_kind::effective_kind(
-                &ws.workspace.uuid,
-                &s.ref_id,
-                s.kind,
-            );
+            let eff =
+                crate::mc_data::surface_kind::effective_kind(&ws.workspace.uuid, &s.ref_id, s.kind);
             if eff != s.kind && eff.is_agent() {
                 hints.dim_surface_refs.insert(s.ref_id.clone());
             }
@@ -86,7 +83,9 @@ pub fn render_detail(
         // Overlay the dispatch modal at the bottom of the detail pane when
         // active. The trajectory view above remains visible (the user is
         // dispatching from a specific row and seeing context matters).
-        if let Some(modal) = ws.dispatch_modal.as_ref() {
+        if let Some(modal) = ws.handoff_modal.as_ref() {
+            crate::tui::handoff_modal::render(f, area, modal);
+        } else if let Some(modal) = ws.dispatch_modal.as_ref() {
             crate::tui::dispatch_modal::render(f, area, modal);
         }
         return;
@@ -415,7 +414,10 @@ fn contract_lines(contract: &TurnContract, width: usize) -> Vec<Line<'static>> {
                     .fg(label_color)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(truncate_field(text, budget), Style::default().fg(text_color)),
+            Span::styled(
+                truncate_field(text, budget),
+                Style::default().fg(text_color),
+            ),
         ]));
     };
     if let Some(t) = contract.overall_goal() {

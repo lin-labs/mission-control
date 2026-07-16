@@ -208,3 +208,27 @@ fn bind_fallback_scan_picks_matching_file() {
         "expected matching file to be picked, got: {written}"
     );
 }
+
+#[test]
+fn bind_rejects_handoff_transport_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Command::new(mc_bin())
+        .env("HOME", tmp.path())
+        .env("MC_WORKSPACE_ID", "uuid-transport")
+        .args([
+            "bind",
+            "sid-transport",
+            "--session-file",
+            "/tmp/arcmux-handoff-sha256-deadbeef.md",
+        ])
+        .output()
+        .expect("run mc bind with transport snapshot");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not a canonical"));
+    assert!(
+        !tmp.path()
+            .join("data/mission-control/active/uuid-transport/surfaces/sid-transport.session-path")
+            .exists()
+    );
+}

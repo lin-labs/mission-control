@@ -30,6 +30,10 @@ pub fn run(surface_id: &str, session_file: Option<&Path>) -> Result<()> {
         },
     };
 
+    if !crate::session::file::is_canonical_history_path(&path) {
+        anyhow::bail!("session file is not a canonical conversation history");
+    }
+
     let surfaces_dir = paths::surfaces_dir(&workspace_id);
     std::fs::create_dir_all(&surfaces_dir)
         .with_context(|| format!("create surfaces dir {surfaces_dir:?}"))?;
@@ -59,8 +63,7 @@ fn fallback_scan_histories(workspace_id: &str) -> Result<PathBuf> {
         let entry = entry?;
         let path = entry.path();
 
-        // Only process .md files.
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+        if !crate::session::file::is_canonical_history_path(&path) {
             continue;
         }
 

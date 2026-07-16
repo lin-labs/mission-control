@@ -2,6 +2,22 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Arcmux publishes immutable handoff transport snapshots beside canonical
+/// conversation histories so the mesh sync can carry them. They are protocol
+/// artifacts, not conversations, and must never enter Mission Control's
+/// session discovery or trajectory inputs.
+pub const HANDOFF_TRANSPORT_HISTORY_PREFIX: &str = "arcmux-handoff-sha256-";
+
+pub fn is_canonical_history_path(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "md")
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                !name.starts_with('.') && !name.starts_with(HANDOFF_TRANSPORT_HISTORY_PREFIX)
+            })
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Frontmatter {
     #[serde(default)]
@@ -161,11 +177,7 @@ pub fn list_session_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files: Vec<_> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| {
-            p.extension().is_some_and(|ext| ext == "md")
-                && p.file_name()
-                    .is_some_and(|n| !n.to_string_lossy().starts_with('.'))
-        })
+        .filter(|p| is_canonical_history_path(p))
         .collect();
 
     files.sort_by(|a, b| {
@@ -200,10 +212,7 @@ pub fn list_recent_session_files(dir: &Path, days: i64) -> Result<Vec<PathBuf>> 
             let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
                 return false;
             };
-            if !p.extension().is_some_and(|ext| ext == "md") {
-                return false;
-            }
-            if name.starts_with('.') {
+            if !is_canonical_history_path(p) {
                 return false;
             }
             // Filename must start with a YYYY-MM-DD prefix that's >= cutoff.
@@ -219,4 +228,43 @@ pub fn list_recent_session_files(dir: &Path, days: i64) -> Result<Vec<PathBuf>> 
     // Sort by filename descending — newest first, no stat() calls needed.
     files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handoff_transport_markdown_is_not_a_canonical_history() {
+        assert!(!is_canonical_history_path(Path::new(
+            "arcmux-handoff-sha256-0123456789abcdef.md"
+        )));
+        assert!(!is_canonical_history_path(Path::new(".hidden.md")));
+        assert!(is_canonical_history_path(Path::new(
+            "2026-07-15-20-surface-handoff.md"
+        )));
+    }
+
+    #[test]
+    fn both_session_scans_exclude_handoff_transport_markdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = temp.path().join(format!(
+            "{}-canonical.md",
+            chrono::Local::now().format("%Y-%m-%d-%H")
+        ));
+        let transport = temp
+            .path()
+            .join("arcmux-handoff-sha256-0123456789abcdef.md");
+        std::fs::write(&canonical, "canonical").unwrap();
+        std::fs::write(&transport, "transport").unwrap();
+
+        assert_eq!(
+            list_session_files(temp.path()).unwrap(),
+            vec![canonical.clone()]
+        );
+        assert_eq!(
+            list_recent_session_files(temp.path(), 1).unwrap(),
+            vec![canonical]
+        );
+    }
 }

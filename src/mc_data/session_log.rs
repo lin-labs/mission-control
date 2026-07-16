@@ -215,7 +215,7 @@ fn collect_session_candidates(sessions_dir: &Path) -> Result<Vec<SessionCandidat
     let entries = std::fs::read_dir(sessions_dir)?;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+        if !crate::session::file::is_canonical_history_path(&path) {
             continue;
         }
 
@@ -434,7 +434,7 @@ pub fn resolve_session_log_for_surface_in_dir(
         .join(format!("{surface_id}.session-path"));
     if let Ok(content) = std::fs::read_to_string(&pointer) {
         let p = PathBuf::from(content.trim());
-        if p.exists() {
+        if p.exists() && crate::session::file::is_canonical_history_path(&p) {
             let text = std::fs::read_to_string(&p).unwrap_or_default();
             return Ok(Some(SessionResolution {
                 path: p,

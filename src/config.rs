@@ -64,6 +64,11 @@ pub enum Command {
     Summarize,
     /// Backfill the registry JSON for the active cmux window and exit.
     BackfillWindow,
+    /// Project persisted workspace/surface state into today's Obsidian Missions note.
+    ///
+    /// This command reads Mission Control's existing normalized registries and
+    /// does not contact cmux, so it also works during a socket outage.
+    Missions,
     /// Run the workspace state lifecycle once and exit: migrate legacy `.data/`
     /// → `active/`, then move workspaces no longer in any live cmux window from
     /// `active/` → `archived/`. Prints what changed.

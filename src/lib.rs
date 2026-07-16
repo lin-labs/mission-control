@@ -6,5 +6,6 @@ pub mod cli;
 pub mod cmux;
 pub mod llm;
 pub mod mc_data;
+pub mod session;
 /// Pure sidebar helpers (no binary-only deps); exposed for integration tests.
 pub mod sidebar_pure;

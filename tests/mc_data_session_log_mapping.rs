@@ -100,6 +100,29 @@ fn falls_back_to_uuid_when_no_host_cwd_match() {
 }
 
 #[test]
+fn handoff_transport_snapshot_is_never_a_session_candidate() {
+    with_tmp_histories(|histories| {
+        write_session(
+            histories,
+            "arcmux-handoff-sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md",
+            "mbp",
+            "/Users/blin/Tools/mission-control",
+            "TARGET-UUID",
+        );
+        let ctx = WorkspaceContext {
+            host: Some("mbp".into()),
+            cwd: Some("/Users/blin/Tools/mission-control".into()),
+        };
+
+        assert!(
+            latest_session_file_for_workspace_in_dir(histories, "TARGET-UUID", &ctx)
+                .unwrap()
+                .is_none()
+        );
+    });
+}
+
+#[test]
 fn picks_most_specific_cwd_when_multiple_match() {
     with_tmp_histories(|histories| {
         // shallow.md: cwd=/Users/blin -- NOT a descendant of ctx.cwd=/Users/blin/Projects/agents

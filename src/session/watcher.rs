@@ -20,7 +20,7 @@ impl SessionWatcher {
                     match event.kind {
                         EventKind::Modify(_) | EventKind::Create(_) => {
                             for path in event.paths {
-                                if path.extension().is_some_and(|e| e == "md") {
+                                if crate::session::file::is_canonical_history_path(&path) {
                                     let _ = tx.send(FileChanged { path });
                                 }
                             }

@@ -262,6 +262,9 @@ or `src/tui/peek_view.rs`:
 2. Manually launch `mc` and press the key — confirm the visible effect.
 3. Add a comment in `main.rs`'s match block referencing the new key so it's
    discoverable.
+4. For shifted letter bindings, cover both terminal encodings: the shifted
+   character (`H`) and the base character plus `SHIFT` (`h` + `SHIFT`). Keep
+   the unmodified base key's existing behavior intact.
 
 ### F3 — Empty trajectory.md on every workspace (the "this doesn't work" gap)
 
@@ -687,6 +690,69 @@ disconnects.
    peer URL and then restore it); do **not** stop the remote daemon, because a
    daemon stop may terminate its managed tmux session and exercises `gone`
    cleanup instead of same-locator stale → fresh recovery.
+
+### F17 — Handoff retires the wrong source or loses context
+
+**Symptom**: `H` launches a plausible target but closes the wrong local
+surface, retires before history/goal context is loaded, or silently creates two
+live agents after an ambiguous response.
+
+**Prevention checklist**:
+
+1. Offer handoff only from a highlighted `Current surfaces` row with an exact
+   same-device arcmux binding. Never infer the source from title, cwd, recency,
+   workspace status, or cmux selection. Cached mesh projection is discovery
+   only: before prepare, call argv-only
+   `arcmux surface show --surface <surface_uuid>` and require its live binding
+   to match the exact surface, workspace, local device, and source locator.
+2. Preflight the exact mux session contract, canonical history, registered
+   project, repo cwd, goal, and source agent before confirmation. Treat the
+   registry's explicit `worktrees:` root as an authoritative project binding;
+   handoff work normally starts from managed worktrees. Normalize a
+   multiline goal to one bounded line; require an idle session with a completed
+   turn, and cache its turn count plus update/end timestamps. Re-run the exact
+   preflight at confirmation and require it to match the cached plan.
+3. Pin `handoff_id`, the same valid 64-hex `manifest_digest`, source locator,
+   target device/profile, project, and exact target locator across
+   prepare/show/launch/verify/retire. The target locator's device must be the
+   selected peer.
+4. Treat target launch as successful only with `state: accepted` and a valid
+   target locator. Require `verification_state: context_loaded` plus
+   `context_loaded: true` before requesting source retirement. Immediately
+   before retirement, repeat the authoritative `surface show` proof and re-read
+   the exact local mux session; require both the binding and completed-turn
+   observation to be unchanged. A replacement preserves both sessions.
+5. Because Mission Control is an external controller, call exact immediate
+   `handoff retire <id> --timeout 10s` only after verified context load. Require
+   `retirement_state: retired`; never accept or poll `pending`. Never close a
+   cmux surface as a substitute.
+6. Preserve the source on every failure. Once launch has been invoked, never
+   offer blind retry. On an ambiguous response or timeout, preserve the known
+   handoff ID, mark target existence uncertain/duplicate-live, and show the
+   exact reconciliation command even when no target locator is available.
+7. Run fake-CLI order, malformed/mismatched identity, timeout/output-bound,
+   stale-generation, raw-surface, and verify-before-retire tests. Tier 4 must
+   move one real supervised session and confirm history/goal context on the
+   target before the source disappears. Preserve the content-addressed target
+   history snapshot, verify its hash and byte size against the manifest, and
+   require a target response whose one-time token/action came from that
+   conversation record.
+
+### F18 — Arcmux transport snapshots appear as conversations
+
+**Symptom**: a generated `arcmux-handoff-sha256-<digest>.md` file becomes the
+latest session, pollutes trajectory summaries, appears in history, or receives
+a per-surface session pointer.
+
+**Prevention checklist**:
+
+1. Treat the prefix `arcmux-handoff-sha256-` as protocol transport, not a
+   canonical conversation, in every history scan, watcher, bind path, and
+   per-surface resolver.
+2. Keep canonical `.md` histories unchanged; do not hide arbitrary dotless
+   Markdown files or rely on content sniffing.
+3. Run directory-scan, watcher/filter, explicit bind, fallback bind, and
+   per-surface pointer regressions with a transport-shaped basename.
 
 ---
 

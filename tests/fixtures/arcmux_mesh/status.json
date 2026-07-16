@@ -1,7 +1,7 @@
 {
   "enabled": true,
   "peers": [
-    {"peer_id": "devbox", "state": "connected"},
-    {"peer_id": "labs", "state": "connected"}
+    {"peer_id": "devbox", "state": "connected", "capabilities": ["handoffs.v1", "sessions.read.v1"]},
+    {"peer_id": "labs", "state": "connected", "capabilities": ["handoffs.v1"]}
   ]
 }

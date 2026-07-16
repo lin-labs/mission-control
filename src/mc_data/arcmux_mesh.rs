@@ -31,15 +31,12 @@ pub struct RemoteSessionLocator {
 }
 
 impl RemoteSessionLocator {
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         self.schema_version == 1
             && valid_id(&self.device_id)
             && valid_profile_scope(&self.profile_scope)
             && valid_id(&self.session_id)
-            && self
-                .transport_binding_id
-                .as_deref()
-                .is_none_or(valid_id)
+            && self.transport_binding_id.as_deref().is_none_or(valid_id)
     }
 
     fn identity(&self) -> RemoteSessionIdentity {
@@ -149,8 +146,9 @@ impl RemoteSurfaceState {
         match self.state_label() {
             // arcmux's native `idle` means the agent is ready after a turn,
             // which is the same human-facing state as waiting for input.
-            "idle" | "waiting" | "needs_input" | "blocked" | "stuck" | "escalated"
-            | "failed" => RemoteActivity::Actionable,
+            "idle" | "waiting" | "needs_input" | "blocked" | "stuck" | "escalated" | "failed" => {
+                RemoteActivity::Actionable
+            }
             "working" | "starting" | "handshaking" => RemoteActivity::Working,
             _ => RemoteActivity::Idle,
         }
@@ -168,6 +166,14 @@ pub struct RemoteMeshSnapshot {
     bindings: HashMap<String, SurfaceBinding>,
     sessions: HashMap<RemoteSessionIdentity, SessionProjection>,
     peer_states: HashMap<String, PeerConnectionState>,
+    peer_capabilities: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalHandoffSource {
+    pub surface_uuid: String,
+    pub workspace_uuid: String,
+    pub locator: RemoteSessionLocator,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +201,13 @@ impl RemoteMeshSnapshot {
                 continue;
             };
             if !binding.workspace_id.eq_ignore_ascii_case(workspace_uuid) {
+                continue;
+            }
+            // A same-device binding describes a local arcmux source eligible
+            // for handoff, not a remote surface projection. Keep the two
+            // meanings disjoint so adding handoff metadata cannot relabel a
+            // local surface as remote.
+            if binding.locator.device_id == binding.local_device_id {
                 continue;
             }
             let projection = self.sessions.get(&binding.locator.identity());
@@ -229,6 +242,56 @@ impl RemoteMeshSnapshot {
                     launch_cwd: metadata.and_then(|m| m.launch_cwd.clone()),
                     current_work: metadata.and_then(SessionMetadata::safe_current_work),
                     freshness,
+                },
+            );
+        }
+        resolved
+    }
+
+    /// Connected peers that explicitly advertise the handoff protocol. The
+    /// result is deterministic and never includes connecting/offline peers.
+    pub fn connected_handoff_peers(&self) -> Vec<String> {
+        let mut peers: Vec<String> = self
+            .peer_states
+            .iter()
+            .filter(|(peer, state)| {
+                **state == PeerConnectionState::Connected
+                    && self.peer_capabilities.get(*peer).is_some_and(|caps| {
+                        caps.iter().any(|capability| capability == "handoffs.v1")
+                    })
+            })
+            .map(|(peer, _)| peer.clone())
+            .collect();
+        peers.sort();
+        peers
+    }
+
+    /// Resolve only exact same-device arcmux bindings for one workspace. No
+    /// title, cwd, session-name, or recency inference is permitted.
+    pub fn resolve_local_handoff_sources(
+        &self,
+        workspace_uuid: &str,
+        surfaces: &[SurfaceInfo],
+    ) -> HashMap<String, LocalHandoffSource> {
+        let mut resolved = HashMap::new();
+        for surface in surfaces {
+            let Some(surface_uuid) = surface.uuid.as_deref() else {
+                continue;
+            };
+            let Some(binding) = self.bindings.get(&surface_uuid.to_ascii_lowercase()) else {
+                continue;
+            };
+            if !binding.workspace_id.eq_ignore_ascii_case(workspace_uuid)
+                || binding.locator.device_id != binding.local_device_id
+            {
+                continue;
+            }
+            resolved.insert(
+                surface.ref_id.clone(),
+                LocalHandoffSource {
+                    surface_uuid: binding.surface_id.clone(),
+                    workspace_uuid: binding.workspace_id.clone(),
+                    locator: binding.locator.clone(),
                 },
             );
         }
@@ -390,13 +453,22 @@ fn decode_snapshot(status: &Value, sessions: &Value, bindings: &Value) -> Decode
         .flatten()
     {
         match serde_json::from_value::<PeerStatus>(value.clone()) {
-            Ok(peer) if valid_id(&peer.peer_id) && valid_peer_state(&peer.state) => {
+            Ok(peer)
+                if valid_id(&peer.peer_id)
+                    && valid_peer_state(&peer.state)
+                    && peer
+                        .capabilities
+                        .iter()
+                        .all(|capability| safe_token(capability, 64).is_some()) =>
+            {
                 let state = match peer.state.as_str() {
                     "connected" => PeerConnectionState::Connected,
                     "connecting" => PeerConnectionState::Connecting,
                     "disconnected" | "error" => PeerConnectionState::Offline,
                     _ => unreachable!("peer state was validated"),
                 };
+                out.peer_capabilities
+                    .insert(peer.peer_id.clone(), peer.capabilities);
                 out.peer_states.insert(peer.peer_id, state);
             }
             _ => skipped += 1,
@@ -454,6 +526,8 @@ fn decode_snapshot(status: &Value, sessions: &Value, bindings: &Value) -> Decode
 struct PeerStatus {
     peer_id: String,
     state: String,
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -630,13 +704,9 @@ fn valid_profile_scope(value: &str) -> bool {
         && bytes.len() <= 63
         && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
         && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-        && bytes
-            .iter()
-            .all(|byte| {
-                byte.is_ascii_lowercase()
-                    || byte.is_ascii_digit()
-                    || matches!(byte, b'_' | b'-')
-            })
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
 }
 
 fn valid_peer_state(value: &str) -> bool {
@@ -715,6 +785,89 @@ mod tests {
             state.current_work.as_deref(),
             Some("Wire native remote surfaces into Mission Control")
         );
+    }
+
+    #[test]
+    fn handoff_peers_are_connected_capable_and_sorted() {
+        let status = serde_json::json!({"peers": [
+            {"peer_id":"zeta","state":"connected","capabilities":["handoffs.v1"]},
+            {"peer_id":"alpha","state":"connected","capabilities":["sessions.read.v1","handoffs.v1"]},
+            {"peer_id":"offline","state":"disconnected","capabilities":["handoffs.v1"]},
+            {"peer_id":"legacy","state":"connected","capabilities":["sessions.read.v1"]}
+        ]});
+        let decoded = decode_snapshot(
+            &status,
+            &serde_json::json!({"sessions": []}),
+            &serde_json::json!({"surface_bindings": []}),
+        );
+        assert_eq!(
+            decoded.snapshot.connected_handoff_peers(),
+            vec!["alpha".to_string(), "zeta".to_string()]
+        );
+    }
+
+    #[test]
+    fn same_device_binding_is_handoff_source_not_remote_surface() {
+        let bindings = serde_json::json!({"surface_bindings": [{
+            "schema_version": 1,
+            "binding_id": "binding-local",
+            "local_device_id": "ref",
+            "mux": "cmux",
+            "surface_id": "11111111-1111-4111-8111-111111111111",
+            "workspace_id": "22222222-2222-4222-8222-222222222222",
+            "locator": {
+                "schema_version": 1,
+                "device_id": "ref",
+                "profile_scope": "root",
+                "session_id": "s-local"
+            },
+            "source": "arcmux",
+            "created_at": "2026-07-15T12:00:00Z",
+            "updated_at": "2026-07-15T12:00:00Z"
+        }]});
+        let decoded = decode_snapshot(
+            &fixture("status"),
+            &serde_json::json!({"sessions": []}),
+            &bindings,
+        );
+        let surface = surface(
+            "11111111-1111-4111-8111-111111111111",
+            "surface:14",
+            "title must not matter",
+        );
+        assert!(
+            decoded
+                .snapshot
+                .resolve_workspace(
+                    "22222222-2222-4222-8222-222222222222",
+                    std::slice::from_ref(&surface),
+                )
+                .is_empty()
+        );
+        let sources = decoded
+            .snapshot
+            .resolve_local_handoff_sources("22222222-2222-4222-8222-222222222222", &[surface]);
+        let source = sources.get("surface:14").unwrap();
+        assert_eq!(source.locator.device_id, "ref");
+        assert_eq!(source.locator.session_id, "s-local");
+    }
+
+    #[test]
+    fn local_handoff_source_never_infers_from_title_or_remote_binding() {
+        let decoded = decode_snapshot(
+            &fixture("status"),
+            &fixture("sessions"),
+            &fixture("bindings"),
+        );
+        let sources = decoded.snapshot.resolve_local_handoff_sources(
+            "22222222-2222-4222-8222-222222222222",
+            &[surface(
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "surface:99",
+                "ref root s-local",
+            )],
+        );
+        assert!(sources.is_empty());
     }
 
     #[test]
@@ -886,11 +1039,7 @@ mod tests {
         let disconnected = serde_json::json!({
             "peers":[{"peer_id":"devbox","state":"disconnected"}]
         });
-        let decoded = decode_snapshot(
-            &disconnected,
-            &fixture("sessions"),
-            &fixture("bindings"),
-        );
+        let decoded = decode_snapshot(&disconnected, &fixture("sessions"), &fixture("bindings"));
         assert_eq!(
             decoded
                 .snapshot
@@ -902,11 +1051,7 @@ mod tests {
         let connecting = serde_json::json!({
             "peers":[{"peer_id":"devbox","state":"connecting"}]
         });
-        let decoded = decode_snapshot(
-            &connecting,
-            &fixture("sessions"),
-            &fixture("bindings"),
-        );
+        let decoded = decode_snapshot(&connecting, &fixture("sessions"), &fixture("bindings"));
         assert_eq!(
             decoded
                 .snapshot

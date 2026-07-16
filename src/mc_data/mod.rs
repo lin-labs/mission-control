@@ -1,3 +1,4 @@
+pub mod arcmux_handoff;
 pub mod arcmux_mesh;
 pub mod beads;
 pub mod cmux_sessions;
@@ -7,11 +8,12 @@ pub mod frame_merge;
 pub mod goals_json;
 pub mod inputs;
 pub mod linear;
+pub mod missions;
 pub mod mux_state;
 pub mod overall_cache;
 pub mod paths;
-pub mod prompts;
 pub mod project_registry;
+pub mod prompts;
 pub mod remote_intent;
 pub mod session_log;
 pub mod snapshots;

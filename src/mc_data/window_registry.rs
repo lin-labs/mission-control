@@ -1,7 +1,7 @@
 use crate::cmux::client::{SurfaceInfo, Workspace};
 use crate::mc_data::session_log::{ConversationIntent, Frontmatter};
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,7 +22,7 @@ pub struct RegistryBuildOutput {
     pub repo_by_surface_by_ws_id: HashMap<String, HashMap<String, PathBuf>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowRegistry {
     pub schema_version: u32,
     pub window_id: String,
@@ -34,7 +34,7 @@ pub struct WindowRegistry {
     pub surfaces: Vec<SurfaceRegistration>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceRegistration {
     pub schema_version: u32,
     pub window_id: String,
@@ -47,7 +47,7 @@ pub struct WorkspaceRegistration {
     pub surface_refs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SurfaceRegistration {
     pub schema_version: u32,
     pub window_id: String,

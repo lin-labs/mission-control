@@ -1,9 +1,10 @@
 pub mod app;
 pub mod command;
 pub mod detail;
+pub mod dispatch_modal;
 pub mod footer;
+pub mod handoff_modal;
 pub mod peek_view;
 pub mod sidebar;
 pub mod trajectory_edit;
 pub mod trajectory_view;
-pub mod dispatch_modal;
