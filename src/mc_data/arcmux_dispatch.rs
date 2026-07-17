@@ -11,7 +11,7 @@ use crate::cmux::client::CmuxClient;
 use crate::mc_data::arcmux_mesh::RemoteSessionLocator;
 use crate::mc_data::surface_kind::SurfaceKind;
 use serde::Deserialize;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -340,17 +340,14 @@ async fn execute_dispatch(
 
         let created = runner
             .cli(
-                vec![
-                    "create".into(),
-                    "--agent".into(),
-                    agent.into(),
-                    "--name".into(),
-                    session_name.clone().into(),
-                    "--cwd".into(),
-                    request.cwd.as_os_str().to_owned(),
-                    "--owner".into(),
-                    owner.clone().into(),
-                ],
+                create_args(
+                    request,
+                    agent,
+                    &session_name,
+                    &owner,
+                    &uuid,
+                    cmux.socket_path(),
+                ),
                 None,
             )
             .await
@@ -591,6 +588,44 @@ fn validate_request(request: &NewSurfaceDispatchRequest) -> Result<(), String> {
     Ok(())
 }
 
+fn create_args(
+    request: &NewSurfaceDispatchRequest,
+    agent: &str,
+    session_name: &str,
+    owner: &str,
+    surface_uuid: &str,
+    cmux_socket_path: &Path,
+) -> Vec<OsString> {
+    // cmux's hooks key their registry by these exact IDs. The documented
+    // CMUX_SOCKET_PATH connection override is also forwarded so a configured
+    // non-default cmux instance receives the hook events; no other cmux env is
+    // inferred. Values remain individual argv entries and never enter a shell.
+    vec![
+        "create".into(),
+        "--agent".into(),
+        agent.into(),
+        "--name".into(),
+        session_name.into(),
+        "--cwd".into(),
+        request.cwd.as_os_str().to_owned(),
+        "--owner".into(),
+        owner.into(),
+        "--env".into(),
+        env_assignment("CMUX_SURFACE_ID", OsStr::new(surface_uuid)),
+        "--env".into(),
+        env_assignment("CMUX_WORKSPACE_ID", OsStr::new(&request.workspace_uuid)),
+        "--env".into(),
+        env_assignment("CMUX_SOCKET_PATH", cmux_socket_path.as_os_str()),
+    ]
+}
+
+fn env_assignment(key: &str, value: &OsStr) -> OsString {
+    let mut assignment = OsString::from(key);
+    assignment.push("=");
+    assignment.push(value);
+    assignment
+}
+
 fn agent_name(kind: SurfaceKind) -> Option<&'static str> {
     match kind {
         SurfaceKind::Claude => Some("claude"),
@@ -810,6 +845,12 @@ fi
         let temp = tempfile::tempdir().unwrap();
         let log = temp.path().join("calls");
         let goal = temp.path().join("goal");
+        let injected = temp.path().join("must-not-exist");
+        let user_goal = format!(
+            "Keep this literal: $(touch '{}'); touch '{}'\nsecond line",
+            injected.display(),
+            injected.display()
+        );
         let cmux_bin = temp.path().join("cmux");
         let cli_bin = temp.path().join("arcmux-cli");
         let arcmux_bin = temp.path().join("arcmux");
@@ -821,8 +862,10 @@ fi
             temp.path().join("cmux.sock"),
         );
         let (tx, mut rx) = mpsc::channel(1);
+        let mut dispatch_request = request(temp.path().to_path_buf());
+        dispatch_request.goal_text = user_goal.clone();
         run_new_surface_dispatch_with_runner(
-            request(temp.path().to_path_buf()),
+            dispatch_request,
             cmux,
             DispatchCommandRunner::new(arcmux_bin, cli_bin, Duration::from_secs(2)),
             tx,
@@ -833,12 +876,24 @@ fi
         let success = update.result.unwrap();
         assert_eq!(success.surface_ref, "surface:42");
         assert_eq!(success.locator.session_id, "s-created");
-        assert_eq!(std::fs::read_to_string(goal).unwrap(), update.goal_text);
+        assert_eq!(std::fs::read_to_string(goal).unwrap(), user_goal);
+        assert_eq!(update.goal_text, user_goal);
+        assert!(
+            !injected.exists(),
+            "goal text must never be shell-evaluated"
+        );
         let calls = std::fs::read_to_string(log).unwrap();
         let lines: Vec<_> = calls.lines().collect();
         assert!(lines[0].starts_with("cmux:new-surface --type terminal --workspace workspace:9"));
         assert!(lines[1].starts_with("cmux:tree --all --json --id-format both"));
-        assert!(lines[2].starts_with("cli:create --agent codex"));
+        assert_eq!(
+            lines[2],
+            format!(
+                "cli:create --agent codex --name mc-codex-222222222222-surface-42 --cwd {} --owner mission-control:22222222-2222-4222-8222-222222222222:surface:42 --env CMUX_SURFACE_ID=11111111-1111-4111-8111-111111111111 --env CMUX_WORKSPACE_ID=22222222-2222-4222-8222-222222222222 --env CMUX_SOCKET_PATH={}",
+                temp.path().display(),
+                temp.path().join("cmux.sock").display()
+            )
+        );
         assert!(lines[3].starts_with("cli:list --owner mission-control:"));
         assert_eq!(lines[4], "arcmux:info --json");
         assert!(lines[5].contains("surface bind ref root s-created"));
@@ -1222,6 +1277,42 @@ time.sleep(5)
             request.kind = invalid;
             assert!(validate_request(&request).is_err());
         }
+    }
+
+    #[test]
+    fn create_env_is_exact_argv_and_excludes_goal_text() {
+        let mut request = request(PathBuf::from("/tmp/project;$(touch pwned)"));
+        request.goal_text = "$(touch should-never-be-an-argument)".to_string();
+        let args = create_args(
+            &request,
+            "codex",
+            "mc-codex-session",
+            "mission-control:owner",
+            "11111111-1111-4111-8111-111111111111",
+            Path::new("/tmp/cmux socket;literal.sock"),
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("create"),
+                OsString::from("--agent"),
+                OsString::from("codex"),
+                OsString::from("--name"),
+                OsString::from("mc-codex-session"),
+                OsString::from("--cwd"),
+                OsString::from("/tmp/project;$(touch pwned)"),
+                OsString::from("--owner"),
+                OsString::from("mission-control:owner"),
+                OsString::from("--env"),
+                OsString::from("CMUX_SURFACE_ID=11111111-1111-4111-8111-111111111111"),
+                OsString::from("--env"),
+                OsString::from("CMUX_WORKSPACE_ID=22222222-2222-4222-8222-222222222222"),
+                OsString::from("--env"),
+                OsString::from("CMUX_SOCKET_PATH=/tmp/cmux socket;literal.sock"),
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == OsStr::new(&request.goal_text)));
     }
 
     #[test]

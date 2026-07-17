@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -210,6 +210,10 @@ impl CmuxClient {
         let mut cmd = Command::new(&self.bin);
         cmd.env("CMUX_SOCKET_PATH", &self.socket_path);
         cmd
+    }
+
+    pub(crate) fn socket_path(&self) -> &Path {
+        &self.socket_path
     }
 
     /// Run one identity-sensitive cmux transaction command with bounded time,
