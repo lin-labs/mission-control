@@ -13,6 +13,9 @@ const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 /// Default xAI model. Their lineup shifts; this name is the current
 /// "small + fast" tier (verified live 2026-05-25 against
 /// https://api.x.ai/v1/models).
+/// Beam is in-house and OpenAI-compatible (measured 2026-11-03).
+pub const BEAM_DEFAULT_MODEL: &str = "Beam-1.0-501B-A23B";
+pub const BEAM_DEFAULT_BASE_URL: &str = "https://api.reflection.ai/openai/v1";
 const DEFAULT_MODEL: &str = "grok-4-fast-non-reasoning";
 
 #[derive(Clone)]
@@ -23,8 +26,18 @@ pub struct ShortTextClient {
 
 #[derive(Clone)]
 enum Transport {
-    Xai { api_key: String },
-    Openai { api_key: String, model: String },
+    Xai {
+        api_key: String,
+    },
+    Openai {
+        api_key: String,
+        model: String,
+    },
+    Beam {
+        api_key: String,
+        model: String,
+        base_url: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -91,14 +104,29 @@ impl ShortTextClient {
         }
     }
 
+    pub fn beam(api_key: String, model: String, base_url: String) -> Self {
+        Self {
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .unwrap_or_default(),
+            transport: Transport::Beam {
+                api_key,
+                model,
+                base_url,
+            },
+        }
+    }
+
     pub fn provider_name(&self) -> &'static str {
         match self.transport {
             Transport::Xai { .. } => "xAI",
             Transport::Openai { .. } => "OpenAI",
+            Transport::Beam { .. } => "Beam",
         }
     }
 
-    async fn complete(&self, user_prompt: &str, max_tokens: u32) -> Result<String> {
+    pub async fn complete(&self, user_prompt: &str, max_tokens: u32) -> Result<String> {
         match &self.transport {
             Transport::Xai { api_key } => {
                 let body = XaiRequest {
@@ -158,7 +186,58 @@ impl ShortTextClient {
                 extract_openai_output_text(parsed)
                     .ok_or_else(|| anyhow!("OpenAI returned no output_text"))
             }
+            Transport::Beam {
+                api_key,
+                model,
+                base_url,
+            } => {
+                let resp = self
+                    .http
+                    .post(format!(
+                        "{}/chat/completions",
+                        base_url.trim_end_matches('/')
+                    ))
+                    .bearer_auth(api_key)
+                    .json(&beam_body(model, user_prompt, max_tokens))
+                    .send()
+                    .await
+                    .context("Beam request failed")?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("Beam HTTP {}: {}", status, text);
+                }
+                let parsed: serde_json::Value = resp.json().await.context("Beam parse")?;
+                parse_chat_completion(&parsed)
+            }
         }
+    }
+}
+
+/// Beam rejects `chat_template_kwargs` (HTTP 400), so reasoning is set via
+/// `reasoning_effort` only.
+fn beam_body(model: &str, prompt: &str, max_tokens: u32) -> serde_json::Value {
+    json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "reasoning_effort": "low",
+        "temperature": 0,
+        "max_tokens": max_tokens,
+    })
+}
+
+/// Answer is `choices[0].message.content`; reasoning lives in
+/// `reasoning_content` and can exhaust `max_tokens`, leaving content empty.
+fn parse_chat_completion(v: &serde_json::Value) -> Result<String> {
+    let choice = v["choices"]
+        .get(0)
+        .ok_or_else(|| anyhow!("Beam returned no choices"))?;
+    match choice["message"]["content"].as_str().map(str::trim) {
+        Some(text) if !text.is_empty() => Ok(text.to_string()),
+        _ if choice["finish_reason"] == "length" => {
+            anyhow::bail!("Beam used its token budget on reasoning; raise max_tokens")
+        }
+        _ => anyhow::bail!("Beam returned empty content"),
     }
 }
 
@@ -427,6 +506,33 @@ mod tests {
             ShortTextClient::openai("x".into(), "gpt-5.4-mini".into()).provider_name(),
             "OpenAI"
         );
+        assert_eq!(
+            ShortTextClient::beam("x".into(), "m".into(), "http://h/v1".into()).provider_name(),
+            "Beam"
+        );
+    }
+
+    #[test]
+    fn beam_body_sets_reasoning_low() {
+        let body = beam_body("m", "hi", 7);
+        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(body["temperature"], 0);
+        assert_eq!(body["max_tokens"], 7);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn chat_completion_returns_content() {
+        let v = json!({"choices":[{"finish_reason":"stop","message":{"content":"OK","reasoning_content":"..."}}]});
+        assert_eq!(parse_chat_completion(&v).unwrap(), "OK");
+    }
+
+    #[test]
+    fn chat_completion_empty_on_length_is_error() {
+        let v = json!({"choices":[{"finish_reason":"length","message":{"content":null}}]});
+        let error = parse_chat_completion(&v).unwrap_err().to_string();
+        assert!(error.contains("Beam used its token budget on reasoning"));
     }
 
     #[test]
@@ -513,5 +619,24 @@ mod tests {
             deterministic_prefix("mc-tui", std::slice::from_ref(&natural)),
             expected
         );
+    }
+}
+
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "live Beam call; needs REFLECTION_API_KEY in ~/.zshenv"]
+    async fn beam_live_smoke() {
+        let key = crate::llm::openai::resolve_reflection_api_key(None)
+            .await
+            .api_key
+            .expect("REFLECTION_API_KEY");
+        let client =
+            ShortTextClient::beam(key, BEAM_DEFAULT_MODEL.into(), BEAM_DEFAULT_BASE_URL.into());
+        let out = client.complete("Answer only: OK", 2000).await.unwrap();
+        println!("beam reply: {out:?}");
+        assert!(out.contains("OK"));
     }
 }

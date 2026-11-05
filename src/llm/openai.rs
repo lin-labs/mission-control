@@ -13,6 +13,7 @@ const GCP_SECRET: &str = "OPENAI_API_KEY_AGENTIC";
 const GCP_SECRET_TIMEOUT: Duration = Duration::from_secs(8);
 const ZSHENV_KEY_TIMEOUT: Duration = Duration::from_secs(2);
 const ZSHENV_KEY_SCRIPT: &str = r#"print -rn -- "${OPENAI_API_KEY-}""#;
+const REFLECTION_KEY_SCRIPT: &str = r#"print -rn -- "${REFLECTION_API_KEY-}""#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiKeyResolution {
@@ -42,6 +43,29 @@ pub async fn resolve_api_key(explicit: Option<String>) -> ApiKeyResolution {
         GCP_SECRET_TIMEOUT,
     )
     .await
+}
+
+/// Resolve the Beam key: explicit value, then ~/.zshenv. No gcloud fallback.
+pub async fn resolve_reflection_api_key(explicit: Option<String>) -> ApiKeyResolution {
+    if let Some(key) = normalize_key(explicit) {
+        return resolved(key);
+    }
+    match key_from_command(
+        "/bin/zsh",
+        &["-c", REFLECTION_KEY_SCRIPT],
+        ZSHENV_KEY_TIMEOUT,
+    )
+    .await
+    {
+        Some(key) => resolved(key),
+        None => ApiKeyResolution {
+            api_key: None,
+            warning: Some(
+                "Beam key unavailable: set REFLECTION_API_KEY in ~/.zshenv and reload mc"
+                    .to_string(),
+            ),
+        },
+    }
 }
 
 async fn resolve_api_key_with_sources(

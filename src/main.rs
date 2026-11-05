@@ -164,7 +164,28 @@ async fn resolve_short_text_runtime(config: &mut Config) -> ShortTextRuntime {
         }
     }
 
+    let beam_key = if local.short_text_provider == config::ShortTextProvider::Beam {
+        let resolution = crate::llm::openai::resolve_reflection_api_key(None).await;
+        if let Some(key_warning) = resolution.warning {
+            append_warning(&mut warning, format!("{key_warning}; using xAI"));
+        }
+        resolution.api_key
+    } else {
+        None
+    };
+
     let client = match local.short_text_provider {
+        config::ShortTextProvider::Beam => match beam_key {
+            Some(key) => Some(crate::llm::short_text::ShortTextClient::beam(
+                key,
+                local.beam_model.clone(),
+                local.beam_base_url.clone(),
+            )),
+            None => config
+                .xai_api_key
+                .as_ref()
+                .map(|key| crate::llm::short_text::ShortTextClient::xai(key.clone())),
+        },
         config::ShortTextProvider::Xai => config
             .xai_api_key
             .as_ref()

@@ -163,14 +163,28 @@ pub enum ShortTextProvider {
     #[default]
     Xai,
     Openai,
+    Beam,
 }
 
 /// Machine-local settings read from `~/data/mission-control/config.json`.
 /// Missing fields intentionally preserve historical behavior.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct LocalConfig {
     pub short_text_provider: ShortTextProvider,
+    pub beam_model: String,
+    pub beam_base_url: String,
+}
+
+impl Default for LocalConfig {
+    fn default() -> Self {
+        use crate::llm::short_text::{BEAM_DEFAULT_BASE_URL, BEAM_DEFAULT_MODEL};
+        Self {
+            short_text_provider: ShortTextProvider::default(),
+            beam_model: BEAM_DEFAULT_MODEL.into(),
+            beam_base_url: BEAM_DEFAULT_BASE_URL.into(),
+        }
+    }
 }
 
 impl LocalConfig {
@@ -245,6 +259,17 @@ mod tests {
         std::fs::write(&path, r#"{"short_text_provider":"openai"}"#).unwrap();
         let config = LocalConfig::load_from(&path).unwrap();
         assert_eq!(config.short_text_provider, ShortTextProvider::Openai);
+    }
+
+    #[test]
+    fn local_config_selects_beam() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, r#"{"short_text_provider":"beam"}"#).unwrap();
+        let config = LocalConfig::load_from(&path).unwrap();
+        assert_eq!(config.short_text_provider, ShortTextProvider::Beam);
+        assert_eq!(config.beam_model, "Beam-1.0-501B-A23B");
+        assert_eq!(config.beam_base_url, "https://api.reflection.ai/openai/v1");
     }
 
     #[test]
