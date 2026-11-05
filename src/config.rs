@@ -82,6 +82,25 @@ pub enum Command {
         /// cmux surface UUID (the `id` from `cmux tree --id-format both`).
         surface_uuid: String,
     },
+    /// Watch agent transcripts and keep per-session update records.
+    ///
+    /// Every `--interval` seconds, reads the new bytes of grown Claude/Codex
+    /// transcripts, applies them to per-session records (Beam routes and
+    /// classifies), joins sessions to cmux surfaces, and writes a heartbeat.
+    Watch {
+        /// Seconds between ticks.
+        #[arg(long, default_value_t = 15)]
+        interval: u64,
+        /// Run one tick and exit.
+        #[arg(long)]
+        once: bool,
+        /// Never refine intent/latest (as on the first run).
+        #[arg(long)]
+        seed_only: bool,
+        /// Output directory (default: ~/data/mission-control/updates/local).
+        #[arg(long, hide = true)]
+        updates_dir: Option<PathBuf>,
+    },
     /// Probe the remote screen-grab + frame-merge loop against one surface.
     ///
     /// Repeatedly captures a surface, merges overlapping frames, and prints the

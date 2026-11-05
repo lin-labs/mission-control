@@ -129,6 +129,10 @@ fn mc_help_shows_subcommands() {
         combined.contains("backfill-window"),
         "help should mention `backfill-window` subcommand. stdout={stdout} stderr={stderr}"
     );
+    assert!(
+        combined.contains("watch"),
+        "help should mention `watch` subcommand. stdout={stdout} stderr={stderr}"
+    );
 }
 
 #[test]

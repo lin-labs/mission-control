@@ -1,12 +1,8 @@
-mod cli;
-mod cmux;
 mod commands;
 mod config;
-mod llm;
-mod mc_data;
-mod session;
-mod sidebar_pure;
 mod tui;
+
+use mission_control::{cli, cmux, llm, mc_data, session, sidebar_pure};
 
 use crate::cmux::client::CmuxClient;
 use crate::cmux::events;
@@ -342,7 +338,46 @@ async fn main() -> Result<()> {
             run_overall_probe(&cli.tui, &surface_uuid).await
         }
         Some(config::Command::ArchiveClosed) => run_archive_closed(&cli.tui).await,
+        Some(config::Command::Watch {
+            interval,
+            once,
+            seed_only,
+            updates_dir,
+        }) => run_watch(&cli.tui, interval, once, seed_only, updates_dir).await,
     }
+}
+
+/// Transcript watcher; Beam is its only judge. Without one it runs seed-only.
+async fn run_watch(
+    config: &Config,
+    interval: u64,
+    once: bool,
+    seed_only: bool,
+    updates_dir: Option<PathBuf>,
+) -> Result<()> {
+    use crate::mc_data::updates::{judge::Judge, record, watch};
+    let mut config = config.clone();
+    let runtime = resolve_short_text_runtime(&mut config).await;
+    let judge = runtime
+        .client
+        .filter(|c| c.provider_name() == "Beam")
+        .map(|c| Arc::new(c) as Arc<dyn Judge>);
+    if judge.is_none() {
+        eprintln!(
+            "watch: no Beam client ({}); running seed-only",
+            runtime
+                .warning
+                .as_deref()
+                .unwrap_or("short_text_provider is not beam")
+        );
+    }
+    let opts = watch::WatchOpts {
+        interval,
+        once,
+        seed_only: seed_only || judge.is_none(),
+        updates_dir: updates_dir.unwrap_or_else(record::updates_dir),
+    };
+    watch::run(judge, opts).await
 }
 
 fn run_missions_cli() -> Result<()> {
