@@ -183,3 +183,12 @@ fn invalid_session_id_rejected() {
         assert!(load(dir.path(), bad).is_none());
     }
 }
+
+#[test]
+fn oversize_without_segments_still_saves() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut f = file(vec![]);
+    f.transcript = "/t/".repeat(17_000).into();
+    save(dir.path(), &f).unwrap();
+    assert_eq!(load(dir.path(), "abc"), Some(f));
+}

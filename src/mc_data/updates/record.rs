@@ -131,20 +131,23 @@ fn trimmed_bytes(file: &SessionFile) -> io::Result<Vec<u8>> {
             .filter_map(|(i, s)| s.user_inputs.first().map(|u| (u.at, i)))
             .min();
         let Some((_, i)) = oldest else {
-            drop_segment(&mut f.segments);
-            len = encode_len(&f)?;
-            if f.segments.len() == 1 && len > MAX_FILE_BYTES {
-                // Last resort for the sole survivor: shed oldest artifacts, then turns.
-                let seg = &mut f.segments[0];
-                if !seg.artifacts.is_empty() {
-                    seg.artifacts.remove(0);
-                } else if !seg.agent_turns.is_empty() {
-                    seg.agent_turns.remove(0);
-                } else {
-                    return encode(&f);
+            // Each branch shrinks the file or returns, so the loop terminates.
+            match f.segments.len() {
+                0 => return encode(&f), // oversize from top-level fields: write as is
+                1 => {
+                    // Sole survivor: shed oldest artifacts, then turns.
+                    let seg = &mut f.segments[0];
+                    if !seg.artifacts.is_empty() {
+                        seg.artifacts.remove(0);
+                    } else if !seg.agent_turns.is_empty() {
+                        seg.agent_turns.remove(0);
+                    } else {
+                        return encode(&f);
+                    }
                 }
-                len = encode_len(&f)?;
+                _ => drop_segment(&mut f.segments),
             }
+            len = encode_len(&f)?;
             continue;
         };
         let dropped = f.segments[i].user_inputs.remove(0);
