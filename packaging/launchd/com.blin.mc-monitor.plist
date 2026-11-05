@@ -21,6 +21,15 @@
     <key>Nice</key>
     <integer>10</integer>
 
+    <!-- The watcher shells out to tmux; a LaunchAgent gets a bare PATH. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/blin</string>
+        <key>PATH</key>
+        <string>/Users/blin/.local/bin:/opt/homebrew/bin:/opt/homebrew/opt/python@3.12/libexec/bin:/Applications/cmux.app/Contents/Resources/bin:/Users/blin/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
     <key>StandardOutPath</key>
     <string>/Users/blin/Library/Logs/mc-monitor.log</string>
     <key>StandardErrorPath</key>

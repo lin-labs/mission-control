@@ -69,14 +69,14 @@ The resolved key is never persisted.
 ## Updates watcher (mc-monitor)
 
 `mission-control watch` keeps the updates view current in the background.
-Devbox runs it as a systemd user unit; Mac as a launchd agent:
+Run these from the repo root. Devbox runs it as a systemd user unit; Mac as a launchd agent:
 
 ```bash
 cp packaging/systemd/mc-monitor.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now mc-monitor
 ```
 
 ```bash
-cp packaging/launchd/com.blin.mc-monitor.plist ~/Library/LaunchAgents/ && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.blin.mc-monitor.plist
+cp packaging/launchd/com.blin.mc-monitor.plist ~/Library/LaunchAgents/ && launchctl bootout gui/$(id -u)/com.blin.mc-monitor 2>/dev/null; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.blin.mc-monitor.plist
 ```
 
 It needs `{"short_text_provider":"beam"}` in `~/data/mission-control/config.json`
