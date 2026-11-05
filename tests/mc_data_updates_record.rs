@@ -129,3 +129,57 @@ fn trim_keeps_intent_and_artifacts() {
         f.segments[0].agent_turns.last()
     );
 }
+
+#[test]
+fn many_segments_drop_done_then_oldest() {
+    let dir = tempfile::tempdir().unwrap();
+    let segs: Vec<_> = (0..200usize)
+        .map(|n| {
+            let mut s = segment(n + 1);
+            // Newest segment is the last; every 3rd is Done.
+            s.latest_at = Some(t0() + Duration::seconds(n as i64));
+            s.state = if n % 3 == 0 && n != 199 {
+                SegState::Done
+            } else {
+                SegState::Working
+            };
+            s.user_inputs[0].text = "y".repeat(300);
+            s.artifacts = (0..4)
+                .map(|k| Artifact {
+                    kind: ArtifactKind::Pr,
+                    reference: format!("o/r#{n}{k}"),
+                    at: t0(),
+                })
+                .collect();
+            s
+        })
+        .collect();
+    save(dir.path(), &file(segs)).unwrap();
+    let len = std::fs::metadata(dir.path().join("abc.json"))
+        .unwrap()
+        .len();
+    assert!(len as usize <= MAX_FILE_BYTES, "{len}");
+    let got = load(dir.path(), "abc").unwrap().segments;
+    assert!(got.len() < 200);
+    assert_eq!(got.last().unwrap().segment, "s200");
+    // Done dropped first: while any Done was dropped, no Working one may be gone
+    // unless every Done is gone.
+    let done_left = got.iter().filter(|s| s.state == SegState::Done).count();
+    let working_left = got.iter().filter(|s| s.state == SegState::Working).count();
+    assert!(
+        done_left == 0 || working_left == 133 - 0,
+        "{done_left} {working_left}"
+    );
+}
+
+#[test]
+fn invalid_session_id_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    for bad in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
+        let mut f = file(vec![segment(1)]);
+        f.session = bad.into();
+        let e = save(dir.path(), &f).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{bad:?}");
+        assert!(load(dir.path(), bad).is_none());
+    }
+}

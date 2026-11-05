@@ -66,14 +66,27 @@ pub fn updates_dir() -> PathBuf {
     data_root().join("updates").join("local")
 }
 
+fn valid_session_id(s: &str) -> bool {
+    !(s.is_empty() || s == "." || s == ".." || s.contains(['/', '\\', '\0']))
+}
+
 pub fn load(dir: &Path, session: &str) -> Option<SessionFile> {
+    if !valid_session_id(session) {
+        return None;
+    }
     let bytes = std::fs::read(dir.join(format!("{session}.json"))).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
 /// Atomic write (dot-prefixed tmp + rename, so listers never see a partial file).
-/// Trims a copy to `MAX_FILE_BYTES`; errors if it still cannot fit.
+/// Trims a copy to `MAX_FILE_BYTES`, dropping whole segments if needed.
 pub fn save(dir: &Path, file: &SessionFile) -> io::Result<()> {
+    if !valid_session_id(&file.session) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid session id",
+        ));
+    }
     let bytes = trimmed_bytes(file)?;
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(".{}.json.tmp", file.session));
@@ -118,10 +131,21 @@ fn trimmed_bytes(file: &SessionFile) -> io::Result<Vec<u8>> {
             .filter_map(|(i, s)| s.user_inputs.first().map(|u| (u.at, i)))
             .min();
         let Some((_, i)) = oldest else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("session record is {len} bytes after trimming"),
-            ));
+            drop_segment(&mut f.segments);
+            len = encode_len(&f)?;
+            if f.segments.len() == 1 && len > MAX_FILE_BYTES {
+                // Last resort for the sole survivor: shed oldest artifacts, then turns.
+                let seg = &mut f.segments[0];
+                if !seg.artifacts.is_empty() {
+                    seg.artifacts.remove(0);
+                } else if !seg.agent_turns.is_empty() {
+                    seg.agent_turns.remove(0);
+                } else {
+                    return encode(&f);
+                }
+                len = encode_len(&f)?;
+            }
+            continue;
         };
         let dropped = f.segments[i].user_inputs.remove(0);
         len -= encode_len(&dropped)? + 1; // + array comma
@@ -131,4 +155,28 @@ fn trimmed_bytes(file: &SessionFile) -> io::Result<Vec<u8>> {
 
 fn encode_len<T: Serialize>(v: &T) -> io::Result<usize> {
     Ok(serde_json::to_vec(v).map_err(io::Error::other)?.len())
+}
+
+fn activity(s: &Segment) -> Option<DateTime<Utc>> {
+    let last = |a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>| a.max(b);
+    last(
+        s.latest_at,
+        last(
+            s.user_inputs.last().map(|u| u.at),
+            s.agent_turns.last().map(|t| t.at),
+        ),
+    )
+}
+
+/// Drops the least-active segment, Done ones first; never the most active one.
+fn drop_segment(segs: &mut Vec<Segment>) {
+    if segs.len() < 2 {
+        return;
+    }
+    let keep = (0..segs.len()).max_by_key(|&i| activity(&segs[i])).unwrap();
+    let victim = (0..segs.len())
+        .filter(|&i| i != keep)
+        .min_by_key(|&i| (segs[i].state != SegState::Done, activity(&segs[i])))
+        .unwrap();
+    segs.remove(victim);
 }
