@@ -1,6 +1,8 @@
 //! Joins an agent session to its cmux surface/workspace: own env, then its
 //! tmux client's env, then (devbox) a mosh-port hint.
 
+use std::cell::{OnceCell, RefCell};
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
@@ -32,11 +34,12 @@ pub struct SurfaceHint {
 
 pub trait Sys {
     fn env_of(&self, pid: u32) -> Option<HashMap<String, String>>;
-    /// `tmux -L arcmux list-clients -F '#{client_pid} #{client_session} #{client_tty}'`.
+    /// `tmux -L arcmux list-clients -F '#{client_pid} #{client_session} #{client_tty} #{client_activity}'`.
     fn tmux_clients(&self) -> String;
     /// `ss -ulpn` output.
     fn udp_listeners(&self) -> String;
     fn tty_of(&self, pid: u32) -> Option<String>;
+    fn children_of(&self, pid: u32) -> Vec<u32>;
 }
 
 /// Reads `<pid>.json` files in `dir`, keyed by session id; other files are ignored.
@@ -77,12 +80,14 @@ pub fn load_agent_sessions(dir: &Path) -> HashMap<String, AgentSession> {
     out
 }
 
+/// Keeps only `CMUX_*` keys: other vars may be secrets.
 pub fn parse_environ(raw: &[u8]) -> HashMap<String, String> {
     raw.split(|b| *b == 0)
         .filter_map(|kv| {
             let s = String::from_utf8_lossy(kv);
             let (k, v) = s.split_once('=')?;
-            Some((k.to_string(), v.to_string()))
+            k.starts_with("CMUX_")
+                .then(|| (k.to_string(), v.to_string()))
         })
         .collect()
 }
@@ -98,7 +103,7 @@ pub fn parse_ps_eww(raw: &str) -> HashMap<String, String> {
     };
     raw.split_whitespace()
         .filter_map(|t| t.split_once('='))
-        .filter(|(k, _)| is_key(k))
+        .filter(|(k, _)| is_key(k) && k.starts_with("CMUX_"))
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
 }
@@ -111,19 +116,50 @@ fn ids_from(env: &HashMap<String, String>) -> Option<CmuxIds> {
     })
 }
 
-/// `(client_pid, client_session, client_tty)` rows.
-fn clients(sys: &dyn Sys) -> Vec<(u32, String, String)> {
-    sys.tmux_clients()
-        .lines()
-        .filter_map(|l| {
-            let mut f = l.split_whitespace();
-            Some((
-                f.next()?.parse().ok()?,
-                f.next()?.to_string(),
-                f.next()?.to_string(),
-            ))
-        })
-        .collect()
+struct Client {
+    pid: u32,
+    session: String,
+    tty: String,
+    activity: u64,
+}
+
+/// Per-tick view of the host: built once, shared by every `resolve` call.
+pub struct Snapshot<'a> {
+    sys: &'a dyn Sys,
+    clients: Vec<Client>,
+    udp: OnceCell<String>,
+    env: RefCell<HashMap<u32, Option<CmuxIds>>>,
+}
+
+impl<'a> Snapshot<'a> {
+    pub fn new(sys: &'a dyn Sys) -> Self {
+        let clients = sys
+            .tmux_clients()
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split_whitespace();
+                Some(Client {
+                    pid: f.next()?.parse().ok()?,
+                    session: f.next()?.to_string(),
+                    tty: f.next()?.to_string(),
+                    activity: f.next().and_then(|a| a.parse().ok()).unwrap_or(0),
+                })
+            })
+            .collect();
+        Snapshot {
+            sys,
+            clients,
+            udp: OnceCell::new(),
+            env: RefCell::default(),
+        }
+    }
+
+    fn ids(&self, pid: u32) -> Option<CmuxIds> {
+        let mut memo = self.env.borrow_mut();
+        memo.entry(pid)
+            .or_insert_with(|| self.sys.env_of(pid).as_ref().and_then(ids_from))
+            .clone()
+    }
 }
 
 /// Pid of the `mosh-server` listening on UDP `port` in `ss -ulpn` output.
@@ -145,8 +181,8 @@ fn mosh_pid(ss: &str, port: u16) -> Option<u32> {
         })
 }
 
-pub fn resolve(s: &AgentSession, sys: &dyn Sys, hints: &[SurfaceHint]) -> Option<CmuxIds> {
-    if let Some(ids) = sys.env_of(s.pid).as_ref().and_then(ids_from) {
+pub fn resolve(s: &AgentSession, snap: &Snapshot, hints: &[SurfaceHint]) -> Option<CmuxIds> {
+    if let Some(ids) = snap.ids(s.pid) {
         return Some(ids);
     }
     let session = s
@@ -155,22 +191,35 @@ pub fn resolve(s: &AgentSession, sys: &dyn Sys, hints: &[SurfaceHint]) -> Option
         .split(':')
         .next()
         .filter(|n| !n.is_empty())?;
-    let all = clients(sys);
-    if let Some(ids) = all
+    // Newest-active client with both IDs; ties go to the lowest pid.
+    let best = snap
+        .clients
         .iter()
-        .filter(|c| c.1 == session)
-        .find_map(|c| sys.env_of(c.0).as_ref().and_then(ids_from))
-    {
+        .filter(|c| c.session == session)
+        .filter_map(|c| Some(((Reverse(c.activity), c.pid), snap.ids(c.pid)?)))
+        .min_by_key(|(k, _)| *k);
+    if let Some((_, ids)) = best {
         return Some(ids);
     }
-    let ss = sys.udp_listeners();
+    if hints.is_empty() {
+        return None;
+    }
+    let ss = snap.udp.get_or_init(|| snap.sys.udp_listeners());
     hints.iter().find_map(|h| {
         if h.surface_id.is_empty() || h.workspace_id.is_empty() {
             return None;
         }
-        let tty = sys.tty_of(mosh_pid(&ss, h.mosh_port)?)?;
-        all.iter()
-            .any(|c| c.2 == tty && c.1 == session)
+        // The pty belongs to mosh-server's child; its own fds are /dev/null.
+        let server = mosh_pid(ss, h.mosh_port)?;
+        let ttys: Vec<String> = snap
+            .sys
+            .children_of(server)
+            .into_iter()
+            .filter_map(|p| snap.sys.tty_of(p))
+            .collect();
+        snap.clients
+            .iter()
+            .any(|c| c.session == session && ttys.contains(&c.tty))
             .then(|| CmuxIds {
                 surface: h.surface_id.clone(),
                 workspace: h.workspace_id.clone(),
@@ -201,13 +250,31 @@ impl Sys for RealSys {
                 "arcmux",
                 "list-clients",
                 "-F",
-                "#{client_pid} #{client_session} #{client_tty}",
+                "#{client_pid} #{client_session} #{client_tty} #{client_activity}",
             ],
         )
         .unwrap_or_default()
     }
     fn udp_listeners(&self) -> String {
         run("ss", &["-ulpn"]).unwrap_or_default()
+    }
+    fn children_of(&self, pid: u32) -> Vec<u32> {
+        let ppid_of = |p: u32| -> Option<u32> {
+            let stat = std::fs::read_to_string(format!("/proc/{p}/stat")).ok()?;
+            stat.rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()
+        };
+        let Ok(rd) = std::fs::read_dir("/proc") else {
+            return vec![];
+        };
+        rd.flatten()
+            .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
+            .filter(|p| ppid_of(*p) == Some(pid))
+            .collect()
     }
     fn tty_of(&self, pid: u32) -> Option<String> {
         ["0", "1"].iter().find_map(|fd| {
@@ -228,6 +295,7 @@ mod tests {
         clients: String,
         ss: String,
         tty: HashMap<u32, String>,
+        kids: HashMap<u32, Vec<u32>>,
     }
     impl Sys for Fake {
         fn env_of(&self, pid: u32) -> Option<HashMap<String, String>> {
@@ -241,6 +309,9 @@ mod tests {
         }
         fn tty_of(&self, pid: u32) -> Option<String> {
             self.tty.get(&pid).cloned()
+        }
+        fn children_of(&self, pid: u32) -> Vec<u32> {
+            self.kids.get(&pid).cloned().unwrap_or_default()
         }
     }
 
@@ -272,7 +343,7 @@ mod tests {
     fn own_env_wins() {
         let mut f = Fake::default();
         f.env.insert(10, ids_env("S1", "W1"));
-        assert_eq!(resolve(&sess(), &f, &[]), ids("S1", "W1"));
+        assert_eq!(resolve(&sess(), &Snapshot::new(&f), &[]), ids("S1", "W1"));
     }
 
     #[test]
@@ -281,26 +352,56 @@ mod tests {
         f.env.insert(10, env(&[("CMUX_SURFACE_ID", "S1")]));
         f.env.insert(20, ids_env("S2", "W2"));
         f.clients = "30 other /dev/pts/1\n20 blin-claude-x-1 /dev/pts/2\n".into();
-        assert_eq!(resolve(&sess(), &f, &[]), ids("S2", "W2"));
+        assert_eq!(resolve(&sess(), &Snapshot::new(&f), &[]), ids("S2", "W2"));
     }
 
     #[test]
-    fn mosh_hint_via_pty() {
+    fn mosh_hint_via_child_pty() {
         let mut f = Fake::default();
-        f.clients = "20 blin-claude-x-1 /dev/pts/7\n".into();
+        f.clients = "20 blin-claude-x-1 /dev/pts/7 100\n".into();
         f.ss = "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n\
-                UNCONN 0 0 0.0.0.0:60033 0.0.0.0:* users:((\"mosh-server\",pid=123,fd=4))\n\
-                UNCONN 0 0 *:60034 *:* users:((\"mosh-server\",pid=124,fd=4))\n"
+UNCONN 0      0          100.85.14.76:60001      0.0.0.0:*    users:((\"mosh-server\",pid=452490,fd=4)) \n\
+UNCONN 0 0 *:60034 *:* users:((\"mosh-server\",pid=124,fd=4))\n"
             .into();
-        f.tty.insert(123, "/dev/pts/7".into());
-        f.tty.insert(124, "/dev/pts/8".into());
+        // Real mosh-server fds are /dev/null; only the child has the pts.
+        f.kids.insert(452490, vec![452491]);
+        f.tty.insert(452491, "/dev/pts/7".into());
+        f.kids.insert(124, vec![125]);
+        f.tty.insert(125, "/dev/pts/8".into());
         let hint = |p, s: &str| SurfaceHint {
             mosh_port: p,
             surface_id: s.into(),
             workspace_id: "W3".into(),
         };
-        let hints = [hint(60034, "S-other"), hint(60033, "S3")];
-        assert_eq!(resolve(&sess(), &f, &hints), ids("S3", "W3"));
+        let hints = [hint(60034, "S-other"), hint(60001, "S3")];
+        assert_eq!(
+            resolve(&sess(), &Snapshot::new(&f), &hints),
+            ids("S3", "W3")
+        );
+    }
+
+    #[test]
+    fn newest_active_client_with_ids_wins_ties_lowest_pid() {
+        let mut f = Fake::default();
+        f.env.insert(21, ids_env("S-old", "W-old"));
+        f.env.insert(22, ids_env("S-new", "W-new"));
+        f.env.insert(23, ids_env("S-tie", "W-tie"));
+        // 24 is newest but has no IDs; 23 ties with 22 on activity.
+        f.clients = "21 blin-claude-x-1 /dev/pts/1 10\n23 blin-claude-x-1 /dev/pts/3 50\n\
+22 blin-claude-x-1 /dev/pts/2 50\n24 blin-claude-x-1 /dev/pts/4 99\n"
+            .into();
+        assert_eq!(
+            resolve(&sess(), &Snapshot::new(&f), &[]),
+            ids("S-new", "W-new")
+        );
+    }
+
+    #[test]
+    fn parsers_drop_non_cmux_vars() {
+        let e = parse_environ(b"SECRET=x\0CMUX_SURFACE_ID=y");
+        assert_eq!((e.len(), e["CMUX_SURFACE_ID"].as_str()), (1, "y"));
+        let e = parse_ps_eww("cmd API_KEY=x CMUX_SURFACE_ID=y");
+        assert_eq!((e.len(), e["CMUX_SURFACE_ID"].as_str()), (1, "y"));
     }
 
     #[test]
@@ -308,10 +409,10 @@ mod tests {
         let mut f = Fake::default();
         f.clients = "20 blin-claude-x-1 /dev/pts/2\n".into();
         f.env.insert(20, env(&[("CMUX_WORKSPACE_ID", "W")]));
-        assert_eq!(resolve(&sess(), &f, &[]), None);
+        assert_eq!(resolve(&sess(), &Snapshot::new(&f), &[]), None);
         let mut s = sess();
         s.tmux = None;
-        assert_eq!(resolve(&s, &f, &[]), None);
+        assert_eq!(resolve(&s, &Snapshot::new(&f), &[]), None);
     }
 
     #[test]
@@ -325,13 +426,12 @@ CMUX_SURFACE_ID=E35B477C-7711-437E-A430-69972174B67D\n";
             e["CMUX_WORKSPACE_ID"],
             "2EC28B75-6BE2-46F1-B3F2-0C9C8E1FA273"
         );
-        assert_eq!(e["TERM"], "xterm-256color");
         assert!(!e.contains_key("-L") && !e.contains_key("tmux"));
     }
 
     #[test]
     fn parses_environ_and_sessions_dir() {
-        assert_eq!(parse_environ(b"A=1\0B=x=y\0\0")["B"], "x=y");
+        assert_eq!(parse_environ(b"A=1\0CMUX_B=x=y\0\0")["CMUX_B"], "x=y");
         let d = std::env::temp_dir().join(format!("mc-join-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
