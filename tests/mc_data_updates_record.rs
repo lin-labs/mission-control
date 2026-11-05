@@ -162,12 +162,12 @@ fn many_segments_drop_done_then_oldest() {
     let got = load(dir.path(), "abc").unwrap().segments;
     assert!(got.len() < 200);
     assert_eq!(got.last().unwrap().segment, "s200");
-    // Done dropped first: while any Done was dropped, no Working one may be gone
-    // unless every Done is gone.
+    // 67 Done + 133 Working originally: a Working drop implies no Done is left.
     let done_left = got.iter().filter(|s| s.state == SegState::Done).count();
     let working_left = got.iter().filter(|s| s.state == SegState::Working).count();
+    assert!(done_left < 67, "no Done segment was dropped");
     assert!(
-        done_left == 0 || working_left == 133 - 0,
+        working_left == 133 || done_left == 0,
         "{done_left} {working_left}"
     );
 }
