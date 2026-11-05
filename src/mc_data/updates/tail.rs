@@ -86,16 +86,7 @@ fn claude_turn(line: &Value, at: DateTime<Utc>) -> Option<Turn> {
     let content = line.get("message")?.get("content")?;
     match line.get("type")?.as_str()? {
         "assistant" => {
-            let text = match content {
-                Value::String(s) => s.clone(),
-                Value::Array(blocks) => blocks
-                    .iter()
-                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-                    .filter_map(|b| b.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                _ => return None,
-            };
+            let text = content_text(content)?;
             let text = text.trim().to_string();
             (!text.is_empty()).then_some(Turn::Agent {
                 at,
@@ -104,7 +95,7 @@ fn claude_turn(line: &Value, at: DateTime<Utc>) -> Option<Turn> {
             })
         }
         "user" => {
-            let text = content.as_str()?.trim().to_string();
+            let text = content_text(content)?.trim().to_string();
             if text.is_empty() {
                 return None;
             }
@@ -124,6 +115,22 @@ fn claude_turn(line: &Value, at: DateTime<Utc>) -> Option<Turn> {
                 Turn::User { at, text }
             })
         }
+        _ => None,
+    }
+}
+
+/// String content, or the `text` blocks of list content joined with newlines.
+fn content_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(blocks) => Some(
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
         _ => None,
     }
 }

@@ -46,8 +46,11 @@ fn classifies_origin_kinds() {
         .iter()
         .filter(|t| matches!(t, Turn::User { .. }))
         .collect();
-    assert_eq!(users.len(), 1);
+    assert_eq!(users.len(), 2);
     assert!(matches!(users[0], Turn::User { text, .. } if text == "placeholder human request"));
+    assert!(
+        matches!(users[1], Turn::User { text, .. } if text == "placeholder array line one\nplaceholder array line two")
+    );
     let injected = out
         .turns
         .iter()
@@ -166,4 +169,16 @@ fn codex_user_message_is_user() {
             ..
         }
     ));
+}
+
+#[test]
+fn utf8_and_crlf_lines_parse() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("t.jsonl");
+    let a = r#"{"type":"user","message":{"content":"héllo 日本語 🎉"},"timestamp":"2026-11-03T00:00:00Z","origin":{"kind":"human"}}"#;
+    std::fs::write(&p, format!("{a}\r\n{a}\r\n")).unwrap();
+    let out = read_new(SurfaceKind::Claude, &p, 0, fallback()).unwrap();
+    assert_eq!(out.next_offset, std::fs::metadata(&p).unwrap().len());
+    assert_eq!(out.turns.len(), 2);
+    assert!(matches!(&out.turns[0], Turn::User { text, .. } if text == "héllo 日本語 🎉"));
 }

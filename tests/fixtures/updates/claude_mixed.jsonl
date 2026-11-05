@@ -6,3 +6,4 @@
 {"type":"user","message":{"role":"user","content":"<task-notification>placeholder</task-notification>"},"uuid":"u4","timestamp":"2026-11-02T05:45:00.000Z","origin":{"kind":"task-notification","producer":"session-task","runId":"r1"}}
 {"type":"user","message":{"role":"user","content":"Protocol: blin-letter/1\nfrom: placeholder\n\nplaceholder letter body"},"uuid":"u5","timestamp":"2026-11-02T05:46:00.000Z","origin":{"kind":"human"}}
 {"type":"user","message":{"role":"user","content":"<system-reminder>placeholder reminder</system-reminder>"},"uuid":"u6","timestamp":"2026-11-02T05:47:00.000Z"}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"placeholder array line one"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"placeholder array line two"}]},"uuid":"u7","timestamp":"2026-11-02T05:48:00.000Z","origin":{"kind":"human"}}
