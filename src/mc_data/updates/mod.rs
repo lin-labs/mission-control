@@ -3,3 +3,4 @@ pub mod judge;
 pub mod tail;
 pub mod record;
 pub mod engine;
+pub mod join;
