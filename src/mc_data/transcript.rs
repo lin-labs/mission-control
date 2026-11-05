@@ -47,7 +47,7 @@ pub fn intent_from_transcript(agent: SurfaceKind, path: &Path) -> ConversationIn
 }
 
 /// Harness/system text that appears as a "user" turn but isn't a real prompt.
-fn is_injected_claude(s: &str) -> bool {
+pub(crate) fn is_injected_claude(s: &str) -> bool {
     let t = s.trim_start();
     t.starts_with("workspace_ref=")
         || t.starts_with("<system-reminder")
