@@ -1300,6 +1300,7 @@ dependencies = [
  "dirs",
  "notify",
  "ratatui",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
