@@ -103,7 +103,12 @@ fn claude_turn(line: &Value, at: DateTime<Utc>) -> Option<Turn> {
             let injected = match origin {
                 Some("human") => text.starts_with("Protocol: blin-letter/1"),
                 Some(_) => true,
-                None => is_injected_claude(&text),
+                // Scheduled/SDK runs are automation, not the user typing.
+                None => {
+                    is_injected_claude(&text)
+                        || line["promptSource"] == "sdk"
+                        || line["entrypoint"] == "sdk-cli"
+                }
             };
             Some(if injected {
                 Turn::Agent {

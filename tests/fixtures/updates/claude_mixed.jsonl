@@ -7,3 +7,5 @@
 {"type":"user","message":{"role":"user","content":"Protocol: blin-letter/1\nfrom: placeholder\n\nplaceholder letter body"},"uuid":"u5","timestamp":"2026-11-02T05:46:00.000Z","origin":{"kind":"human"}}
 {"type":"user","message":{"role":"user","content":"<system-reminder>placeholder reminder</system-reminder>"},"uuid":"u6","timestamp":"2026-11-02T05:47:00.000Z"}
 {"type":"user","message":{"role":"user","content":[{"type":"text","text":"placeholder array line one"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"placeholder array line two"}]},"uuid":"u7","timestamp":"2026-11-02T05:48:00.000Z","origin":{"kind":"human"}}
+{"type":"user","message":{"role":"user","content":"placeholder scheduled prompt"},"uuid":"u8","timestamp":"2026-11-02T05:49:00.000Z","promptSource":"sdk"}
+{"type":"user","message":{"role":"user","content":"placeholder sdk run prompt"},"uuid":"u9","timestamp":"2026-11-02T05:50:00.000Z","entrypoint":"sdk-cli"}

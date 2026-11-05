@@ -64,7 +64,7 @@ fn classifies_origin_kinds() {
             )
         })
         .count();
-    assert_eq!(injected, 4); // peer, notification, letter, no-origin system-reminder
+    assert_eq!(injected, 6); // peer, notification, letter, no-origin system-reminder, 2 sdk
     let replies: Vec<_> = out
         .turns
         .iter()
@@ -82,9 +82,28 @@ fn classifies_origin_kinds() {
     assert!(matches!(replies[0], Turn::Agent { text, .. } if text == "placeholder agent reply"));
     assert_eq!(
         out.lines.len(),
-        9,
+        11,
         "every parsed line is carried, tool_result included"
     );
+}
+
+#[test]
+fn sdk_prompts_without_origin_are_injected() {
+    let out = read_new(
+        SurfaceKind::Claude,
+        &fixture("claude_mixed.jsonl"),
+        0,
+        fallback(),
+    )
+    .unwrap();
+    for text in ["placeholder scheduled prompt", "placeholder sdk run prompt"] {
+        assert!(
+            out.turns.iter().any(
+                |t| matches!(t, Turn::Agent { text: x, kind: AgentKind::Injected, .. } if x == text)
+            ),
+            "{text}"
+        );
+    }
 }
 
 #[test]
