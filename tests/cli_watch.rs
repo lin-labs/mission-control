@@ -114,13 +114,7 @@ fn first_run_ignores_old_transcripts() {
         ".claude/projects/-x/abc.jsonl",
         "claude_mixed.jsonl",
     );
-    let old = SystemTime::now() - Duration::from_secs(2 * 24 * 3600);
-    std::fs::File::options()
-        .write(true)
-        .open(&t)
-        .unwrap()
-        .set_modified(old)
-        .unwrap();
+    set_old(&t);
     watch(home.path());
     assert!(record(home.path(), "abc").is_none());
     // It is tracked at its length, so only growth is read.
@@ -208,6 +202,73 @@ fn truncated_transcript_rereads_only_newer_turns() {
         .map(str::to_string)
         .collect();
     std::fs::write(&t, format!("{}\n{HUMAN}\n", head.join("\n"))).unwrap();
+    watch(home.path());
+    assert_eq!(inputs(&record(home.path(), "abc").unwrap()), 3);
+}
+
+fn set_old(p: &Path) {
+    let old = SystemTime::now() - Duration::from_secs(2 * 24 * 3600);
+    std::fs::File::options()
+        .write(true)
+        .open(p)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+}
+
+#[test]
+fn lost_offset_entry_does_not_duplicate_turns() {
+    let home = tempfile::tempdir().unwrap();
+    place(
+        home.path(),
+        ".claude/projects/-x/abc.jsonl",
+        "claude_mixed.jsonl",
+    );
+    watch(home.path());
+    let offsets = updates(home.path()).join(".offsets.json");
+    let mut m: serde_json::Map<String, Value> =
+        serde_json::from_slice(&std::fs::read(&offsets).unwrap()).unwrap();
+    m.retain(|k, _| !k.ends_with("abc.jsonl"));
+    std::fs::write(&offsets, serde_json::to_vec(&m).unwrap()).unwrap();
+    watch(home.path());
+    assert_eq!(inputs(&record(home.path(), "abc").unwrap()), 2);
+}
+
+#[test]
+fn unknown_old_transcript_on_later_run_reads_only_growth() {
+    let home = tempfile::tempdir().unwrap();
+    watch(home.path()); // first run: nothing to seed
+    let t = place(
+        home.path(),
+        ".claude/projects/-x/abc.jsonl",
+        "claude_mixed.jsonl",
+    );
+    set_old(&t);
+    watch(home.path());
+    assert!(record(home.path(), "abc").is_none());
+    append(&t, HUMAN);
+    watch(home.path());
+    assert_eq!(inputs(&record(home.path(), "abc").unwrap()), 1);
+}
+
+#[test]
+fn failed_save_keeps_offset() {
+    let home = tempfile::tempdir().unwrap();
+    let t = place(
+        home.path(),
+        ".claude/projects/-x/abc.jsonl",
+        "claude_mixed.jsonl",
+    );
+    watch(home.path());
+    let rec = updates(home.path()).join("abc.json");
+    let saved = std::fs::read(&rec).unwrap();
+    append(&t, HUMAN);
+    // A directory in the record's place makes the save's rename fail.
+    std::fs::remove_file(&rec).unwrap();
+    std::fs::create_dir(&rec).unwrap();
+    watch(home.path());
+    std::fs::remove_dir(&rec).unwrap();
+    std::fs::write(&rec, saved).unwrap();
     watch(home.path());
     assert_eq!(inputs(&record(home.path(), "abc").unwrap()), 3);
 }

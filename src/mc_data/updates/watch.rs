@@ -72,6 +72,8 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
     let first_run = prev.is_none();
     let prev = prev.unwrap_or_default();
     let seed = first_run || opts.seed_only;
+    std::fs::create_dir_all(dir)?;
+    write_monitor(dir, host, now)?;
 
     let mut offsets = BTreeMap::new();
     let mut changed = Vec::new();
@@ -84,7 +86,8 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
             Some(o) if (o.len, o.mtime) == (len, mtime) => {
                 offsets.insert(path, *o);
             }
-            None if first_run && now - mtime > Duration::hours(SEED_HOURS) => {
+            // Unknown and old (first run, or offsets lost): only read growth.
+            None if now - mtime > Duration::hours(SEED_HOURS) => {
                 offsets.insert(
                     path,
                     Offset {
@@ -94,7 +97,12 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
                     },
                 );
             }
-            o => changed.push((path, kind, o.map_or(0, |o| o.offset), len, mtime)),
+            Some(o) => {
+                // Kept until this session's record is saved.
+                offsets.insert(path.clone(), *o);
+                changed.push((path, kind, o.offset, len, mtime));
+            }
+            None => changed.push((path, kind, 0, len, mtime)),
         }
     }
 
@@ -127,10 +135,6 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
                 Ok(out) => out,
                 Err(e) => {
                     warnings.push(format!("read {}: {e}", path.display()));
-                    // Keep the old entry so the next tick retries from it.
-                    if let Some(o) = prev.get(&path) {
-                        offsets.insert(path, *o);
-                    }
                     continue;
                 }
             };
@@ -150,7 +154,8 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
                 segments: vec![],
                 updated_at: now,
             });
-            if out.reset {
+            // A re-read from 0 must not re-apply what the record already has.
+            if from == 0 || out.reset {
                 drop_seen(&file, &mut out);
             }
             let (status, ids) = joined.unwrap_or_default();
@@ -172,25 +177,22 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
             // Sessions with no user input yet (e.g. automation) get no record.
             if !file.segments.is_empty() {
                 file.updated_at = now;
-                match record::save(dir, &file) {
-                    Ok(()) => written += 1,
-                    Err(e) => warnings.push(format!("save {session}: {e}")),
+                if let Err(e) = record::save(dir, &file) {
+                    // Keep the old offset so these turns are re-read.
+                    warnings.push(format!("save {session}: {e}"));
+                    continue;
                 }
+                written += 1;
             }
             let offset = out.next_offset;
             offsets.insert(path, Offset { offset, len, mtime });
+            // Saved per session so a crash mid-tick re-applies nothing.
+            write_atomic(&offsets_path, &serde_json::to_vec(&offsets)?)?;
         }
     }
 
-    std::fs::create_dir_all(dir)?;
     write_atomic(&offsets_path, &serde_json::to_vec(&offsets)?)?;
-    let monitor = serde_json::json!({
-        "host": host,
-        "version": env!("CARGO_PKG_VERSION"),
-        "pid": std::process::id(),
-        "last_tick": now,
-    });
-    write_atomic(&dir.join("monitor.json"), &serde_json::to_vec(&monitor)?)?;
+    write_monitor(dir, host, Utc::now())?;
 
     if written > 0 || !warnings.is_empty() {
         eprintln!(
@@ -213,8 +215,8 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
 fn transcripts() -> Vec<(PathBuf, SurfaceKind)> {
     let home = dirs::home_dir().unwrap_or_default();
     let mut out = Vec::new();
-    for project in subdirs(&home.join(".claude/projects")) {
-        for f in files(&project) {
+    for project in list(&home.join(".claude/projects")).0 {
+        for f in list(&project).1 {
             if f.extension().is_some_and(|e| e == "jsonl") {
                 out.push((f, SurfaceKind::Claude));
             }
@@ -222,36 +224,42 @@ fn transcripts() -> Vec<(PathBuf, SurfaceKind)> {
     }
     let mut stack = vec![(home.join(".codex/sessions"), 0)];
     while let Some((d, depth)) = stack.pop() {
-        for f in files(&d) {
+        let (dirs, files) = list(&d);
+        for f in files {
             let name = f.file_name().unwrap_or_default().to_string_lossy();
             if name.starts_with("rollout-") && name.ends_with(".jsonl") {
                 out.push((f, SurfaceKind::Codex));
             }
         }
         if depth < CODEX_MAX_DEPTH {
-            stack.extend(subdirs(&d).into_iter().map(|s| (s, depth + 1)));
+            stack.extend(dirs.into_iter().map(|s| (s, depth + 1)));
         }
     }
     out
 }
 
-/// Entries of `dir` (following symlinks) that pass `keep`.
-fn entries(dir: &Path, keep: fn(&std::fs::Metadata) -> bool) -> Vec<PathBuf> {
+/// Subdirectories and files of `dir`; only symlinks cost a stat.
+fn list(dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let (mut dirs, mut files) = (vec![], vec![]);
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return vec![];
+        return (dirs, files);
     };
-    rd.flatten()
-        .map(|e| e.path())
-        .filter(|p| std::fs::metadata(p).is_ok_and(|m| keep(&m)))
-        .collect()
-}
-
-fn subdirs(dir: &Path) -> Vec<PathBuf> {
-    entries(dir, |m| m.is_dir())
-}
-
-fn files(dir: &Path) -> Vec<PathBuf> {
-    entries(dir, |m| m.is_file())
+    for e in rd.flatten() {
+        let Ok(mut ft) = e.file_type() else { continue };
+        let p = e.path();
+        if ft.is_symlink() {
+            let Ok(m) = std::fs::metadata(&p) else {
+                continue;
+            };
+            ft = m.file_type();
+        }
+        if ft.is_dir() {
+            dirs.push(p);
+        } else if ft.is_file() {
+            files.push(p);
+        }
+    }
+    (dirs, files)
 }
 
 /// Transcript file stem: the Claude session UUID or the Codex rollout name.
@@ -284,6 +292,19 @@ fn drop_seen(file: &SessionFile, out: &mut ReadOutcome) {
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .is_some_and(|t| t > newest)
     });
+}
+
+fn write_monitor(dir: &Path, host: &str, at: DateTime<Utc>) -> Result<()> {
+    let monitor = serde_json::json!({
+        "host": host,
+        "version": env!("CARGO_PKG_VERSION"),
+        "pid": std::process::id(),
+        "last_tick": at,
+    });
+    Ok(write_atomic(
+        &dir.join("monitor.json"),
+        &serde_json::to_vec(&monitor)?,
+    )?)
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
