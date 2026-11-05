@@ -82,7 +82,7 @@ fn classifies_origin_kinds() {
     assert!(matches!(replies[0], Turn::Agent { text, .. } if text == "placeholder agent reply"));
     assert_eq!(
         out.lines.len(),
-        8,
+        9,
         "every parsed line is carried, tool_result included"
     );
 }
