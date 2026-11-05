@@ -66,6 +66,22 @@ otherwise Mission Control checks `OPENAI_API_KEY` from `~/.zshenv`, then reads
 Secret lookup failures are non-fatal and appear as a global warning in the TUI.
 The resolved key is never persisted.
 
+## Updates watcher (mc-monitor)
+
+`mission-control watch` keeps the updates view current in the background.
+Devbox runs it as a systemd user unit; Mac as a launchd agent:
+
+```bash
+cp packaging/systemd/mc-monitor.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now mc-monitor
+```
+
+```bash
+cp packaging/launchd/com.blin.mc-monitor.plist ~/Library/LaunchAgents/ && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.blin.mc-monitor.plist
+```
+
+It needs `{"short_text_provider":"beam"}` in `~/data/mission-control/config.json`
+and `REFLECTION_API_KEY` in `~/.zshenv`; without them it runs seed-only.
+
 ## Subcommands
 
 By default, `mc` launches the TUI. There are also non-TUI subcommands:

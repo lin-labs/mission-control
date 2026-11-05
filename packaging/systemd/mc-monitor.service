@@ -1,0 +1,18 @@
+[Unit]
+Description=mission-control updates watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=%h/.cargo/bin/mission-control watch
+Restart=always
+RestartSec=5
+MemoryMax=150M
+CPUQuota=10%
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target
