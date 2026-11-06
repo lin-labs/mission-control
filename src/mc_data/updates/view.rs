@@ -1,5 +1,6 @@
 //! View model for the Updates screen: session records -> sorted, grouped rows.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
@@ -58,27 +59,32 @@ pub fn build_rows(
     now: DateTime<Utc>,
     workspace_names: &HashMap<String, String>,
 ) -> Vec<Row> {
-    let mut rows: Vec<Row> = files
+    let mut rows: Vec<(Row, bool)> = files
         .iter()
         .flat_map(|f| {
             f.segments
                 .iter()
                 .map(move |s| row(f, s, order, grouping, workspace_names))
         })
-        .filter(|r| now - r.at <= Duration::days(MAX_AGE_DAYS))
+        .filter(|(r, _)| now - r.at <= Duration::days(MAX_AGE_DAYS))
         .collect();
-    rows.sort_by(|a, b| b.at.cmp(&a.at));
-    let mut rank: HashMap<String, usize> = HashMap::new();
-    for r in &rows {
-        let n = rank.len();
-        rank.entry(r.group.clone()).or_insert(n);
+    rows.sort_by(|(a, _), (b, _)| {
+        (Reverse(a.at), &a.host, &a.session, &a.segment).cmp(&(
+            Reverse(b.at),
+            &b.host,
+            &b.session,
+            &b.segment,
+        ))
+    });
+    // Rows are sorted, so a group's first row is its best.
+    let mut rank: HashMap<String, (bool, Reverse<DateTime<Utc>>)> = HashMap::new();
+    for (r, unattached) in &rows {
+        rank.entry(r.group.clone())
+            .or_insert((*unattached, Reverse(r.at)));
     }
-    let unattached = |g: &str| grouping == Grouping::Workspace && g.ends_with(UNATTACHED);
-    rows.sort_by_key(|r| (unattached(&r.group), rank[&r.group]));
-    rows
+    rows.sort_by(|(a, _), (b, _)| (rank[&a.group], &a.group).cmp(&(rank[&b.group], &b.group)));
+    rows.into_iter().map(|(r, _)| r).collect()
 }
-
-const UNATTACHED: &str = " · unattached";
 
 fn row(
     f: &SessionFile,
@@ -86,7 +92,7 @@ fn row(
     order: Order,
     grouping: Grouping,
     names: &HashMap<String, String>,
-) -> Row {
+) -> (Row, bool) {
     let last_input = s.user_inputs.iter().map(|u| u.at).max();
     let at = match order {
         Order::MyInput => last_input.or(s.latest_at),
@@ -99,12 +105,13 @@ fn row(
             .or(last_input),
     }
     .unwrap_or(f.updated_at);
+    let unattached = grouping == Grouping::Workspace && f.workspace.is_none();
     let group = match (grouping, &f.workspace) {
         (Grouping::Flat, _) => "All".to_string(),
         (_, Some(id)) => names.get(id).cloned().unwrap_or_else(|| id.clone()),
-        (_, None) => format!("{}{UNATTACHED}", f.host),
+        (_, None) => format!("{} · unattached", f.host),
     };
-    Row {
+    let row = Row {
         group,
         host: f.host.clone(),
         session: f.session.clone(),
@@ -118,7 +125,8 @@ fn row(
         entries: entries(s),
         workspace: f.workspace.clone(),
         surface: f.surface.clone(),
-    }
+    };
+    (row, unattached)
 }
 
 fn entries(s: &Segment) -> Vec<Entry> {

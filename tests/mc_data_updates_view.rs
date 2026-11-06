@@ -172,3 +172,42 @@ fn done_is_dim() {
     let rows = build(&files, Order::MyInput, Grouping::Flat);
     assert_eq!((rows[0].dim, rows[1].dim), (true, false));
 }
+
+#[test]
+fn ties_order_is_independent_of_file_order() {
+    let t = ago(1, 0);
+    let mk = |sess: &str, ws: Option<&str>| {
+        file(sess, ws, vec![seg("x", &[t], &[]), seg("a", &[t], &[])])
+    };
+    let fwd = [mk("s1", Some("w1")), mk("s2", Some("w2")), mk("s3", None)];
+    let rev = [mk("s3", None), mk("s2", Some("w2")), mk("s1", Some("w1"))];
+    for g in [Grouping::Flat, Grouping::Workspace] {
+        let key = |files: &[SessionFile]| {
+            build(files, Order::MyInput, g)
+                .into_iter()
+                .map(|r| (r.group, r.session, r.segment))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(key(&fwd), key(&rev));
+    }
+    let rows = build(&fwd, Order::MyInput, Grouping::Workspace);
+    assert_eq!(rows[0].group, "w1");
+    assert_eq!(rows.last().unwrap().group, "mac · unattached");
+}
+
+#[test]
+fn turn_at_next_input_time_counts_for_next_input() {
+    let (t1, t2) = (ago(2, 0), ago(1, 0));
+    let files = [file("s", None, vec![seg("x", &[t1, t2], &[(t2, false)])])];
+    let e = &build(&files, Order::MyInput, Grouping::Flat)[0].entries;
+    assert!(matches!(e[0], Entry::Input { replies: 0, .. }));
+    assert!(matches!(e[1], Entry::Input { replies: 1, .. }));
+}
+
+#[test]
+fn empty_segment_falls_back_to_updated_at() {
+    let files = [file("s", None, vec![seg("x", &[], &[])])];
+    for o in [Order::MyInput, Order::AgentResponse] {
+        assert_eq!(build(&files, o, Grouping::Flat)[0].at, now());
+    }
+}
