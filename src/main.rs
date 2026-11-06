@@ -343,19 +343,29 @@ async fn main() -> Result<()> {
             once,
             seed_only,
             updates_dir,
-        }) => run_watch(&cli.tui, interval, once, seed_only, updates_dir).await,
+            chunk_bytes,
+            seed_bytes,
+        }) => {
+            use crate::mc_data::updates::{record, watch};
+            let opts = watch::WatchOpts {
+                interval,
+                once,
+                seed_only,
+                updates_dir: updates_dir.unwrap_or_else(record::updates_dir),
+                chunk_bytes: chunk_bytes.unwrap_or(watch::CHUNK_BYTES),
+                seed_bytes: seed_bytes.unwrap_or(watch::SEED_BYTES),
+            };
+            run_watch(&cli.tui, opts).await
+        }
     }
 }
 
 /// Transcript watcher; Beam is its only judge. Without one it runs seed-only.
 async fn run_watch(
     config: &Config,
-    interval: u64,
-    once: bool,
-    seed_only: bool,
-    updates_dir: Option<PathBuf>,
+    mut opts: crate::mc_data::updates::watch::WatchOpts,
 ) -> Result<()> {
-    use crate::mc_data::updates::{judge::Judge, record, watch};
+    use crate::mc_data::updates::{judge::Judge, watch};
     let mut config = config.clone();
     let runtime = resolve_short_text_runtime(&mut config).await;
     let judge = runtime
@@ -371,12 +381,7 @@ async fn run_watch(
                 .unwrap_or("short_text_provider is not beam")
         );
     }
-    let opts = watch::WatchOpts {
-        interval,
-        once,
-        seed_only: seed_only || judge.is_none(),
-        updates_dir: updates_dir.unwrap_or_else(record::updates_dir),
-    };
+    opts.seed_only |= judge.is_none();
     watch::run(judge, opts).await
 }
 

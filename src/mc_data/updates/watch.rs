@@ -21,12 +21,18 @@ use crate::mc_data::surface_kind::SurfaceKind;
 const SEED_HOURS: i64 = 24;
 const MAX_WARNING_CHARS: usize = 160;
 const CODEX_MAX_DEPTH: usize = 6;
+/// Bytes read and applied per step, bounding memory on huge transcripts.
+pub const CHUNK_BYTES: u64 = 4 << 20;
+/// An unknown transcript is seeded from at most its last this many bytes.
+pub const SEED_BYTES: u64 = 8 << 20;
 
 pub struct WatchOpts {
     pub interval: u64,
     pub once: bool,
     pub seed_only: bool,
     pub updates_dir: PathBuf,
+    pub chunk_bytes: u64,
+    pub seed_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -100,9 +106,13 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
             Some(o) => {
                 // Kept until this session's record is saved.
                 offsets.insert(path.clone(), *o);
-                changed.push((path, kind, o.offset, len, mtime));
+                changed.push((path, kind, o.offset, false, len, mtime));
             }
-            None => changed.push((path, kind, 0, len, mtime)),
+            None => {
+                let tail = len.saturating_sub(opts.seed_bytes);
+                let start = tail::line_start_at(&path, tail).unwrap_or(tail);
+                changed.push((path, kind, start, true, len, mtime));
+            }
         }
     }
 
@@ -130,14 +140,8 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
                 .collect()
         };
 
-        for ((path, kind, from, len, mtime), joined) in changed.into_iter().zip(joins) {
-            let mut out = match tail::read_new(kind, &path, from, mtime) {
-                Ok(out) => out,
-                Err(e) => {
-                    warnings.push(format!("read {}: {e}", path.display()));
-                    continue;
-                }
-            };
+        for ((path, kind, mut from, unknown, len, mtime), joined) in changed.into_iter().zip(joins)
+        {
             let session = session_id(&path);
             let mut file = record::load(dir, &session).unwrap_or_else(|| SessionFile {
                 host: host.to_string(),
@@ -154,40 +158,69 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
                 segments: vec![],
                 updated_at: now,
             });
-            // A re-read from 0 must not re-apply what the record already has.
-            if from == 0 || out.reset {
-                drop_seen(&file, &mut out);
-            }
             let (status, ids) = joined.unwrap_or_default();
             file.workspace = ids.as_ref().map(|i| i.workspace.clone());
             file.surface = ids.map(|i| i.surface);
             let agent_busy = status.as_deref().map(|s| s == "busy");
             file.status = status;
-            let w = engine::apply(
-                judge.unwrap_or(&NoJudge),
-                &mut file,
-                &out,
-                agent_busy,
-                EngineOpts { seed, now },
-            )
-            .await;
-            if judge.is_some() {
-                warnings.extend(w.into_iter().map(|w| format!("{session}: {w}")));
-            }
-            // Sessions with no user input yet (e.g. automation) get no record.
-            if !file.segments.is_empty() {
-                file.updated_at = now;
-                if let Err(e) = record::save(dir, &file) {
-                    // Keep the old offset so these turns are re-read.
-                    warnings.push(format!("save {session}: {e}"));
-                    continue;
+            // Replaying history (seed window, or offsets lost): no refines.
+            let seed = seed || (unknown && from > 0);
+            // A re-read must not re-apply what the record already has.
+            let mut rereading = unknown;
+            let mut saved = false;
+            // One chunk in memory at a time: apply, save, then record the offset.
+            loop {
+                let mut out = match tail::read_new(kind, &path, from, mtime, opts.chunk_bytes) {
+                    Ok(out) => out,
+                    Err(e) => {
+                        warnings.push(format!("read {}: {e}", path.display()));
+                        break;
+                    }
+                };
+                rereading |= out.reset;
+                if rereading {
+                    drop_seen(&file, &mut out);
+                    rereading = out.turns.is_empty();
                 }
-                written += 1;
+                let w = engine::apply(
+                    judge.unwrap_or(&NoJudge),
+                    &mut file,
+                    &out,
+                    agent_busy,
+                    EngineOpts { seed, now },
+                )
+                .await;
+                if judge.is_some() {
+                    warnings.extend(w.into_iter().map(|w| format!("{session}: {w}")));
+                }
+                // Sessions with no user input yet (e.g. automation) get no record.
+                if !file.segments.is_empty() {
+                    file.updated_at = now;
+                    if let Err(e) = record::save(dir, &file) {
+                        // Keep the old offset so these turns are re-read.
+                        warnings.push(format!("save {session}: {e}"));
+                        break;
+                    }
+                    saved = true;
+                }
+                let done = out.next_offset == from || out.next_offset >= len;
+                from = out.next_offset;
+                // Until caught up, a `len` that cannot match makes the next tick resume.
+                let len = if done { len } else { from };
+                offsets.insert(
+                    path.clone(),
+                    Offset {
+                        offset: from,
+                        len,
+                        mtime,
+                    },
+                );
+                write_atomic(&offsets_path, &serde_json::to_vec(&offsets)?)?;
+                if done {
+                    break;
+                }
             }
-            let offset = out.next_offset;
-            offsets.insert(path, Offset { offset, len, mtime });
-            // Saved per session so a crash mid-tick re-applies nothing.
-            write_atomic(&offsets_path, &serde_json::to_vec(&offsets)?)?;
+            written += saved as usize;
         }
     }
 

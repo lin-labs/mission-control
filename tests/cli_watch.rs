@@ -24,7 +24,8 @@ fn fixture(name: &str) -> PathBuf {
 fn place(home: &Path, rel: &str, name: &str) -> PathBuf {
     let p = home.join(rel);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-    std::fs::copy(fixture(name), &p).unwrap();
+    // fs::copy keeps the fixture's mtime on macOS; a fresh file is "recent".
+    std::fs::write(&p, std::fs::read(fixture(name)).unwrap()).unwrap();
     p
 }
 
@@ -34,9 +35,14 @@ fn append(p: &Path, s: &str) {
 }
 
 fn watch(home: &Path) {
+    watch_with(home, &[]);
+}
+
+fn watch_with(home: &Path, extra: &[&str]) {
     let out = Command::new(mc_bin())
         .env("HOME", home)
         .args(["watch", "--once", "--seed-only"])
+        .args(extra)
         .output()
         .expect("run watch");
     assert!(
@@ -271,4 +277,35 @@ fn failed_save_keeps_offset() {
     std::fs::write(&rec, saved).unwrap();
     watch(home.path());
     assert_eq!(inputs(&record(home.path(), "abc").unwrap()), 3);
+}
+
+/// Fixture (2 inputs), 50 agent lines, then one more human input.
+fn long_transcript(home: &Path) -> PathBuf {
+    let t = place(home, ".claude/projects/-x/abc.jsonl", "claude_mixed.jsonl");
+    for _ in 0..50 {
+        append(&t, AGENT);
+    }
+    append(&t, HUMAN);
+    t
+}
+
+#[test]
+fn seed_starts_near_the_tail() {
+    let home = tempfile::tempdir().unwrap();
+    long_transcript(home.path());
+    watch_with(home.path(), &["--seed-bytes", "2000"]);
+    assert_eq!(inputs(&record(home.path(), "abc").unwrap()), 1);
+}
+
+#[test]
+fn small_chunks_apply_the_whole_transcript() {
+    let home = tempfile::tempdir().unwrap();
+    let t = long_transcript(home.path());
+    watch_with(home.path(), &["--chunk-bytes", "1000"]);
+    assert_eq!(inputs(&record(home.path(), "abc").unwrap()), 3);
+    let offsets: Value =
+        serde_json::from_slice(&std::fs::read(updates(home.path()).join(".offsets.json")).unwrap())
+            .unwrap();
+    let len = std::fs::metadata(&t).unwrap().len();
+    assert_eq!(offsets[t.to_str().unwrap()]["offset"], len);
 }

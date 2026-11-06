@@ -100,6 +100,12 @@ pub enum Command {
         /// Output directory (default: ~/data/mission-control/updates/local).
         #[arg(long, hide = true)]
         updates_dir: Option<PathBuf>,
+        /// Bytes read per step (tests).
+        #[arg(long, hide = true)]
+        chunk_bytes: Option<u64>,
+        /// Seed window from a transcript's end (tests).
+        #[arg(long, hide = true)]
+        seed_bytes: Option<u64>,
     },
     /// Probe the remote screen-grab + frame-merge loop against one surface.
     ///
