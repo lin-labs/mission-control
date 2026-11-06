@@ -1,0 +1,1 @@
+{"peer_id":"devbox","files":[{"name":"s1.json","data":{"session":"s1"}},{"name":"s2.json","data":{"session":"s2"}}],"monitor":{"host":"devbox","last_tick":"2026-11-06T00:00:00Z","pid":4242,"version":"0.1.0"},"next_cursor":"c2"}

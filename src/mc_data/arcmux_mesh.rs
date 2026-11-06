@@ -8,6 +8,8 @@
 
 use crate::cmux::client::SurfaceInfo;
 use crate::mc_data::surface_kind::SurfaceKind;
+use crate::mc_data::updates::join::SurfaceHint;
+use crate::mc_data::updates::remote::{UpdatesReply, UpdatesWire};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::Value;
@@ -16,6 +18,8 @@ use std::time::{Duration, Instant};
 
 const LOOPBACK_BASE: &str = "http://127.0.0.1:7777/mesh/";
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
+const UPDATES_TIMEOUT: Duration = Duration::from_secs(12);
+const UPDATES_MAX_CALLS: usize = 5;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SAFE_TEXT_CHARS: usize = 240;
 const CURRENT_WORK_PROVENANCE: &str = "hook.overall_goal_summarizer.v1";
@@ -407,7 +411,11 @@ impl ArcmuxMeshClient {
 
     async fn get_value(&self, endpoint: &'static str) -> Result<Value, ()> {
         let url = self.base.join(endpoint).map_err(|_| ())?;
-        let mut response = self.http.get(url).send().await.map_err(|_| ())?;
+        Self::read_capped(self.http.get(url)).await
+    }
+
+    async fn read_capped(request: reqwest::RequestBuilder) -> Result<Value, ()> {
+        let mut response = request.send().await.map_err(|_| ())?;
         if !response.status().is_success() {
             return Err(());
         }
@@ -425,6 +433,46 @@ impl ArcmuxMeshClient {
             bytes.extend_from_slice(&chunk);
         }
         serde_json::from_slice(&bytes).map_err(|_| ())
+    }
+
+    /// Pull devbox update records (`POST updates`), following `next_cursor`.
+    pub async fn updates(
+        &self,
+        peer: &str,
+        since: Option<&str>,
+        hints: &[SurfaceHint],
+    ) -> Result<UpdatesReply, ()> {
+        let url = self.base.join("updates").map_err(|_| ())?;
+        let mut reply = UpdatesReply::default();
+        let mut cursor: Option<String> = None;
+        for call in 0..UPDATES_MAX_CALLS {
+            let mut body = serde_json::json!({ "peer_id": peer });
+            match &cursor {
+                Some(c) => body["cursor"] = c.as_str().into(),
+                None => {
+                    body["hints"] = serde_json::to_value(hints).map_err(|_| ())?;
+                    if let Some(s) = since {
+                        body["since"] = s.into();
+                    }
+                }
+            }
+            let req = self
+                .http
+                .post(url.clone())
+                .timeout(UPDATES_TIMEOUT)
+                .json(&body);
+            let wire: UpdatesWire =
+                serde_json::from_value(Self::read_capped(req).await?).map_err(|_| ())?;
+            reply
+                .files
+                .extend(wire.files.into_iter().map(|f| (f.name, f.data)));
+            reply.monitor = wire.monitor;
+            cursor = wire.next_cursor.filter(|c| !c.is_empty());
+            if cursor.is_none() || call + 1 == UPDATES_MAX_CALLS {
+                break;
+            }
+        }
+        Ok(reply)
     }
 }
 

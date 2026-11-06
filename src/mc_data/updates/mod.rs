@@ -5,3 +5,4 @@ pub mod record;
 pub mod engine;
 pub mod join;
 pub mod watch;
+pub mod remote;
