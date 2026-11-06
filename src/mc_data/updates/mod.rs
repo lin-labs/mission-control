@@ -6,3 +6,4 @@ pub mod engine;
 pub mod join;
 pub mod watch;
 pub mod remote;
+pub mod view;
