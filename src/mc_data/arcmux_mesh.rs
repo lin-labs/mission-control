@@ -446,16 +446,7 @@ impl ArcmuxMeshClient {
         let mut reply = UpdatesReply::default();
         let mut cursor: Option<String> = None;
         for call in 0..UPDATES_MAX_CALLS {
-            let mut body = serde_json::json!({ "peer_id": peer });
-            match &cursor {
-                Some(c) => body["cursor"] = c.as_str().into(),
-                None => {
-                    body["hints"] = serde_json::to_value(hints).map_err(|_| ())?;
-                    if let Some(s) = since {
-                        body["since"] = s.into();
-                    }
-                }
-            }
+            let body = updates_body(peer, since, cursor.as_deref(), hints)?;
             let req = self
                 .http
                 .post(url.clone())
@@ -466,7 +457,7 @@ impl ArcmuxMeshClient {
             reply
                 .files
                 .extend(wire.files.into_iter().map(|f| (f.name, f.data)));
-            reply.monitor = wire.monitor;
+            reply.monitor = wire.monitor.or(reply.monitor.take());
             cursor = wire.next_cursor.filter(|c| !c.is_empty());
             if cursor.is_none() || call + 1 == UPDATES_MAX_CALLS {
                 break;
@@ -474,6 +465,24 @@ impl ArcmuxMeshClient {
         }
         Ok(reply)
     }
+}
+
+/// First call (no cursor) carries `hints`; later calls carry `cursor`. `since` rides on every call.
+fn updates_body(
+    peer: &str,
+    since: Option<&str>,
+    cursor: Option<&str>,
+    hints: &[SurfaceHint],
+) -> Result<Value, ()> {
+    let mut body = serde_json::json!({ "peer_id": peer });
+    if let Some(s) = since {
+        body["since"] = s.into();
+    }
+    match cursor {
+        Some(c) => body["cursor"] = c.into(),
+        None => body["hints"] = serde_json::to_value(hints).map_err(|_| ())?,
+    }
+    Ok(body)
 }
 
 fn valid_projection_shape(status: &Value, sessions: &Value, bindings: &Value) -> bool {
@@ -778,6 +787,25 @@ fn valid_uuid(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn updates_body_first_and_later_calls() {
+        let h = [SurfaceHint {
+            mosh_port: 60033,
+            surface_id: "S".into(),
+            workspace_id: "W".into(),
+        }];
+        let first = updates_body("devbox", Some("t0"), None, &h).unwrap();
+        assert_eq!(first["since"], "t0");
+        assert_eq!(first["hints"][0]["mosh_port"], 60033);
+        assert!(first.get("cursor").is_none());
+        let next = updates_body("devbox", Some("t0"), Some("c2"), &h).unwrap();
+        assert_eq!(
+            (next["since"].as_str(), next["cursor"].as_str()),
+            (Some("t0"), Some("c2"))
+        );
+        assert!(next.get("hints").is_none());
+    }
 
     fn fixture(name: &str) -> Value {
         serde_json::from_str(match name {

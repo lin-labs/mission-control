@@ -47,6 +47,14 @@ pub fn mosh_port_from_args(cmd: &str) -> Option<u16> {
 
 /// Write `updates/<peer>/<name>` (and `monitor.json`) atomically.
 pub fn store(peer: &str, reply: &UpdatesReply) -> std::io::Result<()> {
+    if peer.is_empty()
+        || peer.contains(['/', '\\'])
+        || peer.contains("..")
+        || peer.starts_with('.')
+        || peer == "local"
+    {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
     store_in(&updates_dir().with_file_name(peer), reply)
 }
 
@@ -129,6 +137,14 @@ mod tests {
         assert_eq!(a["n"], "a.json");
         assert!(dir.join("monitor.json").exists());
         assert!(!dir.join(".a.json.tmp").exists());
+    }
+
+    #[test]
+    fn store_rejects_bad_peer() {
+        for p in ["", "a/b", "a\\b", "..", ".x", "local"] {
+            let e = store(p, &reply(&["a.json"])).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{p}");
+        }
     }
 
     #[test]
