@@ -1007,6 +1007,8 @@ pub struct App {
     remote_watch: crate::mc_data::remote_intent::RemoteWatch,
     /// Monotonic counter incremented each remote-grab tick (drives backoff).
     remote_grab_tick: u64,
+    /// The Updates screen (`u`), drawn over the sidebar/detail split while open.
+    pub updates: Option<crate::tui::updates_view::UpdatesScreen>,
 }
 
 /// Pre-gathered data for one refresh cycle. Produced off the main loop by
@@ -1581,6 +1583,7 @@ impl App {
             input_mode: crate::tui::command::InputMode::Normal,
             remote_watch: crate::mc_data::remote_intent::RemoteWatch::new(),
             remote_grab_tick: 0,
+            updates: None,
         }
     }
 

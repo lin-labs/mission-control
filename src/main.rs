@@ -905,6 +905,8 @@ async fn run_app(
     // operation can finish after the user's selection has moved elsewhere.
     let (dispatch_tx, mut dispatch_rx) =
         mpsc::channel::<crate::mc_data::arcmux_dispatch::NewSurfaceDispatchUpdate>(8);
+    let (updates_tx, mut updates_rx) = mpsc::channel::<tui::updates_view::UpdatesLoad>(2);
+    let mut updates_inflight = false;
 
     let mut refresh_interval = interval(Duration::from_secs(30));
     let mut mesh_refresh_interval = interval_at(
@@ -919,6 +921,9 @@ async fn run_app(
     let mut surface_summary_tick = interval(Duration::from_secs(60));
     let mut dismiss_tick = interval(Duration::from_secs(30));
     let mut mux_state_interval = interval(Duration::from_secs(2));
+    // Polled only while the Updates screen is open; reset to fire on open.
+    let mut updates_interval = interval(Duration::from_secs(15));
+    updates_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Mission checkboxes update synchronously on keypress. Cross-section
     // relocation is deliberately batched onto its own five-second sweep so
     // the 200 ms peek renderer can never make a mission row disappear.
@@ -982,20 +987,24 @@ async fn run_app(
                 Layout::horizontal([Constraint::Length(32), Constraint::Min(40)]).split(vchunks[0]);
 
             let sidebar_focused = app.focus == crate::tui::app::Focus::Sidebar;
-            tui::sidebar::render_sidebar(
-                f,
-                chunks[0],
-                &app.workspaces,
-                app.selected,
-                sidebar_focused,
-            );
-            tui::detail::render_detail(
-                f,
-                chunks[1],
-                app.selected_workspace(),
-                app.detail_scroll,
-                !sidebar_focused,
-            );
+            if let Some(s) = &app.updates {
+                tui::updates_view::render(f, vchunks[0], s);
+            } else {
+                tui::sidebar::render_sidebar(
+                    f,
+                    chunks[0],
+                    &app.workspaces,
+                    app.selected,
+                    sidebar_focused,
+                );
+                tui::detail::render_detail(
+                    f,
+                    chunks[1],
+                    app.selected_workspace(),
+                    app.detail_scroll,
+                    !sidebar_focused,
+                );
+            }
             let bottom_info = app.bottom_info();
             tui::footer::render_info_line(f, vchunks[1], bottom_info.as_deref());
             let detail_has_trajectory = app.focus == crate::tui::app::Focus::Detail
@@ -1003,6 +1012,9 @@ async fn run_app(
             match &app.input_mode {
                 crate::tui::command::InputMode::Command(cl) => {
                     tui::footer::render_command_bar(f, vchunks[2], cl);
+                }
+                crate::tui::command::InputMode::Normal if app.updates.is_some() => {
+                    tui::footer::render_updates_footer(f, vchunks[2]);
                 }
                 crate::tui::command::InputMode::Normal => {
                     tui::footer::render_footer(f, vchunks[2], app.focus, detail_has_trajectory);
@@ -1097,6 +1109,39 @@ async fn run_app(
                                 _ => {}
                             }
                             continue; // exclusive owner — never fall through
+                        }
+
+                        // ── Updates screen key routing ────────────────────────
+                        // While open it owns every key (so `g` never reaches the
+                        // trajectory editor's go-to-top); ^c / ^r stay global.
+                        if let Some(screen) = app.updates.as_mut() {
+                            if !matches!(
+                                (key.code, key.modifiers),
+                                (KeyCode::Char('c' | 'r'), KeyModifiers::CONTROL)
+                            ) {
+                                use crate::tui::updates_view::{UpdatesAction, cmux_refs};
+                                match screen.handle_key(key) {
+                                    UpdatesAction::None => {}
+                                    UpdatesAction::Close => app.updates = None,
+                                    UpdatesAction::Refresh => updates_interval.reset_immediately(),
+                                    UpdatesAction::Select { workspace, surface } => {
+                                        if let Some((ws_ref, surface_ref)) = cmux_refs(
+                                            &app.workspaces,
+                                            &workspace,
+                                            surface.as_deref(),
+                                        ) {
+                                            let client = cmux_client.clone();
+                                            tokio::spawn(async move {
+                                                let _ = client.select_workspace(&ws_ref).await;
+                                                if let Some(s) = surface_ref {
+                                                    let _ = client.focus_surface(&s).await;
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
                         }
 
                         // Detail view owns page keys for viewport scrolling.
@@ -1460,6 +1505,10 @@ async fn run_app(
                                     }
                                 }
                             }
+                            (KeyCode::Char('u'), _) => {
+                                app.updates = Some(tui::updates_view::UpdatesScreen::new());
+                                updates_interval.reset_immediately();
+                            }
                             (KeyCode::Char(':'), _) => {
                                 app.input_mode =
                                     crate::tui::command::InputMode::Command(
@@ -1671,6 +1720,31 @@ async fn run_app(
 
             _ = mux_state_interval.tick() => {
                 app.refresh_mux_statuses_from_disk();
+            }
+
+            _ = updates_interval.tick(), if app.updates.is_some() => {
+                // Mosh-port probing, the devbox fetch and record loading all
+                // run off the main loop; results flow back via updates_rx.
+                if !updates_inflight {
+                    updates_inflight = true;
+                    let ttys = tui::updates_view::surface_ttys(&app.workspaces);
+                    let tx = updates_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(tui::updates_view::gather(ttys).await).await;
+                    });
+                }
+            }
+
+            Some(load) = updates_rx.recv() => {
+                updates_inflight = false;
+                let names = app
+                    .workspaces
+                    .iter()
+                    .map(|w| (w.workspace.uuid.clone(), w.workspace.name.clone()))
+                    .collect();
+                if let Some(s) = app.updates.as_mut() {
+                    s.apply(load, names, chrono::Utc::now());
+                }
             }
 
             _ = screen_interval.tick() => {

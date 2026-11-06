@@ -10,20 +10,13 @@ use ratatui::{
 
 /// Render the keyboard-shortcut footer line.
 pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus, detail_has_trajectory: bool) {
-    let key_style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    let label_style = Style::default().fg(Color::Gray);
-    let sep_style = Style::default().fg(Color::DarkGray);
-
-    let mut spans: Vec<Span> = Vec::new();
-
     let pairs: &[(&str, &str)] = match focus {
         Focus::Sidebar => &[
             ("j/k", "navigate"),
             ("l/⏎", "open detail"),
             ("⏎", "switch ws"),
             (":", "cmd"),
+            ("u", "updates"),
             ("s", "rescreen"),
             ("r", "summarize"),
             ("^r", "reload"),
@@ -36,6 +29,7 @@ pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus, detail_has_traject
             ("pg/wheel", "scroll"),
             ("h/esc", "back"),
             (":", "cmd"),
+            ("u", "updates"),
             ("s", "rescreen"),
             ("r", "summarize"),
             ("^r", "reload"),
@@ -48,13 +42,41 @@ pub fn render_footer(f: &mut Frame, area: Rect, focus: Focus, detail_has_traject
             ("h/esc", "back"),
             ("⏎", "switch ws"),
             (":", "cmd"),
+            ("u", "updates"),
             ("s", "rescreen"),
             ("r", "summarize"),
             ("^r", "reload"),
             ("q", "quit"),
         ],
     };
+    render_pairs(f, area, pairs);
+}
 
+/// Footer while the Updates screen is open.
+pub fn render_updates_footer(f: &mut Frame, area: Rect) {
+    render_pairs(
+        f,
+        area,
+        &[
+            ("j/k", "navigate"),
+            ("t", "order"),
+            ("g", "grouping"),
+            ("space", "expand"),
+            ("⏎", "go to surface"),
+            ("r", "refresh"),
+            ("u/esc", "close"),
+        ],
+    );
+}
+
+fn render_pairs(f: &mut Frame, area: Rect, pairs: &[(&str, &str)]) {
+    let key_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let label_style = Style::default().fg(Color::Gray);
+    let sep_style = Style::default().fg(Color::DarkGray);
+
+    let mut spans: Vec<Span> = Vec::new();
     for (i, (key, label)) in pairs.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("  ·  ", sep_style));

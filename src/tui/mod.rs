@@ -8,3 +8,4 @@ pub mod peek_view;
 pub mod sidebar;
 pub mod trajectory_edit;
 pub mod trajectory_view;
+pub mod updates_view;
