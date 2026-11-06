@@ -22,7 +22,7 @@ const SEED_HOURS: i64 = 24;
 const MAX_WARNING_CHARS: usize = 160;
 const CODEX_MAX_DEPTH: usize = 6;
 /// Bytes read and applied per step, bounding memory on huge transcripts.
-pub const CHUNK_BYTES: u64 = 4 << 20;
+pub const CHUNK_BYTES: u64 = 1 << 20;
 /// An unknown transcript is seeded from at most its last this many bytes.
 pub const SEED_BYTES: u64 = 8 << 20;
 
