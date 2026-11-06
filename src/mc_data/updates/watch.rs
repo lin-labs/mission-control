@@ -221,6 +221,8 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
                 }
             }
             written += saved as usize;
+            // A seed tick can outlast the view's stale threshold.
+            write_monitor(dir, host, Utc::now())?;
         }
     }
 
