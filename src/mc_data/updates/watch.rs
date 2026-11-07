@@ -177,7 +177,12 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
             let mut rereading = unknown;
             let mut saved = false;
             let mut unjudged = Unjudged::default();
-            let mut budget = opts.tick_budget_bytes;
+            // A seed reads its whole window: chunks end short of EOF at a newline.
+            let mut budget = if unknown {
+                opts.seed_bytes + opts.chunk_bytes
+            } else {
+                opts.tick_budget_bytes
+            };
             // One chunk in memory at a time: apply, save, then record the offset.
             loop {
                 let mut out = match tail::read_new(kind, &path, from, mtime, opts.chunk_bytes) {

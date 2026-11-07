@@ -318,16 +318,31 @@ fn offsets(home: &Path) -> Value {
 fn tick_budget_resumes_next_tick() {
     let home = tempfile::tempdir().unwrap();
     let t = long_transcript(home.path());
-    let len = std::fs::metadata(&t).unwrap().len();
-    let args = ["--chunk-bytes", "1000", "--tick-budget-bytes", "2000"];
+    let args = [
+        "--chunk-bytes",
+        "1000",
+        "--tick-budget-bytes",
+        "2000",
+        "--seed-bytes",
+        "4000",
+    ];
     let offset = || {
         offsets(home.path())[t.to_str().unwrap()]["offset"]
             .as_u64()
             .unwrap()
     };
+    // The seed reads its whole window, past the budget, in one tick.
+    watch_with(home.path(), &args);
+    assert_eq!(offset(), std::fs::metadata(&t).unwrap().len());
+    let seeded = offset();
+    for _ in 0..50 {
+        append(&t, AGENT);
+    }
+    append(&t, HUMAN);
+    let len = std::fs::metadata(&t).unwrap().len();
     watch_with(home.path(), &args);
     let first = offset();
-    assert!(first > 0 && first <= 2000, "{first}");
+    assert!(first > seeded && first <= seeded + 2000, "{seeded} {first}");
     watch_with(home.path(), &args);
     let second = offset();
     assert!(second > first && second <= first + 2000, "{first} {second}");
@@ -335,7 +350,7 @@ fn tick_budget_resumes_next_tick() {
         watch_with(home.path(), &args);
     }
     assert_eq!(offset(), len);
-    assert_eq!(inputs(&record(home.path(), "abc").unwrap()), 3);
+    assert_eq!(inputs(&record(home.path(), "abc").unwrap()), 2);
 }
 
 #[test]

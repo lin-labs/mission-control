@@ -31,6 +31,8 @@ pub struct UpdatesReply {
 pub struct FetchMark {
     pub since: Option<String>,
     pub cursor: Option<String>,
+    /// Devbox `last_tick` when the fetch that `cursor` continues began.
+    pub start_tick: Option<String>,
 }
 
 impl FetchMark {
@@ -46,16 +48,22 @@ impl FetchMark {
     }
 
     /// A pending cursor resumes with the same `since`; a complete fetch
-    /// moves `since` to the devbox's last tick minus slack.
+    /// moves `since` to the devbox's last tick, as of the fetch's first
+    /// call, minus slack: records changed while it spanned refreshes stay due.
     pub fn next(&self, reply: &UpdatesReply) -> Self {
+        let start_tick = match &self.cursor {
+            Some(_) => self.start_tick.clone(),
+            None => reply.monitor.as_ref().map(|m| m.last_tick.clone()),
+        };
         if let Some(c) = &reply.pending_cursor {
             return Self {
                 since: self.since.clone(),
                 cursor: Some(c.clone()),
+                start_tick,
             };
         }
-        let tick = reply.monitor.as_ref().map(|m| &m.last_tick);
-        let since = tick
+        let since = start_tick
+            .as_deref()
             .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
             .map(|t| {
                 (t - Duration::seconds(SINCE_SLACK_SECS)).to_rfc3339_opts(SecondsFormat::Secs, true)
@@ -63,6 +71,7 @@ impl FetchMark {
         Self {
             since: since.or_else(|| self.since.clone()),
             cursor: None,
+            start_tick: None,
         }
     }
 }
@@ -180,7 +189,7 @@ mod tests {
     fn mark_advances_only_after_complete_fetch() {
         let start = FetchMark {
             since: Some("t0".into()),
-            cursor: None,
+            ..Default::default()
         };
         let mut r = reply(&[]);
         r.pending_cursor = Some("c5".into());
@@ -189,7 +198,8 @@ mod tests {
             pending,
             FetchMark {
                 since: Some("t0".into()),
-                cursor: Some("c5".into())
+                cursor: Some("c5".into()),
+                start_tick: Some("2026-11-06T00:00:00Z".into()),
             }
         );
         r.pending_cursor = None;
@@ -198,13 +208,45 @@ mod tests {
             done,
             FetchMark {
                 since: Some("2026-11-05T23:58:00Z".into()),
-                cursor: None
+                ..Default::default()
             }
         );
         let t = tempfile::tempdir().unwrap();
         assert_eq!(FetchMark::load(t.path()), FetchMark::default());
         done.save(t.path()).unwrap();
         assert_eq!(FetchMark::load(t.path()), done);
+    }
+
+    #[test]
+    fn fetch_spanning_refreshes_takes_since_from_its_first_tick() {
+        let mut r = reply(&[]);
+        r.pending_cursor = Some("c50".into());
+        let mark = FetchMark::default().next(&r);
+        // Hours later the resumed fetch completes with a newer tick.
+        r.monitor.as_mut().unwrap().last_tick = "2026-11-06T05:00:00Z".into();
+        r.pending_cursor = Some("c99".into());
+        let mark = mark.next(&r);
+        r.pending_cursor = None;
+        let done = mark.next(&r);
+        assert_eq!(done.since.as_deref(), Some("2026-11-05T23:58:00Z"));
+        assert_eq!((done.cursor, done.start_tick), (None, None));
+    }
+
+    #[test]
+    fn store_replaces_leftover_world_readable_tmp() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("devbox");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join(".a.json.tmp");
+        std::fs::write(&tmp, "old").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        store_in(&dir, &reply(&["a.json"])).unwrap();
+        let mode = std::fs::metadata(dir.join("a.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

@@ -185,13 +185,18 @@ fn claude_turn(line: &Value, at: DateTime<Utc>) -> Option<Turn> {
 }
 
 /// `<command-message>x</command-message><command-name>/x</command-name>
-/// <command-args>a</command-args>` → `/x a`.
+/// <command-args>a</command-args>` (either tag first) → `/x a`.
 fn slash_command(text: &str) -> Option<String> {
-    let (msg, _) = text
-        .strip_prefix("<command-message>")?
-        .split_once("</command-message>")?;
-    let name = between(text, "<command-name>", "</command-name>")
-        .map_or_else(|| format!("/{msg}"), str::to_string);
+    if !(text.starts_with("<command-message>") || text.starts_with("<command-name>")) {
+        return None;
+    }
+    let name = match between(text, "<command-name>", "</command-name>") {
+        Some(n) => n.to_string(),
+        None => format!(
+            "/{}",
+            between(text, "<command-message>", "</command-message>")?
+        ),
+    };
     let args = between(text, "<command-args>", "</command-args>").unwrap_or("");
     Some(format!("{name} {}", args.trim()).trim_end().to_string())
 }

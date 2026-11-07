@@ -96,9 +96,14 @@ pub fn save(dir: &Path, file: &SessionFile) -> io::Result<()> {
 }
 
 /// Writes `bytes` to `path`, creating it owner-only (0600): records hold prompts.
+/// An existing file is removed first, so an older 0644 one is not reused.
 pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
     std::fs::OpenOptions::new()
         .write(true)
         .create(true)

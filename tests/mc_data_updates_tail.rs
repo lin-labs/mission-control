@@ -338,3 +338,15 @@ fn slash_command_renders_as_typed() {
         }]
     );
 }
+
+#[test]
+fn slash_command_with_name_first_renders_as_typed() {
+    let line = r#"{"type":"user","message":{"content":"<command-name>/rename</command-name>\n            <command-message>rename</command-message>\n            <command-args>mc2-qa</command-args>"}}"#;
+    assert_eq!(
+        turns_of(line),
+        vec![Turn::User {
+            at: fallback(),
+            text: "/rename mc2-qa".into()
+        }]
+    );
+}

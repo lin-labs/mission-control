@@ -466,7 +466,8 @@ impl ArcmuxMeshClient {
             reply
                 .files
                 .extend(wire.files.into_iter().map(|f| (f.name, f.data)));
-            reply.monitor = wire.monitor.or(reply.monitor.take());
+            // The first call's tick anchors the next `since`.
+            reply.monitor = reply.monitor.take().or(wire.monitor);
             cursor = wire.next_cursor.filter(|c| !c.is_empty());
             if cursor.is_none() {
                 break;
