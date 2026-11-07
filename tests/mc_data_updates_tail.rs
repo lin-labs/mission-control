@@ -276,3 +276,65 @@ fn lines_keep_only_timestamp_and_message() {
         .collect();
     assert_eq!(keys, ["message", "timestamp"].map(String::from).into());
 }
+
+/// Turns from a transcript holding just `line`.
+fn turns_of(line: &str) -> Vec<Turn> {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("t.jsonl");
+    std::fs::write(&p, format!("{line}\n")).unwrap();
+    read_new(SurfaceKind::Claude, &p, 0, fallback(), ALL)
+        .unwrap()
+        .turns
+}
+
+fn injected(text: &str) -> Vec<Turn> {
+    vec![Turn::Agent {
+        at: fallback(),
+        text: text.into(),
+        kind: AgentKind::Injected,
+    }]
+}
+
+#[test]
+fn meta_and_compact_summary_lines_are_dropped() {
+    for line in [
+        r#"{"type":"user","isMeta":true,"message":{"content":"Base directory for this skill: /x"},"origin":{"kind":"human"}}"#,
+        r#"{"type":"user","isCompactSummary":true,"isVisibleInTranscriptOnly":true,"message":{"content":"This session is being continued from a previous conversation."}}"#,
+    ] {
+        assert_eq!(turns_of(line), vec![], "{line}");
+    }
+}
+
+#[test]
+fn sdk_prompts_with_human_origin_are_injected() {
+    let a = r#"{"type":"user","message":{"content":"You keep the notes for one workstream."},"origin":{"kind":"human"},"promptSource":"sdk"}"#;
+    let b = r#"{"type":"user","message":{"content":"You keep the notes for one workstream."},"origin":{"kind":"human"},"entrypoint":"sdk-ts"}"#;
+    for line in [a, b] {
+        assert_eq!(
+            turns_of(line),
+            injected("You keep the notes for one workstream.")
+        );
+    }
+}
+
+#[test]
+fn pasted_blin_letter_is_injected() {
+    let line = r#"{"type":"user","message":{"content":"<pasted_content id=\"f5a0\">\nProtocol: blin-letter/1\nFrom: x\n</pasted_content id=\"f5a0\">"},"origin":{"kind":"human"},"promptSource":"typed"}"#;
+    let text = "<pasted_content id=\"f5a0\">\nProtocol: blin-letter/1\nFrom: x\n</pasted_content id=\"f5a0\">";
+    assert_eq!(turns_of(line), injected(text));
+    // Any other paste is still the user's input.
+    let other = line.replace("Protocol: blin-letter/1", "my notes");
+    assert!(matches!(&turns_of(&other)[..], [Turn::User { .. }]));
+}
+
+#[test]
+fn slash_command_renders_as_typed() {
+    let line = r#"{"type":"user","message":{"content":"<command-message>incident</command-message>\n<command-name>/incident</command-name>\n<command-args>setup now</command-args>"},"origin":{"kind":"human"}}"#;
+    assert_eq!(
+        turns_of(line),
+        vec![Turn::User {
+            at: fallback(),
+            text: "/incident setup now".into()
+        }]
+    );
+}

@@ -147,20 +147,28 @@ fn claude_turn(line: &Value, at: DateTime<Utc>) -> Option<Turn> {
             })
         }
         "user" => {
+            let origin = line.pointer("/origin/kind").and_then(Value::as_str);
+            // Skill bodies and compaction summaries are nobody's turn; peer
+            // and coordinator messages are also meta but stay loop turns.
+            let meta = line["isMeta"] == true && origin.is_none_or(|o| o == "human");
+            if meta || line["isCompactSummary"] == true {
+                return None;
+            }
             let text = content_text(content)?.trim().to_string();
             if text.is_empty() {
                 return None;
             }
-            let origin = line.pointer("/origin/kind").and_then(Value::as_str);
+            let text = slash_command(&text).unwrap_or(text);
+            // Scheduled/SDK runs are automation, not the user typing.
+            let sdk = line["promptSource"] == "sdk"
+                || line["entrypoint"]
+                    .as_str()
+                    .is_some_and(|e| e.starts_with("sdk"));
             let injected = match origin {
-                Some("human") => text.starts_with("Protocol: blin-letter/1"),
+                _ if sdk => true,
+                Some("human") => unpasted(&text).starts_with("Protocol: blin-letter/1"),
                 Some(_) => true,
-                // Scheduled/SDK runs are automation, not the user typing.
-                None => {
-                    is_injected_claude(&text)
-                        || line["promptSource"] == "sdk"
-                        || line["entrypoint"] == "sdk-cli"
-                }
+                None => is_injected_claude(&text),
             };
             Some(if injected {
                 Turn::Agent {
@@ -174,6 +182,30 @@ fn claude_turn(line: &Value, at: DateTime<Utc>) -> Option<Turn> {
         }
         _ => None,
     }
+}
+
+/// `<command-message>x</command-message><command-name>/x</command-name>
+/// <command-args>a</command-args>` → `/x a`.
+fn slash_command(text: &str) -> Option<String> {
+    let (msg, _) = text
+        .strip_prefix("<command-message>")?
+        .split_once("</command-message>")?;
+    let name = between(text, "<command-name>", "</command-name>")
+        .map_or_else(|| format!("/{msg}"), str::to_string);
+    let args = between(text, "<command-args>", "</command-args>").unwrap_or("");
+    Some(format!("{name} {}", args.trim()).trim_end().to_string())
+}
+
+/// The body of a leading `<pasted_content id="…">` wrapper, else `text`.
+fn unpasted(text: &str) -> &str {
+    text.strip_prefix("<pasted_content")
+        .and_then(|t| t.split_once('>'))
+        .map_or(text, |(_, body)| body.trim_start())
+}
+
+fn between<'a>(s: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let rest = &s[s.find(open)? + open.len()..];
+    Some(&rest[..rest.find(close)?])
 }
 
 /// String content, or the `text` blocks of list content joined with newlines.
