@@ -1,6 +1,6 @@
 //! Devbox update records pulled over the local arcmux mesh route.
 
-use super::record::updates_dir;
+use super::record::{updates_dir, write_private};
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::Path;
@@ -62,7 +62,7 @@ fn store_in(dir: &Path, reply: &UpdatesReply) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let write = |name: &str, bytes: Vec<u8>| {
         let tmp = dir.join(format!(".{name}.tmp"));
-        std::fs::write(&tmp, bytes)?;
+        write_private(&tmp, &bytes)?;
         std::fs::rename(&tmp, dir.join(name))
     };
     for (name, data) in &reply.files {

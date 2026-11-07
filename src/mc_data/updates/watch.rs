@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::engine::{self, EngineOpts};
+use super::engine::{self, EngineOpts, Unjudged};
 use super::join::{self, RealSys, Snapshot, SurfaceHint};
 use super::judge::Judge;
 use super::record::{self, SessionFile};
@@ -19,12 +19,16 @@ use super::tail::{self, ReadOutcome, Turn};
 use crate::mc_data::surface_kind::SurfaceKind;
 
 const SEED_HOURS: i64 = 24;
+/// Offsets of transcripts untouched this long are dropped.
+const OFFSET_DAYS: i64 = 7;
 const MAX_WARNING_CHARS: usize = 160;
 const CODEX_MAX_DEPTH: usize = 6;
 /// Bytes read and applied per step, bounding memory on huge transcripts.
 pub const CHUNK_BYTES: u64 = 1 << 20;
 /// An unknown transcript is seeded from at most its last this many bytes.
 pub const SEED_BYTES: u64 = 8 << 20;
+/// Bytes one session reads per tick; a larger backlog continues next tick.
+pub const TICK_BUDGET_BYTES: u64 = 8 << 20;
 
 pub struct WatchOpts {
     pub interval: u64,
@@ -33,6 +37,7 @@ pub struct WatchOpts {
     pub updates_dir: PathBuf,
     pub chunk_bytes: u64,
     pub seed_bytes: u64,
+    pub tick_budget_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -88,6 +93,9 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
             continue;
         };
         let (len, mtime) = (meta.len(), meta.modified().map_or(now, DateTime::from));
+        if now - mtime > Duration::days(OFFSET_DAYS) {
+            continue;
+        }
         match prev.get(&path) {
             Some(o) if (o.len, o.mtime) == (len, mtime) => {
                 offsets.insert(path, *o);
@@ -168,6 +176,8 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
             // A re-read must not re-apply what the record already has.
             let mut rereading = unknown;
             let mut saved = false;
+            let mut unjudged = Unjudged::default();
+            let mut budget = opts.tick_budget_bytes;
             // One chunk in memory at a time: apply, save, then record the offset.
             loop {
                 let mut out = match tail::read_new(kind, &path, from, mtime, opts.chunk_bytes) {
@@ -178,6 +188,11 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
                     }
                 };
                 rereading |= out.reset;
+                let read = out.next_offset - if out.reset { 0 } else { from };
+                budget = budget.saturating_sub(read);
+                let caught_up = out.next_offset == from || out.next_offset >= len;
+                // Stop before a chunk could overrun the budget.
+                let done = caught_up || budget < opts.chunk_bytes;
                 if rereading {
                     drop_seen(&file, &mut out);
                     rereading = out.turns.is_empty();
@@ -187,7 +202,12 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
                     &mut file,
                     &out,
                     agent_busy,
-                    EngineOpts { seed, now },
+                    EngineOpts {
+                        seed,
+                        now,
+                        final_chunk: done,
+                    },
+                    &mut unjudged,
                 )
                 .await;
                 if judge.is_some() {
@@ -203,10 +223,9 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
                     }
                     saved = true;
                 }
-                let done = out.next_offset == from || out.next_offset >= len;
                 from = out.next_offset;
                 // Until caught up, a `len` that cannot match makes the next tick resume.
-                let len = if done { len } else { from };
+                let len = if caught_up { len } else { from };
                 offsets.insert(
                     path.clone(),
                     Offset {
@@ -216,17 +235,19 @@ async fn tick(judge: Option<&dyn Judge>, opts: &WatchOpts, host: &str) -> Result
                     },
                 );
                 write_atomic(&offsets_path, &serde_json::to_vec(&offsets)?)?;
+                // A seed or catch-up tick can outlast the view's stale threshold.
+                write_monitor(dir, host, Utc::now())?;
                 if done {
                     break;
                 }
             }
             written += saved as usize;
-            // A seed tick can outlast the view's stale threshold.
-            write_monitor(dir, host, Utc::now())?;
         }
     }
 
-    write_atomic(&offsets_path, &serde_json::to_vec(&offsets)?)?;
+    if first_run || offsets != prev {
+        write_atomic(&offsets_path, &serde_json::to_vec(&offsets)?)?;
+    }
     write_monitor(dir, host, Utc::now())?;
 
     if written > 0 || !warnings.is_empty() {
@@ -345,7 +366,7 @@ fn write_monitor(dir: &Path, host: &str, at: DateTime<Utc>) -> Result<()> {
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let tmp = path.with_file_name(format!(".{name}.tmp"));
-    std::fs::write(&tmp, bytes)?;
+    record::write_private(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
 }
 

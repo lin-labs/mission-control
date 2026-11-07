@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use mission_control::mc_data::updates::engine::{EngineOpts, apply};
+use mission_control::mc_data::updates::engine::{EngineOpts, Unjudged, apply};
 use mission_control::mc_data::updates::judge::Judge;
 use mission_control::mc_data::updates::record::*;
 use mission_control::mc_data::updates::tail::{AgentKind, ReadOutcome, Turn};
@@ -120,7 +120,11 @@ fn pr_line(at: DateTime<Utc>, n: u32) -> (Turn, Value) {
 }
 
 fn opts(now: DateTime<Utc>) -> EngineOpts {
-    EngineOpts { seed: false, now }
+    EngineOpts {
+        seed: false,
+        now,
+        final_chunk: true,
+    }
 }
 
 #[tokio::test]
@@ -137,7 +141,15 @@ async fn unrelated_messages_open_two_segments() {
         ],
         vec![],
     );
-    let w = apply(&j, &mut f, &out, None, opts(min(1))).await;
+    let w = apply(
+        &j,
+        &mut f,
+        &out,
+        None,
+        opts(min(1)),
+        &mut Unjudged::default(),
+    )
+    .await;
     assert!(w.is_empty(), "{w:?}");
     let ids: Vec<_> = f.segments.iter().map(|s| s.segment.as_str()).collect();
     assert_eq!(ids, ["s1", "s2"]);
@@ -159,15 +171,14 @@ async fn new_segment_intent_is_first_ten_words_until_refined() {
         )],
         vec![],
     );
+    *j.fail.lock().unwrap() = true;
     apply(
         &j,
         &mut f,
         &out,
         None,
-        EngineOpts {
-            seed: true,
-            now: min(0),
-        },
+        opts(min(0)),
+        &mut Unjudged::default(),
     )
     .await;
     assert_eq!(
@@ -189,7 +200,15 @@ async fn related_message_joins_segment() {
         ],
         vec![],
     );
-    apply(&j, &mut f, &out, None, opts(min(2))).await;
+    apply(
+        &j,
+        &mut f,
+        &out,
+        None,
+        opts(min(2)),
+        &mut Unjudged::default(),
+    )
+    .await;
     assert_eq!(f.segments.len(), 1);
     let s = &f.segments[0];
     assert_eq!(s.user_inputs.len(), 2);
@@ -216,7 +235,15 @@ async fn injected_turns_never_open_segments() {
         )],
         vec![],
     );
-    apply(&j, &mut f, &out, None, opts(min(0))).await;
+    apply(
+        &j,
+        &mut f,
+        &out,
+        None,
+        opts(min(0)),
+        &mut Unjudged::default(),
+    )
+    .await;
     assert!(f.segments.is_empty());
     assert!(j.log.lock().unwrap().is_empty());
 
@@ -229,7 +256,15 @@ async fn injected_turns_never_open_segments() {
         ],
         vec![],
     );
-    apply(&j, &mut f, &out, None, opts(min(3))).await;
+    apply(
+        &j,
+        &mut f,
+        &out,
+        None,
+        opts(min(3)),
+        &mut Unjudged::default(),
+    )
+    .await;
     assert_eq!(f.segments.len(), 1);
     let s = &f.segments[0];
     assert_eq!(s.user_inputs.len(), 1);
@@ -249,6 +284,7 @@ async fn agent_turn_while_user_active_does_not_refine() {
         &outcome(vec![user(min(0), "build it")], vec![]),
         None,
         opts(min(0)),
+        &mut Unjudged::default(),
     )
     .await;
     assert_eq!(j.calls(REFINE), 1);
@@ -260,6 +296,7 @@ async fn agent_turn_while_user_active_does_not_refine() {
         &outcome(vec![turn], vec![line]),
         None,
         opts(min(30)),
+        &mut Unjudged::default(),
     )
     .await;
     assert_eq!(j.calls(STATE), 2);
@@ -280,6 +317,7 @@ async fn after_two_hours_artifact_triggers_one_refine_per_hour() {
         &outcome(vec![user(min(0), "ship it")], vec![]),
         None,
         opts(min(0)),
+        &mut Unjudged::default(),
     )
     .await;
     assert_eq!(j.calls(REFINE), 1);
@@ -291,6 +329,7 @@ async fn after_two_hours_artifact_triggers_one_refine_per_hour() {
             &outcome(vec![turn], vec![line]),
             None,
             opts(min(m)),
+            &mut Unjudged::default(),
         )
         .await;
         assert_eq!(j.calls(REFINE), want, "at +{m}m");
@@ -306,6 +345,7 @@ async fn after_two_hours_artifact_triggers_one_refine_per_hour() {
         &outcome(vec![turn], vec![line]),
         None,
         opts(min(260)),
+        &mut Unjudged::default(),
     )
     .await;
     assert_eq!(j.calls(REFINE), 3);
@@ -321,13 +361,30 @@ async fn after_two_hours_state_change_triggers_refine() {
         &outcome(vec![user(min(0), "ship it")], vec![]),
         None,
         opts(min(0)),
+        &mut Unjudged::default(),
     )
     .await;
     let reply = |m| outcome(vec![agent(min(m), "progress", AgentKind::Reply)], vec![]);
-    apply(&j, &mut f, &reply(130), None, opts(min(130))).await;
+    apply(
+        &j,
+        &mut f,
+        &reply(130),
+        None,
+        opts(min(130)),
+        &mut Unjudged::default(),
+    )
+    .await;
     assert_eq!(j.calls(REFINE), 1, "working → working is no change");
     j.set(&j.state, "done");
-    apply(&j, &mut f, &reply(140), None, opts(min(140))).await;
+    apply(
+        &j,
+        &mut f,
+        &reply(140),
+        None,
+        opts(min(140)),
+        &mut Unjudged::default(),
+    )
+    .await;
     assert_eq!(j.calls(REFINE), 2);
     assert_eq!(f.segments[0].state, SegState::Done);
 }
@@ -341,18 +398,34 @@ async fn busy_skips_state_call() {
         vec![user(min(0), "go"), agent(min(1), "on it", AgentKind::Reply)],
         vec![],
     );
-    apply(&j, &mut f, &out, Some(true), opts(min(1))).await;
+    apply(
+        &j,
+        &mut f,
+        &out,
+        Some(true),
+        opts(min(1)),
+        &mut Unjudged::default(),
+    )
+    .await;
     assert_eq!(j.calls(STATE), 0);
     assert_eq!(f.segments[0].state, SegState::Working);
     j.set(&j.route, "s1");
     let out = outcome(vec![agent(min(2), "error", AgentKind::Reply)], vec![]);
-    apply(&j, &mut f, &out, Some(false), opts(min(2))).await;
+    apply(
+        &j,
+        &mut f,
+        &out,
+        Some(false),
+        opts(min(2)),
+        &mut Unjudged::default(),
+    )
+    .await;
     assert_eq!(j.calls(STATE), 1);
     assert_eq!(f.segments[0].state, SegState::Blocked);
 }
 
 #[tokio::test]
-async fn seed_mode_never_refines() {
+async fn seed_mode_refines_each_segment_once() {
     let j = FakeJudge::new();
     let mut f = file();
     let (turn, line) = pr_line(min(200), 1);
@@ -369,12 +442,54 @@ async fn seed_mode_never_refines() {
         EngineOpts {
             seed: true,
             now: min(300),
+            final_chunk: true,
         },
+        &mut Unjudged::default(),
     )
     .await;
-    assert_eq!(j.calls(REFINE), 0);
-    assert_eq!(f.segments[0].intent, "ship it");
-    assert_eq!(f.segments[0].last_refine_at, None);
+    assert_eq!(j.calls(REFINE), 1);
+    assert_eq!(f.segments[0].intent, "refined goal");
+    assert_eq!(f.segments[0].last_refine_at, Some(min(300)));
+    let seed = EngineOpts {
+        seed: true,
+        now: min(400),
+        final_chunk: true,
+    };
+    let out = outcome(vec![user(min(400), "again")], vec![]);
+    apply(&j, &mut f, &out, None, seed, &mut Unjudged::default()).await;
+    assert_eq!(j.calls(REFINE), 1, "already refined");
+}
+
+#[tokio::test]
+async fn multi_chunk_catch_up_judges_once_on_final_chunk() {
+    let j = FakeJudge::new();
+    let mut f = file();
+    j.set(&j.route, "s1");
+    let mut unjudged = Unjudged::default();
+    let chunks = [
+        vec![user(min(0), "start the migration")],
+        vec![user(min(1), "use the new schema")],
+        vec![agent(min(2), "done", AgentKind::Reply)],
+    ];
+    for (n, turns) in chunks.into_iter().enumerate() {
+        let o = EngineOpts {
+            final_chunk: n == 2,
+            ..opts(min(2))
+        };
+        apply(&j, &mut f, &outcome(turns, vec![]), None, o, &mut unjudged).await;
+        if n < 2 {
+            assert_eq!(j.calls(STATE) + j.calls(REFINE), 0, "chunk {n}");
+        }
+    }
+    assert_eq!(j.calls(STATE), 1);
+    assert_eq!(j.calls(REFINE), 1);
+    assert_eq!(f.segments.len(), 1);
+    assert_eq!(f.segments[0].user_inputs.len(), 2);
+    assert_eq!(f.segments[0].intent, "refined goal");
+    // The refine saw both chunks' messages.
+    let log = j.log.lock().unwrap();
+    let refine = log.iter().find(|p| p.contains(REFINE)).unwrap();
+    assert!(refine.contains("start the migration") && refine.contains("done"));
 }
 
 #[tokio::test]
@@ -387,6 +502,7 @@ async fn judge_error_keeps_previous_intent() {
         &outcome(vec![user(min(0), "ship it")], vec![]),
         None,
         opts(min(0)),
+        &mut Unjudged::default(),
     )
     .await;
     let before = f.segments[0].clone();
@@ -397,6 +513,7 @@ async fn judge_error_keeps_previous_intent() {
         &outcome(vec![user(min(5), "also this")], vec![]),
         None,
         opts(min(5)),
+        &mut Unjudged::default(),
     )
     .await;
     assert!(w.iter().any(|w| w.starts_with("route failed")), "{w:?}");
@@ -422,6 +539,7 @@ async fn segment_older_than_48h_not_routed() {
         &outcome(vec![user(min(0), "old work")], vec![]),
         None,
         opts(min(0)),
+        &mut Unjudged::default(),
     )
     .await;
     let later = min(49 * 60);
@@ -431,6 +549,7 @@ async fn segment_older_than_48h_not_routed() {
         &outcome(vec![user(later, "fresh work")], vec![]),
         None,
         opts(later),
+        &mut Unjudged::default(),
     )
     .await;
     assert_eq!(j.calls(ROUTE), 0, "no open segment, so no route call");
@@ -445,6 +564,7 @@ async fn segment_older_than_48h_not_routed() {
         &outcome(vec![user(m, "third")], vec![]),
         None,
         opts(m),
+        &mut Unjudged::default(),
     )
     .await;
     assert_eq!(j.calls(ROUTE), 0);

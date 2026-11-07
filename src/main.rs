@@ -345,6 +345,7 @@ async fn main() -> Result<()> {
             updates_dir,
             chunk_bytes,
             seed_bytes,
+            tick_budget_bytes,
         }) => {
             use crate::mc_data::updates::{record, watch};
             let opts = watch::WatchOpts {
@@ -354,6 +355,7 @@ async fn main() -> Result<()> {
                 updates_dir: updates_dir.unwrap_or_else(record::updates_dir),
                 chunk_bytes: chunk_bytes.unwrap_or(watch::CHUNK_BYTES),
                 seed_bytes: seed_bytes.unwrap_or(watch::SEED_BYTES),
+                tick_budget_bytes: tick_budget_bytes.unwrap_or(watch::TICK_BUDGET_BYTES),
             };
             run_watch(&cli.tui, opts).await
         }

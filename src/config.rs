@@ -106,6 +106,9 @@ pub enum Command {
         /// Seed window from a transcript's end (tests).
         #[arg(long, hide = true)]
         seed_bytes: Option<u64>,
+        /// Bytes one session reads per tick (tests).
+        #[arg(long, hide = true)]
+        tick_budget_bytes: Option<u64>,
     },
     /// Probe the remote screen-grab + frame-merge loop against one surface.
     ///

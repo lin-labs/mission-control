@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 
 use super::artifacts::{Artifact, from_line};
-use super::judge::{Judge, Route, classify_state, refine, route};
+use super::judge::{Judge, MAX_TURNS_CHARS, Route, classify_state, refine, route};
 use super::record::{AgentTurn, SegState, Segment, SessionFile, UserInput};
 use super::tail::{AgentKind, ReadOutcome, Turn};
 
@@ -21,7 +21,13 @@ const NEW_INTENT_WORDS: usize = 10;
 pub struct EngineOpts {
     pub seed: bool,
     pub now: DateTime<Utc>,
+    /// Last chunk of this session's tick: only then classify and refine.
+    pub final_chunk: bool,
 }
+
+/// Segments touched by a tick's earlier chunks, judged on its final chunk.
+#[derive(Default)]
+pub struct Unjudged(BTreeMap<usize, Touched>);
 
 /// What this apply added to one segment.
 #[derive(Default)]
@@ -32,6 +38,26 @@ struct Touched {
     lines: Vec<String>,
     user_msg: bool,
     new_artifact: bool,
+}
+
+impl Touched {
+    /// Keeps only the tail that classify and refine read.
+    fn trim(&mut self) {
+        self.turns
+            .drain(..self.turns.len().saturating_sub(STATE_TURNS));
+        let mut chars = 0;
+        let keep = self
+            .lines
+            .iter()
+            .rev()
+            .take_while(|l| {
+                let fits = chars < MAX_TURNS_CHARS;
+                chars += l.len();
+                fits
+            })
+            .count();
+        self.lines.drain(..self.lines.len() - keep);
+    }
 }
 
 /// Agent turns and artifacts seen before the session's first user input.
@@ -47,9 +73,10 @@ pub async fn apply(
     out: &ReadOutcome,
     agent_busy: Option<bool>,
     opts: EngineOpts,
+    unjudged: &mut Unjudged,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
-    let mut touched: BTreeMap<usize, Touched> = BTreeMap::new();
+    let touched = &mut unjudged.0;
     let mut pending = Pending::default();
     let segs = &mut file.segments;
     let mut cur = (0..segs.len()).max_by_key(|&i| segs[i].user_inputs.last().map(|u| u.at));
@@ -135,7 +162,11 @@ pub async fn apply(
         }
     }
 
-    for (i, t) in touched {
+    if !opts.final_chunk {
+        touched.values_mut().for_each(Touched::trim);
+        return warnings;
+    }
+    for (i, t) in std::mem::take(touched) {
         let seg = &mut segs[i];
         let newest_user = seg.user_inputs.iter().map(|u| u.at).max();
         let newest = newest_user.max(seg.agent_turns.iter().map(|a| a.at).max());
@@ -153,15 +184,18 @@ pub async fn apply(
                 Err(e) => warnings.push(format!("state failed: {e}")),
             }
         }
-        if opts.seed {
-            continue;
-        }
         let needs_attention = seg.state != old && seg.state != SegState::Working;
         let quiet = newest_user.is_none_or(|u| opts.now - u >= Duration::hours(QUIET_HOURS));
         let due = seg
             .last_refine_at
             .is_none_or(|r| opts.now - r >= Duration::hours(REFINE_EVERY_HOURS));
-        if t.user_msg || (quiet && due && (needs_attention || t.new_artifact)) {
+        // Seeding refines each segment once, so its intent is a summary too.
+        let fire = if opts.seed {
+            seg.last_refine_at.is_none()
+        } else {
+            t.user_msg || (quiet && due && (needs_attention || t.new_artifact))
+        };
+        if fire {
             match refine(j, seg, &t.lines.join("\n")).await {
                 Ok((intent, latest)) => {
                     seg.intent = intent;

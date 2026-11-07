@@ -81,7 +81,7 @@ Keep the current intent wording unless the user's goal changed. The intent is at
 Return only JSON: {\"intent\":\"...\",\"latest\":\"...\"}";
 
 const MAX_MESSAGE_CHARS: usize = 2_000;
-const MAX_TURNS_CHARS: usize = 12_000;
+pub(super) const MAX_TURNS_CHARS: usize = 12_000;
 const MAX_OPEN: usize = 20;
 const ROUTE_TOKENS: u32 = 4_000;
 const STATE_TOKENS: u32 = 4_000;

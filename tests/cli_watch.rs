@@ -309,3 +309,59 @@ fn small_chunks_apply_the_whole_transcript() {
     let len = std::fs::metadata(&t).unwrap().len();
     assert_eq!(offsets[t.to_str().unwrap()]["offset"], len);
 }
+
+fn offsets(home: &Path) -> Value {
+    serde_json::from_slice(&std::fs::read(updates(home).join(".offsets.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn tick_budget_resumes_next_tick() {
+    let home = tempfile::tempdir().unwrap();
+    let t = long_transcript(home.path());
+    let len = std::fs::metadata(&t).unwrap().len();
+    let args = ["--chunk-bytes", "1000", "--tick-budget-bytes", "2000"];
+    let offset = || {
+        offsets(home.path())[t.to_str().unwrap()]["offset"]
+            .as_u64()
+            .unwrap()
+    };
+    watch_with(home.path(), &args);
+    let first = offset();
+    assert!(first > 0 && first <= 2000, "{first}");
+    watch_with(home.path(), &args);
+    let second = offset();
+    assert!(second > first && second <= first + 2000, "{first} {second}");
+    for _ in 0..len / 1000 {
+        watch_with(home.path(), &args);
+    }
+    assert_eq!(offset(), len);
+    assert_eq!(inputs(&record(home.path(), "abc").unwrap()), 3);
+}
+
+#[test]
+fn idle_tick_keeps_offsets_file_and_prunes_missing() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    place(
+        home.path(),
+        ".claude/projects/-x/abc.jsonl",
+        "claude_mixed.jsonl",
+    );
+    watch(home.path());
+    let path = updates(home.path()).join(".offsets.json");
+    for p in [&path, &updates(home.path()).join("abc.json")] {
+        let mode = std::fs::metadata(p).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{}", p.display());
+    }
+    // Same content, different bytes: an idle tick must not rewrite it.
+    let pretty = serde_json::to_string_pretty(&offsets(home.path())).unwrap();
+    std::fs::write(&path, &pretty).unwrap();
+    watch(home.path());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), pretty);
+    // An entry for a missing transcript is pruned.
+    let mut m = offsets(home.path());
+    m["/gone.jsonl"] = m.as_object().unwrap().values().next().unwrap().clone();
+    std::fs::write(&path, serde_json::to_vec(&m).unwrap()).unwrap();
+    watch(home.path());
+    assert!(offsets(home.path()).get("/gone.jsonl").is_none());
+}

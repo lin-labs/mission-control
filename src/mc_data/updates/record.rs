@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use super::artifacts::Artifact;
 use crate::mc_data::paths::data_root;
 
-pub const MAX_FILE_BYTES: usize = 40 * 1024;
+/// Below the 47 KiB mesh page even after Go escapes `<>&` (+5 bytes each).
+pub const MAX_FILE_BYTES: usize = 32 * 1024;
 const MAX_TEXT_CHARS: usize = 300;
 const MAX_AGENT_TURNS: usize = 200;
 
@@ -90,8 +91,21 @@ pub fn save(dir: &Path, file: &SessionFile) -> io::Result<()> {
     let bytes = trimmed_bytes(file)?;
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(".{}.json.tmp", file.session));
-    std::fs::write(&tmp, bytes)?;
+    write_private(&tmp, &bytes)?;
     std::fs::rename(&tmp, dir.join(format!("{}.json", file.session)))
+}
+
+/// Writes `bytes` to `path`, creating it owner-only (0600): records hold prompts.
+pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(bytes)
 }
 
 fn truncate(s: &mut String) {
