@@ -1,9 +1,13 @@
 //! Devbox update records pulled over the local arcmux mesh route.
 
 use super::record::{updates_dir, write_private};
-use serde::Deserialize;
+use chrono::{DateTime, Duration, SecondsFormat};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
+
+/// `since` slack under the devbox's last tick, on the devbox's own clock.
+const SINCE_SLACK_SECS: i64 = 120;
 
 /// Content of the devbox's `monitor.json`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -18,6 +22,49 @@ pub struct Monitor {
 pub struct UpdatesReply {
     pub files: Vec<(String, Value)>,
     pub monitor: Option<Monitor>,
+    /// Cursor the fetch stopped at (call cap or a failed later call).
+    pub pending_cursor: Option<String>,
+}
+
+/// Where the next fetch starts; kept in `updates/<peer>/.since`.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct FetchMark {
+    pub since: Option<String>,
+    pub cursor: Option<String>,
+}
+
+impl FetchMark {
+    pub fn load(dir: &Path) -> Self {
+        std::fs::read(dir.join(".since"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, dir: &Path) -> std::io::Result<()> {
+        write_private(&dir.join(".since"), &serde_json::to_vec(self)?)
+    }
+
+    /// A pending cursor resumes with the same `since`; a complete fetch
+    /// moves `since` to the devbox's last tick minus slack.
+    pub fn next(&self, reply: &UpdatesReply) -> Self {
+        if let Some(c) = &reply.pending_cursor {
+            return Self {
+                since: self.since.clone(),
+                cursor: Some(c.clone()),
+            };
+        }
+        let tick = reply.monitor.as_ref().map(|m| &m.last_tick);
+        let since = tick
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| {
+                (t - Duration::seconds(SINCE_SLACK_SECS)).to_rfc3339_opts(SecondsFormat::Secs, true)
+            });
+        Self {
+            since: since.or_else(|| self.since.clone()),
+            cursor: None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -125,7 +172,39 @@ mod tests {
                 pid: 1,
                 version: "1".into(),
             }),
+            pending_cursor: None,
         }
+    }
+
+    #[test]
+    fn mark_advances_only_after_complete_fetch() {
+        let start = FetchMark {
+            since: Some("t0".into()),
+            cursor: None,
+        };
+        let mut r = reply(&[]);
+        r.pending_cursor = Some("c5".into());
+        let pending = start.next(&r);
+        assert_eq!(
+            pending,
+            FetchMark {
+                since: Some("t0".into()),
+                cursor: Some("c5".into())
+            }
+        );
+        r.pending_cursor = None;
+        let done = pending.next(&r);
+        assert_eq!(
+            done,
+            FetchMark {
+                since: Some("2026-11-05T23:58:00Z".into()),
+                cursor: None
+            }
+        );
+        let t = tempfile::tempdir().unwrap();
+        assert_eq!(FetchMark::load(t.path()), FetchMark::default());
+        done.save(t.path()).unwrap();
+        assert_eq!(FetchMark::load(t.path()), done);
     }
 
     #[test]

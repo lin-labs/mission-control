@@ -435,16 +435,19 @@ impl ArcmuxMeshClient {
         serde_json::from_slice(&bytes).map_err(|_| ())
     }
 
-    /// Pull devbox update records (`POST updates`), following `next_cursor`.
+    /// Pull devbox update records (`POST updates`), following `next_cursor`
+    /// from `cursor`. At the call cap, or when a later call fails, returns
+    /// what was merged with `pending_cursor` set to resume from.
     pub async fn updates(
         &self,
         peer: &str,
         since: Option<&str>,
+        cursor: Option<&str>,
         hints: &[SurfaceHint],
     ) -> Result<UpdatesReply, ()> {
         let url = self.base.join("updates").map_err(|_| ())?;
         let mut reply = UpdatesReply::default();
-        let mut cursor: Option<String> = None;
+        let mut cursor = cursor.map(str::to_string);
         for call in 0..UPDATES_MAX_CALLS {
             let body = updates_body(peer, since, cursor.as_deref(), hints)?;
             let req = self
@@ -452,17 +455,24 @@ impl ArcmuxMeshClient {
                 .post(url.clone())
                 .timeout(UPDATES_TIMEOUT)
                 .json(&body);
-            let wire: UpdatesWire =
-                serde_json::from_value(Self::read_capped(req).await?).map_err(|_| ())?;
+            let wire = Self::read_capped(req)
+                .await
+                .and_then(|v| serde_json::from_value::<UpdatesWire>(v).map_err(|_| ()));
+            let wire = match wire {
+                Ok(w) => w,
+                Err(()) if call > 0 => break,
+                Err(()) => return Err(()),
+            };
             reply
                 .files
                 .extend(wire.files.into_iter().map(|f| (f.name, f.data)));
             reply.monitor = wire.monitor.or(reply.monitor.take());
             cursor = wire.next_cursor.filter(|c| !c.is_empty());
-            if cursor.is_none() || call + 1 == UPDATES_MAX_CALLS {
+            if cursor.is_none() {
                 break;
             }
         }
+        reply.pending_cursor = cursor;
         Ok(reply)
     }
 }
@@ -805,6 +815,98 @@ mod tests {
             (Some("t0"), Some("c2"))
         );
         assert!(next.get("hints").is_none());
+    }
+
+    /// Loopback server answering each `POST updates` with the next body;
+    /// `None` answers 500. Returns its base URL and the request bodies.
+    async fn updates_server(
+        bodies: Vec<Option<Value>>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            for body in bodies {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut req = vec![];
+                let mut buf = [0u8; 4096];
+                let parsed = loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    req.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&req);
+                    let Some((head, rest)) = text.split_once("\r\n\r\n") else {
+                        continue;
+                    };
+                    let len = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")?
+                                .parse()
+                                .ok()
+                        })
+                        .unwrap_or(0);
+                    if rest.len() >= len {
+                        break serde_json::from_str::<Value>(rest).unwrap();
+                    }
+                };
+                log.lock().unwrap().push(parsed);
+                let (status, out) = match body {
+                    Some(b) => ("200 OK", b.to_string()),
+                    None => ("500 Internal Server Error", String::new()),
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{out}",
+                    out.len()
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+        (base, seen)
+    }
+
+    fn page(name: &str, next: Option<&str>) -> Option<Value> {
+        let mut v = serde_json::json!({"files": [{"name": name, "data": {}}]});
+        if let Some(c) = next {
+            v["next_cursor"] = c.into();
+        }
+        Some(v)
+    }
+
+    #[tokio::test]
+    async fn updates_returns_pending_cursor_at_call_cap() {
+        let bodies = (0..UPDATES_MAX_CALLS)
+            .map(|i| page(&format!("{i}.json"), Some(&format!("c{}", i + 1))))
+            .collect();
+        let (base, seen) = updates_server(bodies).await;
+        let c = ArcmuxMeshClient::new(&base).unwrap();
+        let r = c
+            .updates("devbox", Some("t0"), Some("c0"), &[])
+            .await
+            .unwrap();
+        assert_eq!(r.files.len(), UPDATES_MAX_CALLS);
+        assert_eq!(r.pending_cursor.as_deref(), Some("c5"));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0]["cursor"], "c0", "resumes from the given cursor");
+        assert!(seen.iter().all(|b| b["since"] == "t0"));
+    }
+
+    #[tokio::test]
+    async fn updates_keeps_merged_pages_when_later_call_fails() {
+        let (base, _) = updates_server(vec![page("a.json", Some("c1")), None]).await;
+        let c = ArcmuxMeshClient::new(&base).unwrap();
+        let r = c.updates("devbox", None, None, &[]).await.unwrap();
+        assert_eq!(r.files.len(), 1);
+        assert_eq!(r.pending_cursor.as_deref(), Some("c1"));
+        let (base, _) = updates_server(vec![None]).await;
+        let c = ArcmuxMeshClient::new(&base).unwrap();
+        assert!(c.updates("devbox", None, None, &[]).await.is_err());
+        let (base, _) = updates_server(vec![page("a.json", None)]).await;
+        let c = ArcmuxMeshClient::new(&base).unwrap();
+        let r = c.updates("devbox", None, None, &[]).await.unwrap();
+        assert_eq!(r.pending_cursor, None);
     }
 
     fn fixture(name: &str) -> Value {

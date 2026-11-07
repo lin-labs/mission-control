@@ -16,7 +16,7 @@ use ratatui::{
 use crate::mc_data::arcmux_mesh::ArcmuxMeshClient;
 use crate::mc_data::updates::join::SurfaceHint;
 use crate::mc_data::updates::record::{self, SegState, SessionFile, updates_dir};
-use crate::mc_data::updates::remote::{self, mosh_port_from_args};
+use crate::mc_data::updates::remote::{self, FetchMark, mosh_port_from_args};
 use crate::mc_data::updates::view::{Entry, Grouping, Order, Row, build_rows};
 use crate::tui::app::WorkspaceState;
 
@@ -30,6 +30,8 @@ pub struct UpdatesScreen {
     pub expanded: HashSet<String>,
     pub rows: Vec<Row>,
     pub remote: RemoteHealth,
+    /// The Mac watcher's own heartbeat; `fetch_ok` does not apply.
+    pub mac: RemoteHealth,
     files: Vec<SessionFile>,
     names: HashMap<String, String>,
     loaded: bool,
@@ -57,9 +59,11 @@ pub enum UpdatesAction {
 }
 
 /// One refresh's result, gathered off the UI thread by [`gather`].
+#[derive(Default)]
 pub struct UpdatesLoad {
     pub files: Vec<SessionFile>,
     pub last_tick: Option<DateTime<Utc>>,
+    pub mac_tick: Option<DateTime<Utc>>,
     pub fetch_ok: bool,
 }
 
@@ -95,6 +99,7 @@ impl UpdatesScreen {
             expanded: HashSet::new(),
             rows: vec![],
             remote: RemoteHealth::Fresh,
+            mac: RemoteHealth::Fresh,
             files: vec![],
             names: HashMap::new(),
             loaded: false,
@@ -105,6 +110,7 @@ impl UpdatesScreen {
         self.files = load.files;
         self.names = names;
         self.remote = health(load.last_tick, load.fetch_ok, now);
+        self.mac = health(load.mac_tick, true, now);
         self.loaded = true;
         self.rebuild(now);
     }
@@ -113,6 +119,14 @@ impl UpdatesScreen {
     fn rebuild(&mut self, now: DateTime<Utc>) {
         let sel = self.rows.get(self.selected).map(row_key);
         self.rows = build_rows(&self.files, self.order, self.grouping, now, &self.names);
+        // Rows of a host whose monitor is not fresh may be out of date.
+        for r in &mut self.rows {
+            r.dim |= if r.host == "mac" {
+                self.mac
+            } else {
+                self.remote
+            } != RemoteHealth::Fresh;
+        }
         self.selected = sel
             .and_then(|k| self.rows.iter().position(|r| row_key(r) == k))
             .unwrap_or(self.selected)
@@ -220,32 +234,47 @@ pub async fn gather(ttys: Vec<(String, String, String)>) -> UpdatesLoad {
             });
         }
     }
+    let remote_dir = updates_dir().with_file_name(PEER);
+    let mark = FetchMark::load(&remote_dir);
     let reply = ArcmuxMeshClient::default()
-        .updates(PEER, None, &hints)
+        .updates(PEER, mark.since.as_deref(), mark.cursor.as_deref(), &hints)
         .await
         .ok();
     let fetch_ok = reply.is_some();
     let last_tick = reply
         .as_ref()
         .and_then(|r| r.monitor.as_ref())
-        .and_then(|m| DateTime::parse_from_rfc3339(&m.last_tick).ok())
-        .map(|t| t.with_timezone(&Utc));
-    let files = tokio::task::spawn_blocking(move || {
+        .and_then(|m| parse_tick(&m.last_tick));
+    let (files, mac_tick) = tokio::task::spawn_blocking(move || {
         if let Some(reply) = &reply {
-            let _ = remote::store(PEER, reply);
+            if remote::store(PEER, reply).is_ok() {
+                let _ = mark.next(reply).save(&remote_dir);
+            }
         }
         let local = updates_dir();
         let mut files = load_dir(&local, "mac");
-        files.extend(load_dir(&local.with_file_name(PEER), PEER));
-        files
+        files.extend(load_dir(&remote_dir, PEER));
+        (files, monitor_tick(&local))
     })
     .await
     .unwrap_or_default();
     UpdatesLoad {
         files,
         last_tick,
+        mac_tick,
         fetch_ok,
     }
+}
+
+fn parse_tick(s: &str) -> Option<DateTime<Utc>> {
+    Some(DateTime::parse_from_rfc3339(s).ok()?.with_timezone(&Utc))
+}
+
+/// `last_tick` of `dir/monitor.json`; `None` when the file is missing.
+fn monitor_tick(dir: &Path) -> Option<DateTime<Utc>> {
+    let m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("monitor.json")).ok()?).ok()?;
+    parse_tick(m.get("last_tick")?.as_str()?)
 }
 
 fn load_dir(dir: &Path, host: &str) -> Vec<SessionFile> {
@@ -265,17 +294,20 @@ fn load_dir(dir: &Path, host: &str) -> Vec<SessionFile> {
         .collect()
 }
 
-fn banner(h: RemoteHealth) -> Option<String> {
+fn banner(host: &str, h: RemoteHealth) -> Option<String> {
     match h {
         RemoteHealth::Fresh => None,
         RemoteHealth::Stale {
             since_secs: u64::MAX,
-        } => Some("devbox monitor: stale (no heartbeat)".into()),
+        } if host == "mac" => Some("mac monitor: not running".into()),
+        RemoteHealth::Stale {
+            since_secs: u64::MAX,
+        } => Some(format!("{host} monitor: stale (no heartbeat)")),
         RemoteHealth::Stale { since_secs } => Some(format!(
-            "devbox monitor: stale (last heartbeat {} ago)",
+            "{host} monitor: stale (last heartbeat {} ago)",
             age(since_secs as i64)
         )),
-        RemoteHealth::Unreachable => Some("devbox monitor: unreachable".into()),
+        RemoteHealth::Unreachable => Some(format!("{host} monitor: unreachable")),
     }
 }
 
@@ -316,16 +348,16 @@ pub fn render(f: &mut Frame, area: Rect, s: &UpdatesScreen) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let banner = banner(s.remote);
-    let [top, list] = Layout::vertical([
-        Constraint::Length(banner.is_some() as u16),
-        Constraint::Min(0),
-    ])
-    .areas(inner);
-    if let Some(b) = banner {
-        let style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
-        f.render_widget(Paragraph::new(Line::styled(b, style)), top);
-    }
+    let style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+    let banners: Vec<_> = [banner(PEER, s.remote), banner("mac", s.mac)]
+        .into_iter()
+        .flatten()
+        .map(|b| Line::styled(b, style))
+        .collect();
+    let [top, list] =
+        Layout::vertical([Constraint::Length(banners.len() as u16), Constraint::Min(0)])
+            .areas(inner);
+    f.render_widget(Paragraph::new(banners), top);
 
     if s.rows.is_empty() {
         let msg = if s.loaded {
@@ -451,6 +483,7 @@ mod tests {
         let load = UpdatesLoad {
             files,
             last_tick,
+            mac_tick: Some(Utc::now()),
             fetch_ok: true,
         };
         s.apply(load, HashMap::new(), Utc::now());
@@ -556,6 +589,35 @@ mod tests {
         let mut s = UpdatesScreen::new();
         s.remote = RemoteHealth::Unreachable;
         assert!(rendered(&s).contains("devbox monitor: unreachable"));
+    }
+
+    #[test]
+    fn missing_mac_monitor_shows_not_running_and_dims_mac_rows() {
+        let t = tempfile::tempdir().unwrap();
+        assert_eq!(monitor_tick(t.path()), None);
+        let mut s = UpdatesScreen::new();
+        let load = UpdatesLoad {
+            files: vec![file("a", None, None)],
+            last_tick: Some(Utc::now()),
+            mac_tick: monitor_tick(t.path()),
+            fetch_ok: true,
+        };
+        s.apply(load, HashMap::new(), Utc::now());
+        assert!(rendered(&s).contains("mac monitor: not running"));
+        assert!(s.rows[0].dim, "mac row dims while its monitor is down");
+        let s = screen(vec![file("a", None, None)], Some(Utc::now()));
+        assert!(!s.rows[0].dim);
+    }
+
+    #[test]
+    fn stale_devbox_dims_only_devbox_rows() {
+        let mut d = file("b", None, None);
+        d.host = PEER.into();
+        let tick = Utc::now() - chrono::Duration::seconds(300);
+        let s = screen(vec![file("a", None, None), d], Some(tick));
+        for r in &s.rows {
+            assert_eq!(r.dim, r.host == PEER, "{}", r.host);
+        }
     }
 
     #[test]

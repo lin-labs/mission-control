@@ -1732,7 +1732,11 @@ async fn run_app(
                     let ttys = tui::updates_view::surface_ttys(&app.workspaces);
                     let tx = updates_tx.clone();
                     tokio::spawn(async move {
-                        let _ = tx.send(tui::updates_view::gather(ttys).await).await;
+                        // A panicking gather still reports, so updates_inflight clears.
+                        let load = tokio::spawn(tui::updates_view::gather(ttys))
+                            .await
+                            .unwrap_or_default();
+                        let _ = tx.send(load).await;
                     });
                 }
             }
