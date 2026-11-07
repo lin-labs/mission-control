@@ -448,6 +448,7 @@ async fn seed_mode_refines_each_segment_once() {
     )
     .await;
     assert_eq!(j.calls(REFINE), 1);
+    assert_eq!(j.calls("Current intent: (none yet)"), 1);
     assert_eq!(f.segments[0].intent, "refined goal");
     assert_eq!(f.segments[0].last_refine_at, Some(min(300)));
     let seed = EngineOpts {

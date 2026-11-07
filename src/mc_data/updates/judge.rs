@@ -169,8 +169,13 @@ fn parse_state(raw: &str) -> Result<SegState> {
 }
 
 pub async fn refine(j: &dyn Judge, seg: &Segment, new_turns: &str) -> Result<(String, String)> {
+    // Until a first refine, the intent is just the message's first words.
+    let intent = match seg.last_refine_at {
+        Some(_) => &seg.intent,
+        None => "(none yet)",
+    };
     let prompt = REFINE_PROMPT
-        .replace("{intent}", &seg.intent)
+        .replace("{intent}", intent)
         .replace("{latest}", &seg.latest)
         .replace("{turns}", tail(new_turns, MAX_TURNS_CHARS));
     let raw = j.ask(&prompt, REFINE_TOKENS).await?;
